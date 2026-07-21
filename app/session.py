@@ -27,6 +27,7 @@ class PodSession:
         self._lock = threading.Lock()           # guards every read/write below
         self.state: State = State.IDLE          # start with no pod
         self.pod_id: str | None = None          # RunPod pod id once known
+        self.target_pod_id: str | None = None    # user-selected pod to adopt (None = Auto)
         self.proxy_url: str | None = None        # https proxy URL to the pod once known
         self.phase: str = "idle"                # human-readable progress line for the UI
         self.error: str | None = None            # last error message, if any
@@ -35,15 +36,21 @@ class PodSession:
 
     # --- transition gates (atomic check-and-set) --------------------------
 
-    def try_begin_start(self) -> bool:
-        """Move IDLE/ERROR -> STARTING. Returns False if a start isn't allowed."""
+    def try_begin_start(self, target: str | None = None) -> bool:
+        """Move IDLE/ERROR -> STARTING. Returns False if a start isn't allowed.
+
+        `target` is a specific pod id to adopt, or None for Auto (create/resume
+        the podlink pod). A concrete target is recorded as pod_id immediately so
+        an instant POD DOWN can resolve and stop it before the worker records it.
+        """
         with self._lock:                                    # atomic w.r.t. other threads
             if self.state not in (State.IDLE, State.ERROR):  # only start from a settled state
                 return False                                # reject (server answers 409)
             self.state = State.STARTING                     # enter the provisioning window
             self.phase = "initialising"                     # reset progress text
             self.error = None                               # clear any stale error
-            self.pod_id = None                              # no pod id captured yet
+            self.target_pod_id = target                     # remember the selection
+            self.pod_id = target                            # id if adopting; None if Auto/create
             self.proxy_url = None                            # no proxy URL yet
             self.cancel.clear()                             # ensure a fresh (un-cancelled) run
             return True                                     # caller may launch the worker

@@ -16,6 +16,22 @@ Pod Down is greyed out until Pod Up is pressed. The instant Pod Up starts, Pod U
 greys out and Pod Down goes live — and stays live through the **entire**
 provisioning window, so you can kill the pod cleanly at any point.
 
+### Target selection
+
+Above the buttons, a **Target** dropdown chooses what Pod Up acts on:
+
+- **Auto** (default) — create or resume the `podlink` vLLM pod and wait until it
+  serves `/v1/models` (the original behaviour).
+- **A specific pod** — pick any pod on your RunPod account to adopt; Pod Up
+  resumes it (if stopped) and waits for `RUNNING` (no vLLM readiness probe, since
+  an arbitrary pod may not serve that endpoint).
+
+The selected pod's id is recorded the instant Pod Up is pressed, so Pod Down
+stops **that** pod — including if you hit Down immediately. Pod Down always
+**stops** (keeps the volume) regardless of which pod is selected. The list shows
+name, status, GPU, and hourly cost, and only ever exposes those fields — never a
+pod's environment (which can hold API keys).
+
 ### Why Pod Down is safe anywhere
 
 RunPod bills at the full GPU rate from the moment a pod is **created**, not from

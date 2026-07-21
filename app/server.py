@@ -15,7 +15,7 @@ import secrets as pysecrets          # cryptographic token + constant-time compa
 import threading                     # run driver work off the request thread
 from pathlib import Path             # locate the static/ directory
 
-from fastapi import FastAPI, Header, HTTPException, Request   # web framework primitives
+from fastapi import Body, FastAPI, Header, HTTPException, Request   # web framework primitives
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # response types
 
 from . import runpod_driver          # start()/stop() entry points
@@ -75,10 +75,21 @@ def status() -> JSONResponse:
     return JSONResponse(SESSION.snapshot())          # current state + button flags
 
 
+@app.get("/pods")
+def pods(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+    _require_token(x_podlink_token)                   # gated: triggers an authed RunPod call
+    try:
+        return JSONResponse({"pods": runpod_driver.list_pods()})  # whitelisted fields only
+    except Exception as e:                            # noqa: BLE001
+        # Type only in detail — str(e) could embed the API key.
+        raise HTTPException(status_code=502, detail=f"pod list failed: {type(e).__name__}")
+
+
 @app.post("/pod/up")
-def pod_up(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+def pod_up(target: str | None = Body(default=None, embed=True),
+           x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
     _require_token(x_podlink_token)                   # CSRF/token gate
-    if not SESSION.try_begin_start():                # atomically enter STARTING
+    if not SESSION.try_begin_start(target or None):  # atomically enter STARTING (None = Auto)
         # Not in a state where Up is allowed (already starting/running/stopping).
         raise HTTPException(status_code=409, detail="pod up not available in current state")
     _launch(runpod_driver.start)                     # provision in the background

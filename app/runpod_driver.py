@@ -54,20 +54,61 @@ def _read_secret(getter) -> str:
     return value
 
 
+def list_pods() -> list[dict]:
+    """Return a WHITELISTED list of the account's pods for the selector.
+
+    Only safe scalar fields are returned — never the raw pod dict, which can
+    embed `env` (VLLM_API_KEY / HF_TOKEN). Adding fields here is a security
+    decision: never surface `env`, ports, or anything credential-bearing.
+    """
+    runpod.api_key = _read_secret(_secrets.runpod_api_key)   # authenticate the SDK
+    pods = []
+    for p in runpod.get_pods():                              # enumerate every pod
+        machine = p.get("machine") or {}                     # gpu type nests here
+        pods.append({
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "status": p.get("desiredStatus"),
+            "gpu": machine.get("gpuTypeId") or p.get("gpuTypeId"),
+            "cost_per_hr": p.get("costPerHr"),
+        })
+    return pods
+
+
 # ---------------------------------------------------------------------------
 # Pod Up
 # ---------------------------------------------------------------------------
 
 def start(session: PodSession) -> None:
-    """Provision or resume the pod, then wait until it actually serves.
+    """Provision, resume, or adopt the pod, then wait until it's up.
 
     Assumes the session is already in STARTING (set atomically by the request
-    handler). On cancel it returns quietly and lets the stop worker own the
-    state; on failure it flips the session to ERROR.
+    handler). If a specific pod was selected (session.target_pod_id) it is
+    adopted directly; otherwise Auto creates/resumes the podlink pod. On cancel
+    it returns quietly and lets the stop worker own the state; on failure it
+    flips the session to ERROR.
     """
     try:
         runpod.api_key = _read_secret(_secrets.runpod_api_key)        # authenticate the SDK
+        target = session.target_pod_id                    # a specific pod to adopt, or None
 
+        if target:                                        # ---- adopt the selected pod ----
+            pod = runpod.get_pod(target)                  # fetch the chosen pod
+            if not pod:                                   # it was deleted since listing
+                raise RuntimeError("selected pod no longer exists")
+            pod_id = target                               # id already recorded by the session
+            session.update(phase="adopting selected pod")
+            if pod.get("desiredStatus") != "RUNNING":     # stopped -> resume it
+                session.update(phase="resuming selected pod")
+                runpod.resume_pod(pod_id, gpu_count=pod.get("gpuCount") or 1)
+            if not _wait_for_running(session, pod_id):    # poll until RUNNING (or cancel)
+                return
+            # An arbitrary pod may not serve /v1/models, so RUNNING is 'up' here;
+            # skip the readiness probe and write_state (both assume the vLLM pod).
+            session.commit_running()                      # -> RUNNING (unless a stop won)
+            return
+
+        # ---- Auto: create or resume the podlink vLLM pod ----
         existing = pod_up.find_existing()                 # is a pod already named podlink?
         if existing is not None:                          # yes — adopt it instead of duplicating
             pod_id = existing["id"]                       # its RunPod id
