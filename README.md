@@ -29,11 +29,37 @@ a loud `STOP NOT VERIFIED` error rather than a false "safe".
 
 ## Prerequisites
 
-Secrets, each mode `0600` and owned by you, in `~/.config/podlink/`:
+podlink reads three secrets from `~/.config/podlink/`. Each file must be owned by
+you and mode `0600` — `_secrets.py` refuses to read anything more permissive.
 
-- `runpod_api_key`
-- `hf_token`
-- `pod_bearer_token`
+| File | What it holds |
+|------|---------------|
+| `runpod_api_key`   | RunPod API key (drives create/stop). |
+| `hf_token`         | Hugging Face token for the model-weight pull. |
+| `pod_bearer_token` | vLLM API key; also used to probe `/v1/models`. |
+
+Set them up once:
+
+```bash
+mkdir -p ~/.config/podlink
+chmod 700 ~/.config/podlink
+
+# Write each secret (printf avoids a trailing newline). Replace the placeholders.
+printf '%s' 'YOUR_RUNPOD_API_KEY'   > ~/.config/podlink/runpod_api_key
+printf '%s' 'YOUR_HF_TOKEN'         > ~/.config/podlink/hf_token
+printf '%s' 'YOUR_POD_BEARER_TOKEN' > ~/.config/podlink/pod_bearer_token
+
+chmod 600 ~/.config/podlink/*
+```
+
+Tip: to keep the values out of your shell history, prefix each command with a
+space (if `HISTCONTROL=ignorespace`) or paste them into an editor instead.
+
+Verify:
+
+```bash
+ls -l ~/.config/podlink            # each file should show -rw------- (0600)
+```
 
 ## Run
 
