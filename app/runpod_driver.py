@@ -1,10 +1,11 @@
 """Non-interactive orchestration over the vendored pod_control/ scripts.
 
 The original pod_up.py / pod_down.py are CLI tools: they prompt with
-rich.Confirm and quit via sys.exit — both fatal to a webapp. We must not edit
-the vendored copies (see pod_control/PROVENANCE.md), so instead we import their
-reusable, non-interactive pieces (constants, find_existing, create_pod,
-derive_proxy_url, write_state) and re-implement the control loop here with:
+rich.Confirm and quit via sys.exit — both fatal to a webapp. We keep edits to
+the vendored copies minimal (see pod_control/PROVENANCE.md), so instead we
+import their reusable, non-interactive pieces (constants, find_existing,
+create_pod, derive_proxy_url, write_state) and re-implement the control loop
+here with:
 
   * automatic GPU fallback (no prompt),
   * cooperative cancellation on every poll tick,
@@ -21,8 +22,8 @@ import sys           # to mutate sys.path for the vendored imports
 import time          # wall-clock deadlines and inter-poll sleeps
 from pathlib import Path  # build the pod_control directory path
 
-# Make the vendored, unmodified pod_control modules importable with their
-# original sibling imports (`import _secrets`, `import egress_logger`) intact.
+# Make the vendored pod_control modules importable with their original sibling
+# imports (`import _secrets`, `import egress_logger`) intact.
 POD_CONTROL_DIR = Path(__file__).resolve().parents[1] / "pod_control"  # …/podlink/pod_control
 if str(POD_CONTROL_DIR) not in sys.path:              # avoid duplicate entries on reload
     sys.path.insert(0, str(POD_CONTROL_DIR))          # front of path so our copy wins
@@ -46,6 +47,13 @@ def _sleep_or_cancel(session: PodSession, seconds: float) -> bool:
     return session.cancel.wait(seconds)   # Event.wait returns True the moment it's set
 
 
+def _read_secret(getter) -> str:
+    """Read a secret and register it for verbatim redaction in the egress log."""
+    value = getter()                        # vendored getter; may sys.exit if missing
+    egress_logger.register_secret(value)    # strip this exact value from any log line
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Pod Up
 # ---------------------------------------------------------------------------
@@ -58,7 +66,7 @@ def start(session: PodSession) -> None:
     state; on failure it flips the session to ERROR.
     """
     try:
-        runpod.api_key = _secrets.runpod_api_key()        # authenticate the SDK
+        runpod.api_key = _read_secret(_secrets.runpod_api_key)        # authenticate the SDK
 
         existing = pod_up.find_existing()                 # is a pod already named podlink?
         if existing is not None:                          # yes — adopt it instead of duplicating
@@ -92,14 +100,17 @@ def start(session: PodSession) -> None:
         if not session.commit_running():                 # flip to RUNNING unless a stop won
             return                                        # a stop overtook us at the finish line
     except Exception as e:  # noqa: BLE001 — surface any failure to the UI
+        # Type only — str(e) from the SDK/httpx can embed request context
+        # (URLs, headers, the RunPod API key). The phase field already names
+        # the failing step; full detail stays server-side / in the dashboard.
         session.update(state=State.ERROR, phase="error during start",
-                       error=f"{type(e).__name__}: {e}")  # show the error, keep buttons live
+                       error=f"{type(e).__name__} — check the RunPod dashboard for details")
 
 
 def _create_with_fallback(session: PodSession) -> dict | None:
     """Try each GPU in preference order automatically (no interactive prompt)."""
-    bearer = _secrets.bearer_token()                     # vLLM API key (goes into pod env)
-    hf = _secrets.hf_token()                             # Hugging Face token for weight pull
+    bearer = _read_secret(_secrets.bearer_token)                     # vLLM API key (goes into pod env)
+    hf = _read_secret(_secrets.hf_token)                             # Hugging Face token for weight pull
     last_err: Exception | None = None                    # remember the final failure
     for gpu_id in pod_up.GPU_PREFERENCES:                # e.g. ["RTX 5090", "RTX A6000"]
         if session.cancel.is_set():                      # user hit Down before we created
@@ -131,7 +142,7 @@ def _wait_for_running(session: PodSession, pod_id: str) -> bool:
 
 def _wait_for_ready(session: PodSession, proxy_url: str) -> bool:
     """Poll {proxy}/v1/models until 200 (vLLM finished loading), via the audit client."""
-    bearer = _secrets.bearer_token()                     # bearer for the Authorization header
+    bearer = _read_secret(_secrets.bearer_token)                     # bearer for the Authorization header
     url = f"{proxy_url}/v1/models"                        # OpenAI-compatible models endpoint
     headers = {"Authorization": f"Bearer {bearer}"}      # authenticate the probe
     deadline = time.time() + READY_TIMEOUT_S             # absolute give-up time
@@ -163,7 +174,7 @@ def stop(session: PodSession) -> None:
     pod created before the state file existed is still caught.
     """
     try:
-        runpod.api_key = _secrets.runpod_api_key()       # authenticate the SDK
+        runpod.api_key = _read_secret(_secrets.runpod_api_key)       # authenticate the SDK
 
         pod_id = _resolve_pod_id(session)                # find the pod however we can
         if pod_id is None:                               # genuinely nothing exists to stop
@@ -185,8 +196,9 @@ def stop(session: PodSession) -> None:
                       f"{STOP_VERIFY_TIMEOUT_S}s; it may still be charging.",
             )
     except Exception as e:  # noqa: BLE001                # surface any stop failure
+        # Type only — never interpolate str(e); it may leak request context/secrets.
         session.update(state=State.ERROR, phase="error during stop",
-                       error=f"{type(e).__name__}: {e}")
+                       error=f"{type(e).__name__} — check the RunPod dashboard for details")
 
 
 def _resolve_pod_id(session: PodSession) -> str | None:

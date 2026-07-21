@@ -29,6 +29,20 @@ TOKEN = pysecrets.token_urlsafe(24)  # unguessable per-run secret
 STATIC_DIR = Path(__file__).resolve().parent / "static"  # …/app/static
 
 
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Forbid framing so a malicious page can't clickjack POD UP/DOWN.
+
+    Without this, an external site could iframe the localhost UI and overlay a
+    transparent trick-click on the buttons — the framed page's own JS fetches
+    the token, so the per-process token gate alone would not stop it.
+    """
+    response = await call_next(request)                       # run the route
+    response.headers["X-Frame-Options"] = "DENY"              # legacy anti-framing
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"  # modern
+    return response
+
+
 def _require_token(x_podlink_token: str | None) -> None:
     """Reject any state-changing request without the matching header token."""
     if not x_podlink_token or not pysecrets.compare_digest(x_podlink_token, TOKEN):

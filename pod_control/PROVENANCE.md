@@ -5,6 +5,10 @@ unit: podlink's own orchestration (state machine, non-interactive driver, web
 server) lives in `app/`, not here. If you change infra assumptions (pod name,
 GPU list, secrets location), change them here and re-test the driver.
 
+Local modification: `egress_logger.py` gained `register_secret()` so the driver
+can register literal secret values for verbatim redaction in the audit log
+(the original only redacted 64-hex-looking tokens).
+
 | File | Role |
 |------|------|
 | `pod_up.py`      | Create/resume the `podlink` RunPod pod; waits for RUNNING; writes `pod_state.json`. |

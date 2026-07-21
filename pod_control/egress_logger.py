@@ -21,9 +21,22 @@ LOG_PATH = Path(__file__).resolve().parents[1] / "logs" / "egress.jsonl"
 # downstream libs can occasionally include header values.
 _TOKEN_RE = re.compile(r"[A-Fa-f0-9]{64}")
 
+# Literal secret values registered at runtime (via register_secret). Stripped
+# verbatim so a token that ISN'T 64-hex (JWT, base64, short) is still redacted —
+# the regex above is only a format-guess backstop.
+_SECRETS: set[str] = set()
+
+
+def register_secret(value: str) -> None:
+    """Register a literal secret string to strip from every audit-log field."""
+    if value:                       # ignore empty/None
+        _SECRETS.add(value)
+
 
 def _redact(s: str) -> str:
-    return _TOKEN_RE.sub("[REDACTED]", s)
+    for secret in _SECRETS:         # literal, format-independent redaction first
+        s = s.replace(secret, "[REDACTED]")
+    return _TOKEN_RE.sub("[REDACTED]", s)  # then the 64-hex backstop
 
 
 def _tls_version(resp: httpx.Response, scheme: str) -> str | None:
