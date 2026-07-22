@@ -1,47 +1,111 @@
-"""Provision (or resume) the Phase 0 RunPod pod. Idempotent.
+"""Provision (or resume) the podlink RunPod pod. Idempotent.
 
 If a pod named POD_NAME already exists, prints its state and exits 0.
-Otherwise creates a new Secure Cloud pod serving Qwen 2.5 32B AWQ via vLLM
-on RTX 5090 (with A6000 fallback when 5090 stock is exhausted).
+Otherwise creates a new Secure Cloud pod on a single RTX Pro 6000 (96 GB,
+Blackwell) running the ragline three-service stack from ONE bundled image:
 
-Writes phase0/pod_state.json on success. The bearer token is NEVER written
-here — it stays in ~/.config/podlink/pod_bearer_token.
+    :8000  vLLM        LLM (chat + KG extraction), served as ragline-llm
+    :8080  TEI         embedder  (/v1/embeddings, /health)
+    :8081  TEI         reranker  (/rerank, /health)
+
+The image itself (vLLM + both TEI + supervisor) lives in ../pod_image and must be
+built and pushed first — see pod_image/README.md. Model weights are pulled on the
+pod's first boot into the /workspace volume, not baked into the image.
+
+Writes pod_state.json on success. The bearer token is NEVER written here — it
+stays in ~/.config/podlink/pod_bearer_token.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import time
 from pathlib import Path
 
 import runpod
+from runpod.error import QueryError
 from rich import print as rprint
 from rich.prompt import Confirm
 
 import _secrets
 
 POD_NAME = "podlink"
-MODEL_ID = "Qwen/Qwen2.5-32B-Instruct-AWQ"
-# Pinned tag, not :latest. TODO before first prospect demo: replace with a
-# digest pin (`vllm/vllm-openai@sha256:<digest>`) using `docker inspect` on a
-# locally pulled image. Pin tag set 2026-05-12.
-# Updated 2026-05-17: v0.20.2 requires CUDA 13.0 which RunPod's current driver
-# fleet doesn't support (host error: "unsatisfied condition: cuda>=13.0").
-# Dropped to v0.9.2 (CUDA 12.4) which RunPod hosts accept. Amend Phase0_Plan.md
-# accordingly before next prospect demo.
-IMAGE = "vllm/vllm-openai:v0.9.2"
-EXPOSED_PORT = "8000/http"  # HTTP port mode -> RunPod proxy URL with auto TLS
-CONTAINER_DISK_GB = 30
-VOLUME_GB = 30
-VOLUME_MOUNT = "/workspace"
-MAX_MODEL_LEN = 8192
 
-GPU_PREFERENCES = [
-    "NVIDIA GeForce RTX 5090",  # primary
-    "NVIDIA RTX A6000",         # architect-approved fallback (48 GB Ampere)
-]
+# RunPod's on-demand finder lands on a random Secure host; some lack free
+# disk/resources and reject the pod ("This machine does not have the resources…")
+# or momentarily report "no longer any instances available" — intermittently, even
+# when the card is available (the SAME config succeeds on the next host). A failed
+# create allocates nothing and bills nothing, so we just retry until a host takes it.
+CREATE_RETRIES = 15         # attempts before giving up (~ CREATE_RETRIES * RETRY_DELAY s)
+RETRY_DELAY = 15            # seconds between create attempts
+_RETRYABLE_CREATE_ERRORS = (
+    "does not have the resources",
+    "no longer any instances",
+    "instances available",
+)
+
+# --- the bundled three-service image (build + push from ../pod_image) ---------
+# Must equal the tag you `docker push`. Blackwell-capable (Dockerfile pins vLLM
+# v0.25.1 / sm_120). podlink must NOT pass docker_args at create time, so the
+# image's own CMD (supervisord) runs.
+IMAGE = "ghcr.io/14mm47/ragline-pod:2026-07"  # <-- must match what you push
+
+# The image is PRIVATE (ghcr.io), so RunPod needs registry pull-creds on EVERY
+# pull — first boot, a resume that relocates to a new host, and any recreate. The
+# runpod SDK's create_pod CANNOT attach registry auth directly; only a TEMPLATE
+# carries containerRegistryAuthId. So ensure_template() bundles this credential id
+# (the "ghcr-ragline-pod" cred from RunPod → Settings → Container Registry Auth)
+# into a template, and the pod deploys from that template_id. Keep the registry
+# PAT long-lived — if it expires, re-pulls fail.
+CONTAINER_REGISTRY_AUTH_ID = "REDACTED_REGISTRY_AUTH_ID"
+TEMPLATE_NAME = "ragline-pod"   # RunPod template bundling IMAGE + the registry cred
+
+# --- models the pod serves (VERIFIED balanced profile — repo IDs confirmed on
+# live HF pages; awq_marlin is the reliable W4A16 path on sm_120) --------------
+# The LLM served-model-name is fixed to ragline-llm inside the image wrapper.
+LLM_MODEL_ID = "stelterlab/Qwen3-30B-A3B-Instruct-2507-AWQ"   # Apache-2.0, 30B/3.3B active MoE
+EMBED_MODEL_ID = "Qwen/Qwen3-Embedding-8B"                    # Apache-2.0, #1 MMTEB
+RERANK_MODEL_ID = "BAAI/bge-reranker-v2-m3"                   # TEI-native cross-encoder
+# vLLM --quantization. LEAVE EMPTY for this checkpoint: stelterlab/Qwen3-30B-A3B-
+# Instruct-2507-AWQ was produced with llm-compressor, so its config declares the
+# quant as "compressed-tensors" (W4A16 AWQ). Forcing "awq_marlin" CONFLICTS with
+# that and vLLM refuses to start ("... does not match ..."). Empty lets vLLM
+# auto-detect compressed-tensors from the checkpoint and select the Marlin W4A16
+# kernel on sm_120 itself. (For a gpt-oss LLM you'd set "mxfp4" + the image would
+# need --enforce-eager; NEVER "nvfp4" on sm_120.)
+LLM_QUANT = ""
+
+# --- the three service ports, exposed via RunPod's HTTPS proxy ----------------
+SERVICE_PORTS = {"llm": 8000, "embedder": 8080, "reranker": 8081}
+# HTTP port mode -> each port gets a proxy URL with auto TLS.
+EXPOSED_PORT = ",".join(f"{p}/http" for p in SERVICE_PORTS.values())
+
+# --- pod sizing ---------------------------------------------------------------
+CONTAINER_DISK_GB = 55    # must hold the bundled image (~38 GB on the 24.04/CUDA-12.9
+                          # base) + vLLM's torch_compile_cache (~1-2 GB, on container
+                          # disk, not the volume) + scratch. 40 GB was too tight.
+# The /workspace volume holds the persistent HF cache (LLM + both TEI models).
+# This is a pod-scoped Data Volume: it survives STOP/RESUME (podlink's lifecycle)
+# but is destroyed on TERMINATE. To make it terminate-safe, pass a pre-created
+# network_volume_id to create_pod instead (region-bound).
+# 50 GB holds the BALANCED profile (~36 GB weights) with headroom for download
+# temp files. container_disk + volume is the per-pod disk the Secure host must
+# have free: an oversized ask gets rejected with "this machine does not have the
+# resources" (130 GB failed; a manual 30+50=80 GB deploy succeeded). Keep it lean;
+# bump (and re-create) only if you later A/B a second LLM.
+VOLUME_GB = 50
+VOLUME_MOUNT = "/workspace"
+MAX_MODEL_LEN = 32768
+GPU_MEMORY_UTILIZATION = 0.70   # caps vLLM so the two TEI services fit on 96 GB
+
+# The specs never publish RunPod's exact GPU type id for the RTX Pro 6000, so we
+# resolve it live (resolve_gpu_id) by matching this substring against the catalog.
+GPU_MATCH = "RTX PRO 6000"
 
 STATE_PATH = Path(__file__).resolve().parents[1] / "pod_state.json"
+TEMPLATE_STATE_PATH = Path(__file__).resolve().parents[1] / "template_state.json"
 
 
 def find_existing() -> dict | None:
@@ -51,75 +115,193 @@ def find_existing() -> dict | None:
     return None
 
 
-def build_docker_args() -> str:
-    # IMPORTANT: do NOT pass --api-key on the command line.
-    # vLLM reads VLLM_API_KEY from the environment natively; passing it as an
-    # argv would make the token visible in `ps aux` inside the pod (the
-    # RunPod web terminal cannot be disabled, so any shell session there
-    # would see the token).
-    # vllm/vllm-openai images (>= v0.9) set ENTRYPOINT to
-    # `python -m vllm.entrypoints.openai.api_server`, so we pass only the
-    # flags here. Older images had a shell entrypoint and required the full
-    # python invocation; check the image's Dockerfile before changing.
-    return (
-        f"--model {MODEL_ID} "
-        "--quantization awq_marlin "
-        "--host 0.0.0.0 --port 8000 "
-        f"--max-model-len {MAX_MODEL_LEN} "
-        "--gpu-memory-utilization 0.92"
-    )
+def ensure_template() -> str:
+    """Return a RunPod template id that bundles the private IMAGE with its registry
+    credential, so the pod can pull it.
 
+    Why a template: the SDK's create_pod has no registry-auth parameter — only a
+    template carries containerRegistryAuthId (see the module note on
+    CONTAINER_REGISTRY_AUTH_ID). The pod then deploys with template_id.
 
-def create_pod(gpu_type_id: str, bearer: str, hf: str) -> dict:
-    rprint(f"[bold cyan]Creating pod[/] on [bold]{gpu_type_id}[/] …")
-    pod = runpod.create_pod(
-        name=POD_NAME,
+    Idempotency: there is no list-templates API, and create_template always makes a
+    NEW template, so we cache the id in template_state.json and reuse it. We
+    recreate only if IMAGE or the credential changed (a stale template would point
+    at the old image/cred). Delete template_state.json to force a fresh one.
+
+    Secrets are NOT put in the template (env=[] by default) — the bearer/HF token
+    stay in the pod-level env, so nothing sensitive lands in a persistent template.
+    """
+    if TEMPLATE_STATE_PATH.exists():
+        st = json.loads(TEMPLATE_STATE_PATH.read_text())
+        if (st.get("template_id")
+                and st.get("image") == IMAGE
+                and st.get("registry_auth_id") == CONTAINER_REGISTRY_AUTH_ID):
+            rprint(f"[cyan]Reusing template[/] {st['template_id']} "
+                   f"(from {TEMPLATE_STATE_PATH.name})")
+            return st["template_id"]
+        rprint("[yellow]template_state.json is stale (IMAGE or credential changed) "
+               "— creating a new template.[/]")
+
+    rprint(f"[bold cyan]Creating template[/] {TEMPLATE_NAME!r} for private image {IMAGE} …")
+    # docker_start_cmd omitted -> the mutation sends dockerArgs "" -> the image's
+    # own CMD (supervisord) runs, launching all three services. Ports/disk mirror
+    # the pod so the template is self-consistent; the pod re-specifies them anyway.
+    tmpl = runpod.create_template(
+        name=TEMPLATE_NAME,
         image_name=IMAGE,
-        gpu_type_id=gpu_type_id,
-        cloud_type="SECURE",
-        gpu_count=1,
-        volume_in_gb=VOLUME_GB,
+        registry_auth_id=CONTAINER_REGISTRY_AUTH_ID,
         container_disk_in_gb=CONTAINER_DISK_GB,
-        volume_mount_path=VOLUME_MOUNT,
         ports=EXPOSED_PORT,
-        env={
-            "HF_TOKEN": hf,
-            "VLLM_API_KEY": bearer,
-            "HUGGING_FACE_HUB_TOKEN": hf,  # some images read this name instead
-        },
-        docker_args=build_docker_args(),
-        support_public_ip=False,  # all traffic goes via RunPod's HTTPS proxy
-        start_ssh=False,           # SSH disabled; reduces attack surface
+        is_serverless=False,
     )
-    return pod
+    template_id = tmpl["id"]
+    TEMPLATE_STATE_PATH.write_text(json.dumps({
+        "template_id": template_id,
+        "name": tmpl.get("name"),
+        "image": IMAGE,
+        "registry_auth_id": CONTAINER_REGISTRY_AUTH_ID,
+    }, indent=2) + "\n")
+    rprint(f"[green]Created template[/] {template_id} → wrote {TEMPLATE_STATE_PATH.name}")
+    return template_id
+
+
+def resolve_gpu_id(match: str = GPU_MATCH) -> str:
+    """Resolve the RunPod gpu_type_id for a FULL 96 GB RTX PRO 6000.
+
+    RunPod lists several RTX PRO 6000 SKUs and the naive "first substring match"
+    picked the wrong one: the *Max-Q Workstation Edition* (a desktop variant
+    rarely stocked in Secure Cloud) → deploys hit "no instances available". The
+    catalog also has 24/48 GB **MIG slices** (too small for our stack) and a
+    *Workstation Edition*. The datacenter SKU that Secure Cloud actually stocks is
+    the **Server Edition** (displayName "RTX PRO 6000").
+
+    So among entries matching `match`, we drop MIG slices and anything under a
+    full 96 GB card, then prefer the Server Edition, and return its gpu_type_id.
+    """
+    needle = match.upper().replace(" ", "")
+    candidates = []
+    for g in runpod.get_gpus():                              # live GPU catalog
+        gid = g.get("id") or ""
+        label = g.get("displayName") or gid
+        if needle not in (gid + " " + label).upper().replace(" ", ""):
+            continue
+        if "MIG" in gid.upper():                             # skip 24/48 GB MIG slices
+            continue
+        if (g.get("memoryInGb") or 0) < 90:                  # require a full 96 GB card
+            continue
+        candidates.append(gid)
+    if not candidates:
+        raise RuntimeError(
+            f"No full-96GB GPU type matched {match!r}. Inspect the catalog with "
+            f"runpod.get_gpus()."
+        )
+    # Prefer the Secure-stocked datacenter SKU (Server Edition) over the
+    # workstation variants; stable tiebreak by id.
+    candidates.sort(key=lambda i: (0 if "SERVER EDITION" in i.upper() else 1, i))
+    return candidates[0]
+
+
+def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None = None) -> dict:
+    """Create the pod from the bundled image. Model config is passed via env; the
+    image's supervisor launches all three services. No docker_args (that would
+    override the image CMD).
+
+    template_id supplies the private-registry credential (the SDK can't attach it
+    to a pod directly). It defaults to None and is resolved via ensure_template()
+    here, so BOTH entry points work unchanged — the CLI try_create() and the web-UI
+    driver's pod_up.create_pod(gpu_id, bearer, hf) 3-arg call. imageName is still
+    sent alongside; RunPod pulls it using the template's containerRegistryAuthId.
+    Secrets live here in env, never in the persistent template."""
+    if template_id is None:
+        template_id = ensure_template()
+    env = {
+        # weight-pull token, seen by all three services in the container
+        "HF_TOKEN": hf,
+        "HUGGING_FACE_HUB_TOKEN": hf,     # some loaders read this name instead
+        # vLLM reads its API key from env (never argv -> not visible in ps)
+        "VLLM_API_KEY": bearer,
+        # Same bearer gates the two TEI services: their :8080/:8081 endpoints are
+        # reachable over RunPod's PUBLIC proxy, so they must not be keyless. The
+        # wrappers export this as TEI's native API_KEY env (not argv).
+        "TEI_API_KEY": bearer,
+        # which models to serve + how to size vLLM (read by the image wrappers)
+        "LLM_MODEL_ID": LLM_MODEL_ID,
+        "EMBED_MODEL_ID": EMBED_MODEL_ID,
+        "RERANK_MODEL_ID": RERANK_MODEL_ID,
+        "LLM_QUANT": LLM_QUANT,
+        "MAX_MODEL_LEN": str(MAX_MODEL_LEN),
+        "GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
+    }
+    # Retry the host-selection lottery (see _RETRYABLE_CREATE_ERRORS). A failed
+    # create allocates nothing, so retrying is free; Ctrl-C aborts.
+    last_err: QueryError | None = None
+    for attempt in range(1, CREATE_RETRIES + 1):
+        rprint(f"[bold cyan]Creating pod[/] on [bold]{gpu_type_id}[/] "
+               f"(template {template_id}) — attempt {attempt}/{CREATE_RETRIES} …")
+        try:
+            # runpod 1.7.13's create_pod does `print(f"raw_response: {raw_response}")`,
+            # and raw_response echoes the pod env — HF_TOKEN and the VLLM/TEI bearer —
+            # to stdout (terminal + any captured logs). Capture and discard that stdout
+            # so the secrets never leak; we use the return value, not the print.
+            with contextlib.redirect_stdout(io.StringIO()):
+                return runpod.create_pod(
+                    name=POD_NAME,
+                    image_name=IMAGE,
+                    template_id=template_id,  # carries the ghcr pull credential
+                    gpu_type_id=gpu_type_id,
+                    cloud_type="SECURE",
+                    gpu_count=1,
+                    volume_in_gb=VOLUME_GB,
+                    container_disk_in_gb=CONTAINER_DISK_GB,
+                    volume_mount_path=VOLUME_MOUNT,
+                    ports=EXPOSED_PORT,       # "8000/http,8080/http,8081/http"
+                    env=env,
+                    support_public_ip=False,  # all traffic via RunPod's HTTPS proxy
+                    start_ssh=True,           # SSH on for first-boot debug / pre-warm
+                )
+        except QueryError as e:
+            if not any(s in str(e) for s in _RETRYABLE_CREATE_ERRORS):
+                raise                         # a real error (bad spec, auth, …) — surface it
+            last_err = e
+            if attempt < CREATE_RETRIES:
+                rprint(f"[yellow]  no host with capacity yet — retrying in "
+                       f"{RETRY_DELAY}s[/] ({str(e)[:70]})")
+                time.sleep(RETRY_DELAY)
+    raise RuntimeError(
+        f"No Secure host accepted the pod after {CREATE_RETRIES} attempts. "
+        f"Last error: {last_err}. Try again later, pin a data_center_id, or trim disk."
+    )
 
 
 def try_create() -> dict:
+    """CLI helper: resolve the RTX Pro 6000 id and create the pod (no GPU fallback
+    — the image + models are sized for the 96 GB card; a smaller GPU would OOM)."""
     bearer = _secrets.bearer_token()
     hf = _secrets.hf_token()
-    last_err = None
-    for gpu_id in GPU_PREFERENCES:
-        try:
-            return create_pod(gpu_id, bearer, hf)
-        except Exception as e:
-            # Avoid printing exception payload — SDK exceptions can include
-            # request context (potentially the API key in some versions).
-            rprint(f"[yellow]GPU {gpu_id} unavailable[/] "
-                   f"({type(e).__name__}). Check the RunPod dashboard for details.")
-            last_err = e
-            if gpu_id != GPU_PREFERENCES[-1]:
-                if not Confirm.ask(f"Fall back to next GPU option?", default=True):
-                    break
-    raise RuntimeError(f"All GPU options exhausted. Last error: {last_err}")
+    gpu_id = resolve_gpu_id()
+    try:
+        return create_pod(gpu_id, bearer, hf)   # create_pod ensures the template
+    except Exception as e:
+        # Avoid printing the exception payload — SDK exceptions can embed request
+        # context (potentially the API key in some versions).
+        rprint(f"[yellow]Create failed on {gpu_id}[/] ({type(e).__name__}). "
+               f"Check the RunPod dashboard for details.")
+        raise
 
 
-def derive_proxy_url(pod_id: str) -> str:
-    # Format documented at docs.runpod.io/pods/configuration/expose-ports
-    return f"https://{pod_id}-8000.proxy.runpod.net"
+def derive_proxy_url(pod_id: str, port: int = 8000) -> str:
+    """RunPod HTTPS proxy URL for a given exposed port.
+    Format: docs.runpod.io/pods/configuration/expose-ports"""
+    return f"https://{pod_id}-{port}.proxy.runpod.net"
+
+
+def service_urls(pod_id: str) -> dict[str, str]:
+    """The three proxy base URLs keyed by service name (llm/embedder/reranker)."""
+    return {name: derive_proxy_url(pod_id, port) for name, port in SERVICE_PORTS.items()}
 
 
 def wait_for_running(pod_id: str, timeout_s: int = 900) -> dict:
-    rprint("[bold]Waiting for pod to reach RUNNING…[/] (model weight pull can take 5–15 min)")
+    rprint("[bold]Waiting for pod to reach RUNNING…[/] (model weight pull can take several min)")
     deadline = time.time() + timeout_s
     last_status = None
     while time.time() < deadline:
@@ -137,18 +319,26 @@ def wait_for_running(pod_id: str, timeout_s: int = 900) -> dict:
 
 def write_state(pod: dict, gpu_type_id: str) -> None:
     pod_id = pod["id"]
+    urls = service_urls(pod_id)
     state = {
         "pod_id": pod_id,
         "name": pod.get("name"),
-        "proxy_url": derive_proxy_url(pod_id),
-        "model": MODEL_ID,
+        "proxy_url": urls["llm"],          # primary (kept for back-compat)
+        "service_urls": urls,              # all three: llm / embedder / reranker
+        "models": {
+            "llm": LLM_MODEL_ID,
+            "served_as": "ragline-llm",
+            "embedder": EMBED_MODEL_ID,
+            "reranker": RERANK_MODEL_ID,
+        },
         "gpu_type": gpu_type_id,
         "image": IMAGE,
         "created_at": pod.get("lastStatusChange") or pod.get("createdAt"),
     }
     STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
     rprint(f"[green]Wrote[/] {STATE_PATH}")
-    rprint(f"[bold]Proxy URL:[/] {state['proxy_url']}")
+    for name, url in urls.items():
+        rprint(f"[bold]{name} URL:[/] {url}")
 
 
 def main() -> None:
@@ -165,9 +355,8 @@ def main() -> None:
                 # resume_pod signature varies; SDK requires gpu_count
                 runpod.resume_pod(pod_id, gpu_count=1)
                 wait_for_running(pod_id)
-        # rewrite state file so we always have fresh URL on disk
+        # rewrite state file so we always have fresh URLs on disk
         pod = runpod.get_pod(pod_id)
-        # gpu_type comes back nested in 'machine'/'gpuTypeId' depending on SDK version
         gpu_type = (pod.get("machine", {}).get("gpuTypeId")
                     or pod.get("gpuTypeId") or "unknown")
         write_state({**pod, "id": pod_id}, gpu_type)
@@ -178,11 +367,11 @@ def main() -> None:
     rprint(f"[green]Pod created:[/] id={pod_id}")
     pod = wait_for_running(pod_id)
     gpu_type = (pod.get("machine", {}).get("gpuTypeId")
-                or pod.get("gpuTypeId") or GPU_PREFERENCES[0])
+                or pod.get("gpuTypeId") or GPU_MATCH)
     write_state(pod, gpu_type)
-    rprint("[bold green]Pod is up.[/] vLLM may still be loading model weights — "
-           "check logs in the RunPod dashboard, or run auth_checks.py and retry "
-           "until /v1/models returns 200.")
+    rprint("[bold green]Pod is up.[/] The three services may still be loading model "
+           "weights — check logs in the RunPod dashboard, or poll /v1/models (8000) "
+           "and /health (8080, 8081) until each returns 200.")
 
 
 if __name__ == "__main__":

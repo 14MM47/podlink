@@ -118,7 +118,7 @@ def start(session: PodSession) -> None:
                 session.update(phase="resuming stopped pod")
                 runpod.resume_pod(pod_id, gpu_count=1)    # SDK requires gpu_count
         else:                                             # no pod yet — create one
-            pod = _create_with_fallback(session)          # try 5090, then A6000
+            pod = _create_with_fallback(session)          # resolve RTX Pro 6000 + create
             if pod is None:                               # cancel arrived during create
                 return                                    # let the stop worker take over
             pod_id = pod["id"]                            # id of the freshly created pod
@@ -127,9 +127,10 @@ def start(session: PodSession) -> None:
         if not _wait_for_running(session, pod_id):        # poll until RUNNING (or cancel)
             return                                        # cancelled mid-wait
 
-        proxy_url = pod_up.derive_proxy_url(pod_id)        # https://<id>-8000.proxy.runpod.net
-        session.update(proxy_url=proxy_url, phase="waiting for vLLM to serve model")
-        if not _wait_for_ready(session, proxy_url):        # poll /v1/models until 200 (or cancel)
+        llm_url = pod_up.derive_proxy_url(pod_id, pod_up.SERVICE_PORTS["llm"])  # primary URL
+        session.update(proxy_url=llm_url,
+                       phase="waiting for all three services to become healthy")
+        if not _wait_for_all_ready(session, pod_id):       # LLM + embedder + reranker (or cancel)
             return                                        # cancelled mid-wait
 
         # Persist state only once safely up, matching the scripts' contract.
@@ -149,20 +150,22 @@ def start(session: PodSession) -> None:
 
 
 def _create_with_fallback(session: PodSession) -> dict | None:
-    """Try each GPU in preference order automatically (no interactive prompt)."""
-    bearer = _read_secret(_secrets.bearer_token)                     # vLLM API key (goes into pod env)
-    hf = _read_secret(_secrets.hf_token)                             # Hugging Face token for weight pull
-    last_err: Exception | None = None                    # remember the final failure
-    for gpu_id in pod_up.GPU_PREFERENCES:                # e.g. ["RTX 5090", "RTX A6000"]
-        if session.cancel.is_set():                      # user hit Down before we created
-            return None                                  # abort the create loop
-        try:
-            session.update(phase=f"creating pod on {gpu_id}")  # progress text
-            return pod_up.create_pod(gpu_id, bearer, hf)  # blocking SDK call; returns pod dict
-        except Exception as e:  # noqa: BLE001            # this GPU type unavailable etc.
-            last_err = e                                 # keep the error…
-            session.update(phase=f"{gpu_id} unavailable ({type(e).__name__}); trying next")
-    raise RuntimeError(f"All GPU options exhausted. Last error: {last_err}")  # none worked
+    """Resolve the RTX Pro 6000 id and create the pod (no GPU fallback).
+
+    The bundled image + models are sized for the 96 GB card, so a smaller GPU
+    would OOM rather than help — we target one card and let any create error
+    surface to start()'s handler.
+    """
+    bearer = _read_secret(_secrets.bearer_token)         # -> pod env VLLM_API_KEY
+    hf = _read_secret(_secrets.hf_token)                 # -> weight-pull token (all 3 services)
+    if session.cancel.is_set():                          # Down pressed before we resolve
+        return None
+    session.update(phase="resolving RTX Pro 6000 GPU id")  # live catalog lookup
+    gpu_id = pod_up.resolve_gpu_id()                     # exact RunPod gpu_type_id
+    if session.cancel.is_set():                          # Down pressed during the lookup
+        return None
+    session.update(phase=f"creating pod on {gpu_id}")    # progress text
+    return pod_up.create_pod(gpu_id, bearer, hf)         # blocking SDK call; returns pod dict
 
 
 def _wait_for_running(session: PodSession, pod_id: str) -> bool:
@@ -181,26 +184,48 @@ def _wait_for_running(session: PodSession, pod_id: str) -> bool:
     raise RuntimeError(f"pod {pod_id} did not reach RUNNING within {RUNNING_TIMEOUT_S}s")
 
 
-def _wait_for_ready(session: PodSession, proxy_url: str) -> bool:
-    """Poll {proxy}/v1/models until 200 (vLLM finished loading), via the audit client."""
-    bearer = _read_secret(_secrets.bearer_token)                     # bearer for the Authorization header
-    url = f"{proxy_url}/v1/models"                        # OpenAI-compatible models endpoint
-    headers = {"Authorization": f"Bearer {bearer}"}      # authenticate the probe
+def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
+    """Poll all three services until each returns 200 (or cancel/timeout).
+
+    "Pod ready" = LLM /v1/models AND embedder /health AND reranker /health, per
+    the ragline spec. All three services are gated by the same bearer (their
+    ports are on RunPod's public proxy), so every probe carries it. Each service
+    is dropped from the poll set once healthy, and the phase text reports which
+    are still coming up.
+    """
+    bearer = _read_secret(_secrets.bearer_token)         # gates all three services
+    auth = {"Authorization": f"Bearer {bearer}"}         # same header for each probe
+    urls = pod_up.service_urls(pod_id)                   # {llm,embedder,reranker: base URL}
+    probes = {                                           # service -> (url, headers)
+        "llm":      (f"{urls['llm']}/v1/models",   auth),
+        "embedder": (f"{urls['embedder']}/health", auth),
+        "reranker": (f"{urls['reranker']}/health", auth),
+    }
+    ready: set[str] = set()                              # services confirmed 200
     deadline = time.time() + READY_TIMEOUT_S             # absolute give-up time
     while time.time() < deadline:                        # loop until deadline
         if session.cancel.is_set():                      # Down pressed while weights load
             return False                                 # bail to the stop worker
-        try:
-            with egress_logger.client(timeout=15.0) as c:    # audited httpx client (logs egress)
-                r = c.get(url, headers=headers)          # probe the endpoint
-            if r.status_code == 200:                     # vLLM is serving the model
-                return True                              # start is complete
-            session.update(phase=f"waiting for vLLM… (HTTP {r.status_code})")  # e.g. 401/503
-        except Exception:  # noqa: BLE001                 # connection refused while booting
-            session.update(phase="waiting for vLLM… (connecting)")  # progress text
+        for name, (url, headers) in probes.items():      # probe each not-yet-ready service
+            if name in ready:                            # already up — skip
+                continue
+            try:
+                with egress_logger.client(timeout=15.0) as c:   # audited httpx client
+                    r = c.get(url, headers=headers)      # probe the endpoint
+                if r.status_code == 200:                 # this service is serving
+                    ready.add(name)
+            except Exception:  # noqa: BLE001            # connection refused while booting
+                pass                                     # keep waiting on this one
+        if len(ready) == len(probes):                    # all three healthy
+            return True                                  # start is complete
+        pending = [n for n in probes if n not in ready]  # what's still loading
+        session.update(phase=f"waiting for services… "
+                             f"(ready: {sorted(ready) or ['none']}; pending: {pending})")
         if _sleep_or_cancel(session, POLL_S):            # wait, waking early on cancel
             return False                                 # cancelled during the sleep
-    raise RuntimeError("pod RUNNING but /v1/models never returned 200")  # boot never finished
+    pending = [n for n in probes if n not in ready]      # timed out — name the stragglers
+    raise RuntimeError(f"pod RUNNING but services not all healthy within "
+                       f"{READY_TIMEOUT_S}s (pending: {pending})")
 
 
 # ---------------------------------------------------------------------------

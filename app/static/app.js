@@ -46,9 +46,18 @@ function render(s) {
   badge.textContent = s.state;                      // show the current state
   phaseEl.textContent = s.phase || "";              // show progress text (or blank)
   errorEl.textContent = s.error || "";              // show error (or blank)
-  metaEl.textContent = s.pod_id                     // show pod id + proxy when known
-    ? `pod ${s.pod_id}${s.proxy_url ? " · " + s.proxy_url : ""}`
-    : "";                                           // otherwise blank
+  // Show the pod id, and — for our three-service stack (proxy_url set on the
+  // Auto path) — the three ragline URLs, which are just pod-id + fixed ports.
+  if (s.pod_id) {
+    let m = `pod ${s.pod_id}`;
+    if (s.proxy_url) {
+      const base = (port) => `https://${s.pod_id}-${port}.proxy.runpod.net`;
+      m += ` · llm ${base(8000)}/v1 · embed ${base(8080)}/v1 · rerank ${base(8081)}`;
+    }
+    metaEl.textContent = m;
+  } else {
+    metaEl.textContent = "";                        // no pod -> blank
+  }
   // Server is the single source of truth for enablement.
   upBtn.disabled = !s.up_enabled;                   // grey Up unless server allows it
   downBtn.disabled = !s.down_enabled;               // grey Down unless server allows it

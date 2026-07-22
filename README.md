@@ -1,16 +1,25 @@
 # podlink
 
-A standalone local webapp that reduces the podlink Phase 0 pod lifecycle to **two
+A standalone local webapp that reduces the podlink pod lifecycle to **two
 buttons**: **POD UP** and **POD DOWN**. It wraps the original pod-control scripts
 (vendored verbatim in `pod_control/`) so you never touch the RunPod dashboard or
 a terminal to bring the GPU pod up or take it down.
+
+POD UP provisions the **ragline three-service stack** on a single **RTX Pro 6000
+(96 GB, Blackwell)** from one bundled image (see `pod_image/`):
+
+| Port | Service | Readiness gate |
+|------|---------|----------------|
+| 8000 | vLLM — LLM (chat + KG extraction), served as `ragline-llm` | `GET /v1/models` → 200 |
+| 8080 | TEI — embedder | `GET /health` → 200 |
+| 8081 | TEI — reranker | `GET /health` → 200 |
 
 ## Behaviour
 
 | Button | State it's live in | What it does |
 |--------|--------------------|--------------|
-| **POD UP** | IDLE / ERROR | Creates or resumes the `podlink` pod (RTX 5090 → A6000 fallback), waits for `RUNNING`, then waits until vLLM answers `/v1/models` with `200`. |
-| **POD DOWN** | STARTING / RUNNING / ERROR | Cancels any in-flight start, **stops** the pod (GPU billing ends, model-weight volume kept), and **verifies** the pod left `RUNNING` before reporting safe. |
+| **POD UP** | IDLE / ERROR | Resolves the RTX Pro 6000 GPU id (live, via `runpod.get_gpus()`), creates or resumes the `podlink` pod, waits for `RUNNING`, then waits until **all three** services are healthy (LLM `/v1/models` + both TEI `/health` return `200`). |
+| **POD DOWN** | STARTING / RUNNING / ERROR | Cancels any in-flight start, **stops** the whole pod (GPU billing ends, model-weight volume kept), and **verifies** the pod left `RUNNING` before reporting safe. |
 
 Pod Down is greyed out until Pod Up is pressed. The instant Pod Up starts, Pod Up
 greys out and Pod Down goes live — and stays live through the **entire**
@@ -50,9 +59,13 @@ you and mode `0600` — `_secrets.py` refuses to read anything more permissive.
 
 | File | What it holds |
 |------|---------------|
-| `runpod_api_key`   | RunPod API key (drives create/stop). |
-| `hf_token`         | Hugging Face token for the model-weight pull. |
-| `pod_bearer_token` | vLLM API key; also used to probe `/v1/models`. |
+| `runpod_api_key`   | RunPod API key (drives create / resume / stop / GPU lookup). |
+| `hf_token`         | Hugging Face token for the model-weight pull — injected container-wide, so **all three** services (LLM + both TEI) use it. |
+| `pod_bearer_token` | vLLM API key (`VLLM_API_KEY`); also used to probe `/v1/models` and doubles as ragline's `LLM_API_KEY`. |
+
+**No other secrets are needed.** TEI (embedder/reranker) is keyless internally.
+If you use a private image registry, its pull credentials live in **RunPod**
+(Settings → Container Registry Auth), never in `~/.config/podlink/`.
 
 Set them up once:
 
@@ -77,11 +90,56 @@ Verify:
 ls -l ~/.config/podlink            # each file should show -rw------- (0600)
 ```
 
+## Pod image (build once)
+
+POD UP pulls a single bundled image that runs all three services under
+`supervisord`. Build and push it before your first pod up, then set `IMAGE` in
+`pod_control/pod_up.py`. Full instructions — including the Blackwell `sm_120`
+base-image pins to validate — are in [`pod_image/README.md`](pod_image/README.md).
+
 ## Run
 
 ```bash
 pip install -r requirements.txt
 ./run.sh                     # serves http://127.0.0.1:8765
+```
+
+## Deploying to the RTX Pro 6000
+
+1. **Build & push** the bundled image (`pod_image/`); set `IMAGE` in `pod_control/pod_up.py`.
+2. **Confirm the model pins** in `pod_up.py` (`LLM_MODEL_ID` / `EMBED_MODEL_ID` /
+   `RERANK_MODEL_ID` / `LLM_QUANT`) exist on HF with a Blackwell-compatible quant
+   (FP8 checkpoint, or AWQ-Marlin W4A16 — **never NVFP4** on `sm_120`).
+3. **Ensure the three secrets** are in place (above).
+4. **POD UP** — first boot resolves the GPU id, creates the pod, and downloads
+   weights to the `/workspace` volume (a one-time cost; later resumes are fast).
+   The `/workspace` volume is sized (`VOLUME_GB`, ~150 GB) to hold the persistent
+   HF cache so weights aren't re-downloaded each boot.
+5. **Wire ragline** — the UI shows the three proxy URLs (also saved in
+   `pod_state.json`). Point ragline's `.env` at them:
+
+   ```dotenv
+   LLM_BASE_URL=https://<pod-id>-8000.proxy.runpod.net/v1
+   LLM_MODEL=ragline-llm            # must match vLLM --served-model-name
+   LLM_API_KEY=<pod_bearer_token>
+   EMBEDDING_BASE_URL=https://<pod-id>-8080.proxy.runpod.net/v1
+   EMBEDDING_MODEL=BAAI/bge-m3
+   EMBEDDING_DIMENSIONS=1024
+   EMBEDDING_API_KEY=<pod_bearer_token>    # TEI is key-gated (public proxy)
+   RERANKER_PROVIDER=api
+   RERANKER_BASE_URL=https://<pod-id>-8081.proxy.runpod.net   # root, no /rerank
+   RERANKER_API_KEY=<pod_bearer_token>     # TEI is key-gated (public proxy)
+   KG_EXTRACTION_CONCURRENCY=10
+   ```
+
+   The embedder/reranker ports are on RunPod's **public** proxy, so podlink gates
+   them with the same bearer as the LLM — ragline must send it (above) or its
+   embedding/rerank calls get 401.
+
+## Tests
+
+```bash
+python3 tests/test_driver_smoke.py   # stub-based; no RunPod SDK / GPU needed
 ```
 
 ## Security
@@ -97,6 +155,8 @@ pip install -r requirements.txt
 ```
 podlink/
 ├─ pod_control/   # vendored pod-control scripts (see PROVENANCE.md)
+├─ pod_image/     # bundled 3-service image: Dockerfile + supervisor + wrappers
+├─ tests/         # stub-based driver smoke tests (no SDK/GPU needed)
 └─ app/
    ├─ session.py         # thread-safe pod state machine
    ├─ runpod_driver.py   # non-interactive start/stop over pod_control
