@@ -18,6 +18,7 @@ own background thread.
 from __future__ import annotations  # allow `dict | None` etc. annotations
 
 import json          # read pod_state.json as a last-resort id source
+import os            # read the auto-terminate window from the environment
 import sys           # to mutate sys.path for the vendored imports
 import time          # wall-clock deadlines and inter-poll sleeps
 from pathlib import Path  # build the pod_control directory path
@@ -40,6 +41,32 @@ RUNNING_TIMEOUT_S = 900   # RunPod allocation + container boot
 READY_TIMEOUT_S = 900     # vLLM model-weight load until /v1/models == 200
 STOP_VERIFY_TIMEOUT_S = 180  # max wait to confirm the pod left RUNNING
 POLL_S = 10               # inter-poll sleep (interruptible by cancel)
+
+
+def _auto_terminate_minutes() -> int:
+    """Idle safety window in minutes from PODLINK_AUTO_TERMINATE_MIN (0 = off).
+
+    Read live (not import-time) so the value can't get baked into a stale module
+    and so tests can set it per-case. Non-numeric/negative -> disabled.
+    """
+    try:
+        return max(0, int(os.environ.get("PODLINK_AUTO_TERMINATE_MIN", "0") or "0"))
+    except ValueError:
+        return 0
+
+
+def _arm_billing(session: PodSession) -> None:
+    """Start the cost clock and (if configured) the auto-terminate deadline.
+
+    Called the instant a pod id is captured — RunPod bills from pod creation, so
+    the meter and the idle timer both start there.
+    """
+    now = time.time()
+    fields = {"billing_started_at": now}
+    minutes = _auto_terminate_minutes()
+    if minutes > 0:                                      # arm the idle safety timer
+        fields["auto_terminate_at"] = now + minutes * 60
+    session.update(**fields)
 
 
 def _sleep_or_cancel(session: PodSession, seconds: float) -> bool:
@@ -118,6 +145,7 @@ def start(session: PodSession) -> None:
                 raise RuntimeError("selected pod no longer exists")
             pod_id = target                               # id already recorded by the session
             session.update(phase="adopting selected pod")
+            _arm_billing(session)                         # start the cost meter + idle timer
             if pod.get("desiredStatus") != "RUNNING":     # stopped -> resume it
                 session.update(phase="resuming selected pod")
                 runpod.resume_pod(pod_id, gpu_count=pod.get("gpuCount") or 1)
@@ -146,6 +174,7 @@ def start(session: PodSession) -> None:
                 return                                    # let the stop worker take over
             pod_id = pod["id"]                            # id of the freshly created pod
             session.update(pod_id=pod_id, phase="pod created")  # capture id immediately
+        _arm_billing(session)                             # start the cost meter + idle timer
 
         if not _wait_for_running(session, pod_id):        # poll until RUNNING (or cancel)
             return                                        # cancelled mid-wait
@@ -199,6 +228,11 @@ def _wait_for_running(session: PodSession, pod_id: str) -> bool:
             return False                                 # bail; stop worker owns state
         pod = runpod.get_pod(pod_id)                     # fetch current pod record
         status = pod.get("desiredStatus") if pod else None   # e.g. "RUNNING"/"CREATED"
+        if pod and pod.get("costPerHr") is not None:     # capture the hourly rate for the meter
+            try:
+                session.update(cost_per_hr=float(pod["costPerHr"]))
+            except (TypeError, ValueError):
+                pass
         session.update(phase=f"waiting for RUNNING… ({status})")  # progress text
         if pod and status == "RUNNING" and pod.get("runtime"):    # container is actually up
             return True                                  # ready to check vLLM next
@@ -270,7 +304,8 @@ def stop(session: PodSession) -> None:
         pod_id = _resolve_pod_id(session)                # find the pod however we can
         if pod_id is None:                               # genuinely nothing exists to terminate
             session.update(state=State.IDLE, phase="no pod found — nothing to terminate",
-                           pod_id=None, proxy_url=None)   # settle back to IDLE
+                           pod_id=None, proxy_url=None,   # settle back to IDLE
+                           billing_started_at=None, cost_per_hr=None, auto_terminate_at=None)
             return
 
         session.update(pod_id=pod_id, phase=f"terminating pod {pod_id}")  # progress text
@@ -279,7 +314,8 @@ def stop(session: PodSession) -> None:
         if _verify_terminated(session, pod_id):          # confirm it left RUNNING / vanished
             _clear_state_file()                          # drop pod_state.json so a stale id can't resurface
             session.update(state=State.IDLE, phase="terminated — GPU released",
-                           pod_id=None, proxy_url=None)   # safe: back to IDLE
+                           pod_id=None, proxy_url=None,   # safe: back to IDLE
+                           billing_started_at=None, cost_per_hr=None, auto_terminate_at=None)  # stop the meter
         else:                                            # could NOT confirm — do not lie
             session.update(
                 state=State.ERROR,                       # loud error state, buttons stay live

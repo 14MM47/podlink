@@ -57,7 +57,7 @@ sys.modules["_secrets"] = fake_secrets
 
 # Now safe to import the driver (it self-bootstraps pod_control onto sys.path).
 from app import runpod_driver as rd                 # noqa: E402
-from app.session import PodSession                   # noqa: E402
+from app.session import PodSession, State            # noqa: E402
 
 # Make the readiness loop fast for tests.
 rd.READY_TIMEOUT_S = 3
@@ -206,6 +206,54 @@ def test_verify_terminated_true_when_get_pod_raises():
         fake_runpod.get_pod = saved_get
 
 
+def test_cost_meter_derives_from_billing_and_rate():
+    # With a rate and a billing start 1h ago, the snapshot should report ~1h
+    # uptime and ~ the hourly rate as the session cost.
+    import time as _t
+    s = PodSession()
+    s.try_begin_start(None)                          # -> STARTING (a 'live' state)
+    s.update(cost_per_hr=2.0, billing_started_at=_t.time() - 3600)
+    snap = s.snapshot()
+    check("uptime_s ~ 3600", snap["uptime_s"] is not None and abs(snap["uptime_s"] - 3600) <= 2)
+    check("session_cost_usd ~ 2.00", abs(snap["session_cost_usd"] - 2.0) <= 0.01)
+    # Once IDLE the meter blanks (pod is gone).
+    s.state = State.IDLE
+    idle = s.snapshot()
+    check("cost meter blank when IDLE", idle["uptime_s"] is None and idle["session_cost_usd"] is None)
+
+
+def test_arm_billing_sets_auto_terminate_when_configured():
+    import os as _os
+    saved = _os.environ.get("PODLINK_AUTO_TERMINATE_MIN")
+    _os.environ["PODLINK_AUTO_TERMINATE_MIN"] = "30"
+    try:
+        s = PodSession()
+        rd._arm_billing(s)
+        snap = s.snapshot() if False else None       # snapshot needs a live state; check field directly
+        check("billing_started_at set", s.billing_started_at is not None)
+        check("auto_terminate_at ~ now+30m",
+              s.auto_terminate_at is not None and 1750 <= (s.auto_terminate_at - s.billing_started_at) <= 1810)
+    finally:
+        if saved is None:
+            _os.environ.pop("PODLINK_AUTO_TERMINATE_MIN", None)
+        else:
+            _os.environ["PODLINK_AUTO_TERMINATE_MIN"] = saved
+
+
+def test_arm_billing_no_auto_terminate_when_disabled():
+    import os as _os
+    saved = _os.environ.get("PODLINK_AUTO_TERMINATE_MIN")
+    _os.environ.pop("PODLINK_AUTO_TERMINATE_MIN", None)   # default 0 = off
+    try:
+        s = PodSession()
+        rd._arm_billing(s)
+        check("no auto-terminate deadline when disabled", s.auto_terminate_at is None)
+        check("billing still armed", s.billing_started_at is not None)
+    finally:
+        if saved is not None:
+            _os.environ["PODLINK_AUTO_TERMINATE_MIN"] = saved
+
+
 if __name__ == "__main__":
     print("driver smoke tests:")
     test_resolve_gpu_id_matches_rtx_pro_6000()
@@ -217,4 +265,7 @@ if __name__ == "__main__":
     test_stop_terminates_and_lands_idle()
     test_read_secret_converts_systemexit()
     test_verify_terminated_true_when_get_pod_raises()
+    test_cost_meter_derives_from_billing_and_rate()
+    test_arm_billing_sets_auto_terminate_when_configured()
+    test_arm_billing_no_auto_terminate_when_disabled()
     print("all driver smoke tests passed.")

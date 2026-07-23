@@ -48,6 +48,14 @@
     .phase { margin-top: .5rem; font-size: .95rem; opacity: .85; }
     .error { margin-top: .5rem; font-size: .9rem; color: #ff8a8a; }
     .meta { margin-top: .35rem; font-size: .78rem; opacity: .5; word-break: break-all; }
+    .cost { margin-top: .5rem; font-size: .9rem; font-variant-numeric: tabular-nums; opacity: .9; }
+    .cost b { color: #7fd7a2; }
+    .autoterm {
+      margin-top: .45rem; font-size: .85rem; display: none;
+      align-items: center; justify-content: center; gap: .5rem;
+      color: #ffcf8a; font-variant-numeric: tabular-nums;
+    }
+    .autoterm.show { display: flex; }
     /* Shown only when no Network Volume is set: POD DOWN would destroy weights. */
     .volwarn {
       display: none; max-width: 460px; text-align: center; line-height: 1.4;
@@ -80,6 +88,11 @@
     <span id="badge" class="state-badge">…</span>
     <div id="phase" class="phase"></div>
     <div id="error" class="error"></div>
+    <div id="cost" class="cost"></div>
+    <div id="autoterm" class="autoterm">
+      <span id="autotermText"></span>
+      <button id="keepalive" class="mini">Keep alive</button>
+    </div>
     <div id="meta" class="meta"></div>
   </div>
   <script src="/app.js"></script>

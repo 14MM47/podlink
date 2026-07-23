@@ -12,6 +12,7 @@ from __future__ import annotations  # allow `str | None` annotations on older ru
 
 import enum       # for the State enumeration below
 import threading  # Lock + Event for thread-safe coordination
+import time        # uptime / cost / auto-terminate countdown maths
 
 
 class State(str, enum.Enum):           # str-mixin so `.value` JSON-serialises cleanly
@@ -31,6 +32,13 @@ class PodSession:
         self.proxy_url: str | None = None        # https proxy URL to the pod once known
         self.phase: str = "idle"                # human-readable progress line for the UI
         self.error: str | None = None            # last error message, if any
+        # Cost meter: GPU $/hr (from the pod record) and when billing began (pod
+        # creation). session_cost is derived live in snapshot() from these.
+        self.cost_per_hr: float | None = None    # pod's GPU hourly rate, once known
+        self.billing_started_at: float | None = None  # epoch when the pod started billing
+        # Idle safety: epoch after which the watchdog auto-terminates the pod, or
+        # None when disarmed / no auto-terminate configured.
+        self.auto_terminate_at: float | None = None
         # Set by a Pod Down request; the start worker polls this and bails out.
         self.cancel = threading.Event()          # cross-thread "stop now" signal
 
@@ -52,6 +60,9 @@ class PodSession:
             self.target_pod_id = target                     # remember the selection
             self.pod_id = target                            # id if adopting; None if Auto/create
             self.proxy_url = None                            # no proxy URL yet
+            self.cost_per_hr = None                          # reset the cost meter for the new run
+            self.billing_started_at = None                   # billing clock starts at pod creation
+            self.auto_terminate_at = None                    # re-armed by the driver once a pod exists
             self.cancel.clear()                             # ensure a fresh (un-cancelled) run
             return True                                     # caller may launch the worker
 
@@ -89,6 +100,17 @@ class PodSession:
         """Immutable view for /status and SSE, including derived button flags."""
         with self._lock:                          # read all fields consistently
             state = self.state                    # local copy for the flag maths below
+            now = time.time()
+            # Cost meter — live only while a pod exists (STARTING..STOPPING). Once
+            # IDLE the pod is gone, so uptime/cost read as None (blank in the UI).
+            live = state in (State.STARTING, State.RUNNING, State.STOPPING)
+            uptime_s = int(now - self.billing_started_at) if (live and self.billing_started_at) else None
+            session_cost = (round(self.cost_per_hr * uptime_s / 3600.0, 4)
+                            if (self.cost_per_hr and uptime_s) else None)
+            # Auto-terminate countdown — only meaningful while the pod is up/coming up.
+            armed = state in (State.STARTING, State.RUNNING)
+            auto_in = (max(0, int(self.auto_terminate_at - now))
+                       if (armed and self.auto_terminate_at) else None)
             return {
                 "state": state.value,             # e.g. "RUNNING"
                 "phase": self.phase,              # progress line
@@ -100,4 +122,10 @@ class PodSession:
                 # Pod Down is pressable from the instant Up starts, through
                 # RUNNING, and in ERROR (so a stuck pod can always be killed).
                 "down_enabled": state in (State.STARTING, State.RUNNING, State.ERROR),
+                # Cost meter (derived, live).
+                "cost_per_hr": self.cost_per_hr,          # $/hr or None
+                "uptime_s": uptime_s,                     # seconds billing, or None
+                "session_cost_usd": session_cost,         # cost_per_hr * uptime, or None
+                # Idle auto-terminate countdown.
+                "auto_terminate_in_s": auto_in,           # seconds until auto-off, or None
             }

@@ -14,13 +14,14 @@ import json                          # serialise snapshots for SSE frames
 import re                            # validate the client-supplied pod id
 import secrets as pysecrets          # cryptographic token + constant-time compare
 import threading                     # run driver work off the request thread
+import time                          # auto-terminate watchdog clock
 from pathlib import Path             # locate the static/ directory
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request   # web framework primitives
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # response types
 
 from . import runpod_driver          # start()/stop() entry points
-from .session import PodSession      # the shared state machine
+from .session import PodSession, State  # the shared state machine
 
 app = FastAPI(title="podlink", docs_url=None, redoc_url=None)  # no public API docs pages
 
@@ -56,6 +57,30 @@ def _require_token(x_podlink_token: str | None) -> None:
 def _launch(target) -> None:
     """Run a driver entry point in a daemon background thread."""
     threading.Thread(target=target, args=(SESSION,), daemon=True).start()  # non-blocking
+
+
+_WATCH_INTERVAL_S = 15               # how often the idle watchdog checks the deadline
+
+
+def _auto_terminate_watch() -> None:
+    """Background watchdog: terminate the pod once its auto-terminate deadline passes.
+
+    Guards against a forgotten pod billing indefinitely. The deadline is armed by
+    the driver when a pod is created (PODLINK_AUTO_TERMINATE_MIN) and cleared by
+    /pod/keepalive. We only fire while a pod is actually up/coming up, and go
+    through the same try_begin_stop + stop path as a manual POD DOWN.
+    """
+    while True:
+        time.sleep(_WATCH_INTERVAL_S)
+        try:
+            deadline = SESSION.auto_terminate_at
+            if (deadline and time.time() >= deadline
+                    and SESSION.state in (State.STARTING, State.RUNNING)):
+                if SESSION.try_begin_stop():          # atomic: enter STOPPING + cancel
+                    SESSION.update(phase="idle auto-terminate — deadline reached")
+                    _launch(runpod_driver.stop)       # terminate + verify in the background
+        except Exception:  # noqa: BLE001 — a watchdog must never die on a transient error
+            pass
 
 
 def _snapshot() -> dict:
@@ -135,6 +160,18 @@ def pod_down(confirm: bool = Body(default=False, embed=True),
         raise HTTPException(status_code=409, detail="pod down not available in current state")
     _launch(runpod_driver.stop)                      # terminate + verify in the background
     return JSONResponse(_snapshot())                 # echo the new state
+
+
+@app.post("/pod/keepalive")
+def pod_keepalive(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+    """Disarm the idle auto-terminate timer ('keep this pod alive')."""
+    _require_token(x_podlink_token)                  # CSRF/token gate
+    SESSION.update(auto_terminate_at=None)           # cancel the pending auto-terminate
+    return JSONResponse(_snapshot())                 # echo the new state
+
+
+# Idle-safety watchdog — one daemon thread for the process lifetime.
+threading.Thread(target=_auto_terminate_watch, daemon=True).start()
 
 
 @app.get("/events")

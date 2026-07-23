@@ -10,6 +10,10 @@ const metaEl = document.getElementById("meta");    // pod id / proxy url line
 const podSelect = document.getElementById("podSelect");  // target-pod dropdown
 const refreshBtn = document.getElementById("refresh");   // reload-pod-list button
 const volwarn = document.getElementById("volwarn");      // "no Network Volume" banner
+const costEl = document.getElementById("cost");          // uptime + running cost line
+const autotermEl = document.getElementById("autoterm");  // auto-terminate countdown row
+const autotermText = document.getElementById("autotermText");  // its text span
+const keepaliveBtn = document.getElementById("keepalive");     // cancel auto-terminate
 
 let token = null;                                   // per-process CSRF token (fetched once)
 let lastState = null;                               // to reload pods on return to IDLE
@@ -43,6 +47,13 @@ async function loadPods() {
   } catch {}                                        // network hiccup — keep prior list
 }
 
+// Format a whole number of seconds as M:SS or H:MM:SS.
+function fmtDuration(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
 // Reflect a status snapshot into the UI.
 function render(s) {
   lastSnap = s;                                     // remember it for the POD DOWN guard
@@ -63,6 +74,23 @@ function render(s) {
     metaEl.textContent = m;
   } else {
     metaEl.textContent = "";                        // no pod -> blank
+  }
+  // Cost meter — shown while a pod is up (uptime_s non-null); blank when IDLE.
+  if (s.uptime_s != null) {
+    let c = `up ${fmtDuration(s.uptime_s)}`;
+    if (s.session_cost_usd != null) c += ` · <b>$${s.session_cost_usd.toFixed(2)}</b>`;
+    if (s.cost_per_hr != null) c += ` ($${Number(s.cost_per_hr).toFixed(2)}/hr)`;
+    costEl.innerHTML = c;
+  } else {
+    costEl.textContent = "";
+  }
+  // Auto-terminate countdown + keep-alive button (only when a deadline is armed).
+  if (s.auto_terminate_in_s != null) {
+    autotermText.textContent = `auto-terminate in ${fmtDuration(s.auto_terminate_in_s)}`;
+    autotermEl.classList.add("show");
+    keepaliveBtn.disabled = false;                  // re-enable each armed frame
+  } else {
+    autotermEl.classList.remove("show");
   }
   // Server is the single source of truth for enablement.
   upBtn.disabled = !s.up_enabled;                   // grey Up unless server allows it
@@ -110,6 +138,10 @@ downBtn.addEventListener("click", () => {           // when POD DOWN is clicked
   send("/pod/down", { confirm: true });            // explicit confirmation for the server-side guard
 });
 refreshBtn.addEventListener("click", loadPods);     // manual pod-list refresh
+keepaliveBtn.addEventListener("click", () => {      // cancel the pending auto-terminate
+  keepaliveBtn.disabled = true;                     // optimistic; SSE re-enables on next frame
+  send("/pod/keepalive");
+});
 
 // Live updates via SSE, with a polling fallback if the stream drops.
 function connect() {
