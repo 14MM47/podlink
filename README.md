@@ -1,9 +1,10 @@
 # podlink
 
-A standalone local webapp that reduces the podlink pod lifecycle to **two
-buttons**: **POD UP** and **POD DOWN**. It wraps the original pod-control scripts
-(vendored verbatim in `pod_control/`) so you never touch the RunPod dashboard or
-a terminal to bring the GPU pod up or take it down.
+A standalone **local web console** for the ragline GPU inference pod on RunPod.
+It reduces the pod lifecycle to two buttons — **POD UP** / **POD DOWN** — and shows
+everything you'd otherwise chase through the RunPod dashboard: provisioning
+progress, per-service health, live cost, and the config block ragline needs. Bound
+to `127.0.0.1` only.
 
 POD UP provisions the **ragline three-service stack** on a single **RTX Pro 6000
 (96 GB, Blackwell)** from one bundled image (see `pod_image/`):
@@ -11,187 +12,163 @@ POD UP provisions the **ragline three-service stack** on a single **RTX Pro 6000
 | Port | Service | Readiness gate |
 |------|---------|----------------|
 | 8000 | vLLM — LLM (chat + KG extraction), served as `ragline-llm` | `GET /v1/models` → 200 |
-| 8080 | TEI — embedder | `GET /health` → 200 |
-| 8081 | TEI — reranker | `GET /health` → 200 |
+| 8080 | TEI — embedder (`Qwen/Qwen3-Embedding-8B`, 4096-dim) | `GET /health` → 200 |
+| 8081 | TEI — reranker (`BAAI/bge-reranker-v2-m3`) | `GET /health` → 200 |
 
-## Behaviour
+## The console
 
-| Button | State it's live in | What it does |
-|--------|--------------------|--------------|
-| **POD UP** | IDLE / ERROR | Resolves the RTX Pro 6000 GPU id (live, via `runpod.get_gpus()`), creates or resumes the `podlink` pod, waits for `RUNNING`, then waits until **all three** services are healthy (LLM `/v1/models` + both TEI `/health` return `200`). |
-| **POD DOWN** | STARTING / RUNNING / ERROR | Cancels any in-flight start, **terminates** the whole pod (GPU released), and **verifies** the pod left `RUNNING` before reporting safe. Model weights persist on the **Network Volume** (if configured) for a fast next up. |
+Beyond the two buttons, the UI is a live status console (dark "frosted tactical"
+skin; all motion respects `prefers-reduced-motion`):
 
-Pod Down is greyed out until Pod Up is pressed. The instant Pod Up starts, Pod Up
-greys out and Pod Down goes live — and stays live through the **entire**
-provisioning window, so you can kill the pod cleanly at any point.
+- **POD UP / POD DOWN** — POD DOWN **terminates** (see below). POD DOWN is live from
+  the instant POD UP starts, through the whole boot, so you can kill a pod cleanly
+  at any point.
+- **Live cost meter** — uptime × the pod's `$/hr`, ticking every second; blanks when idle.
+- **Idle auto-terminate** — an optional watchdog that terminates a forgotten pod
+  after `PODLINK_AUTO_TERMINATE_MIN`; the UI shows a countdown + a **Keep alive** button.
+- **Per-service health tiles** — LLM / embedder / reranker, re-probed continuously.
+- **Streamed status panels** — Provisioning & timeline (with per-step deltas),
+  Service health, and System, split by source; every create-retry and phase shows here.
+- **Test stack** — fires a real completion + embedding + rerank at the pod, reporting
+  pass/fail + latency and detecting the embedding dimension.
+- **Copy ragline .env** — the exact config block for the running pod (bearer left as a
+  placeholder), ready to paste into ragline. See [wiring ragline](#wiring-ragline).
+- **Network Volume** line + a red banner if none is configured (POD DOWN would then
+  destroy weights).
 
-### Terminate, not stop — and the Network Volume
+## Terminate, not stop — and the Network Volume
 
-POD DOWN **terminates** the pod rather than stopping it. A *stopped* pod is pinned
-to its original host and can fail to resume when that host has no free GPU
+POD DOWN **terminates** the pod rather than stopping it. A *stopped* pod is pinned to
+its original host and can fail to resume when that host has no free GPU
 (*"not enough free GPUs on the host machine"*); terminate always releases the GPU
 cleanly and the next POD UP creates a fresh pod on **any** host.
 
 So weights survive a terminate, podlink attaches a pre-created RunPod **Network
 Volume** (region-locked, survives terminate) at `/workspace`, where the image's
-`HF_HOME=/workspace/hf` cache lives. Set its id via the environment before
-launching podlink:
+`HF_HOME=/workspace/hf` cache lives. Create it once in **RunPod → Storage → Network
+Volumes**, sized **75–100 GB**, in a **data center that stocks the RTX Pro 6000**
+(the volume pins the pod to its region — pick one with card availability; the SDK
+resolves the data-center from the volume id). Then give podlink its id (below).
 
-```bash
-export PODLINK_NETWORK_VOLUME_ID=<your-network-volume-id>
-```
-
-Create the volume once in **RunPod → Storage → Network Volumes**, sized **75–100 GB**
-(holds the ~36 GB of weights plus download scratch), in a **data center that stocks
-the RTX Pro 6000** — the volume pins the pod to its region, so pick one with card
-availability. The SDK resolves the data-center automatically from the volume id.
+A warm POD UP re-pulls the ~38 GB image (container disk is ephemeral) but **skips the
+~36 GB weight download** — the payoff of the volume.
 
 > **Cost:** a Network Volume bills storage 24/7 even with no pod running
-> (≈ $0.05–0.07/GB·month → ~$4–7/month for 75 GB). That is the price of skipping a
-> ~36 GB re-download on every POD UP.
+> (~$4–7/month for 75 GB). When the pod is down there is no GPU cost.
 
-If `PODLINK_NETWORK_VOLUME_ID` is **unset**, podlink falls back to a pod-scoped
-Data Volume that is **destroyed on terminate** — the weights re-download on the
-next up. In that mode the web UI shows a red banner and POD DOWN asks you to
-confirm before destroying them.
+If no volume id is set, podlink falls back to a pod-scoped **Data Volume** that is
+**destroyed on terminate** (weights re-download next up). In that mode the UI shows a
+warning banner and POD DOWN requires an explicit confirmation.
 
-### Target selection
+## Quick start
 
-Above the buttons, a **Target** dropdown chooses what Pod Up acts on:
+```bash
+# 1. one-time: three secrets (see Prerequisites)
+# 2. one-time: create a Network Volume, note its id
+./start.sh          # prompts for the Network Volume id (saved for next time), then serves
+                    # http://127.0.0.1:8765
+./start.sh --check  # preflight only: volume id + venv/deps + secrets, no launch
+```
 
-- **Auto** (default) — create or resume the `podlink` vLLM pod and wait until it
-  serves `/v1/models` (the original behaviour).
-- **A specific pod** — pick any pod on your RunPod account to adopt; Pod Up
-  resumes it (if stopped) and waits for `RUNNING` (no vLLM readiness probe, since
-  an arbitrary pod may not serve that endpoint).
-
-The selected pod's id is recorded the instant Pod Up is pressed, so Pod Down
-terminates **that** pod — including if you hit Down immediately. Pod Down always
-**terminates** regardless of which pod is selected. The list shows name, status,
-GPU, and hourly cost, and only ever exposes those fields — never a pod's
-environment (which can hold API keys).
-
-### Why Pod Down is safe anywhere
-
-RunPod bills at the full GPU rate from the moment a pod is **created**, not from
-`RUNNING` — and the original `pod_down.py` relied on `pod_state.json`, which
-`pod_up.py` writes only after the pod is fully up. podlink closes that gap: it
-captures the pod id the instant the pod is created and, failing that, finds the
-pod **by name**, so Pod Down can always locate and terminate the pod even mid-boot
-before any state file exists. It then polls until the pod has actually left
-`RUNNING` (or vanished) before it tells you billing has stopped; if it can't
-confirm, it shows a loud `TERMINATE NOT VERIFIED` error rather than a false "safe".
+`start.sh` resolves the Network Volume id (env var → saved `~/.config/podlink/network_volume_id`
+→ prompt), sets up the venv, and hands off to the hardened `run.sh` (localhost bind).
 
 ## Prerequisites
 
-podlink reads three secrets from `~/.config/podlink/`. Each file must be owned by
-you and mode `0600` — `_secrets.py` refuses to read anything more permissive.
+podlink reads three secrets from `~/.config/podlink/`, each owned by you and mode
+`0600` (`_secrets.py` refuses anything more permissive):
 
 | File | What it holds |
 |------|---------------|
-| `runpod_api_key`   | RunPod API key (drives create / resume / stop / GPU lookup). |
-| `hf_token`         | Hugging Face token for the model-weight pull — injected container-wide, so **all three** services (LLM + both TEI) use it. |
-| `pod_bearer_token` | vLLM API key (`VLLM_API_KEY`); also used to probe `/v1/models` and doubles as ragline's `LLM_API_KEY`. |
-
-**No other secrets are needed.** TEI (embedder/reranker) is keyless internally.
-If you use a private image registry, its pull credentials live in **RunPod**
-(Settings → Container Registry Auth), never in `~/.config/podlink/`.
-
-Set them up once:
+| `runpod_api_key`   | RunPod API key (create / terminate / GPU lookup). |
+| `hf_token`         | Hugging Face token for the weight pull — seen by all three services. |
+| `pod_bearer_token` | vLLM + TEI API key; gates all three services; also ragline's `*_API_KEY`. |
 
 ```bash
-mkdir -p ~/.config/podlink
-chmod 700 ~/.config/podlink
-
-# Write each secret (printf avoids a trailing newline). Replace the placeholders.
+mkdir -p ~/.config/podlink && chmod 700 ~/.config/podlink
 printf '%s' 'YOUR_RUNPOD_API_KEY'   > ~/.config/podlink/runpod_api_key
 printf '%s' 'YOUR_HF_TOKEN'         > ~/.config/podlink/hf_token
 printf '%s' 'YOUR_POD_BEARER_TOKEN' > ~/.config/podlink/pod_bearer_token
-
 chmod 600 ~/.config/podlink/*
 ```
 
-Tip: to keep the values out of your shell history, prefix each command with a
-space (if `HISTCONTROL=ignorespace`) or paste them into an editor instead.
+Private image registry pull credentials live in **RunPod** (Settings → Container
+Registry Auth), never in `~/.config/podlink/`.
 
-Verify:
+## Configuration (environment)
 
-```bash
-ls -l ~/.config/podlink            # each file should show -rw------- (0600)
-```
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PODLINK_NETWORK_VOLUME_ID` | *(empty)* | RunPod Network Volume id. Empty ⇒ Data-Volume fallback (weights destroyed on terminate). `start.sh` prompts/saves this. |
+| `PODLINK_AUTO_TERMINATE_MIN` | `0` (off) | Idle auto-terminate window, minutes. |
+| `PODLINK_CREATE_RETRIES` | `40` | Host-capacity retry attempts (~10 min at the default delay). |
+| `PODLINK_CREATE_RETRY_DELAY` | `15` | Seconds between create attempts. |
+| `PODLINK_START_SSH` | `1` (on) | Enable SSH on the pod for first-boot debug. |
 
 ## Pod image (build once)
 
-POD UP pulls a single bundled image that runs all three services under
-`supervisord`. Build and push it before your first pod up, then set `IMAGE` in
-`pod_control/pod_up.py`. Full instructions — including the Blackwell `sm_120`
-base-image pins to validate — are in [`pod_image/README.md`](pod_image/README.md).
+POD UP pulls one bundled image running all three services under `supervisord`. Build
+and push it before your first pod up, then set `IMAGE` in `pod_control/pod_up.py`.
+Full instructions (including the Blackwell `sm_120` base-image pins) are in
+[`pod_image/README.md`](pod_image/README.md).
 
-## Run
+## Wiring ragline
 
-```bash
-pip install -r requirements.txt
-./run.sh                     # serves http://127.0.0.1:8765
+Bring the pod up, wait until all three tiles are green, and click **Copy ragline .env**
+— it emits the block below with the live pod URLs and the detected
+`EMBEDDING_DIMENSIONS`, the bearer left as a placeholder for you to paste from
+`~/.config/podlink/pod_bearer_token`:
+
+```dotenv
+LLM_BASE_URL=https://<pod-id>-8000.proxy.runpod.net/v1
+LLM_MODEL=ragline-llm                       # must match vLLM --served-model-name
+LLM_API_KEY=<your pod_bearer_token>
+EMBEDDING_BASE_URL=https://<pod-id>-8080.proxy.runpod.net/v1
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B     # deployed balanced profile
+EMBEDDING_DIMENSIONS=4096                   # confirmed via Test stack
+EMBEDDING_API_KEY=<your pod_bearer_token>   # TEI is key-gated (public proxy)
+RERANKER_PROVIDER=api
+RERANKER_BASE_URL=https://<pod-id>-8081.proxy.runpod.net   # root, no /rerank
+RERANKER_API_KEY=<your pod_bearer_token>    # TEI is key-gated (public proxy)
+KG_EXTRACTION_CONCURRENCY=10
 ```
 
-## Deploying to the RTX Pro 6000
-
-1. **Build & push** the bundled image (`pod_image/`); set `IMAGE` in `pod_control/pod_up.py`.
-2. **Confirm the model pins** in `pod_up.py` (`LLM_MODEL_ID` / `EMBED_MODEL_ID` /
-   `RERANK_MODEL_ID` / `LLM_QUANT`) exist on HF with a Blackwell-compatible quant
-   (FP8 checkpoint, or AWQ-Marlin W4A16 — **never NVFP4** on `sm_120`).
-3. **Ensure the three secrets** are in place (above).
-4. **Create the Network Volume** (75–100 GB, in an RTX-Pro-6000 region) and
-   `export PODLINK_NETWORK_VOLUME_ID=<id>` — see *Terminate, not stop* above.
-5. **POD UP** — first boot resolves the GPU id, creates the pod, and downloads
-   weights to the `/workspace` Network Volume (a one-time cost). Every later POD UP
-   creates a fresh pod that reuses the cached weights on the volume — no
-   re-download — so boot is fast.
-6. **Wire ragline** — the UI shows the three proxy URLs (also saved in
-   `pod_state.json`). Point ragline's `.env` at them:
-
-   ```dotenv
-   LLM_BASE_URL=https://<pod-id>-8000.proxy.runpod.net/v1
-   LLM_MODEL=ragline-llm            # must match vLLM --served-model-name
-   LLM_API_KEY=<pod_bearer_token>
-   EMBEDDING_BASE_URL=https://<pod-id>-8080.proxy.runpod.net/v1
-   EMBEDDING_MODEL=BAAI/bge-m3
-   EMBEDDING_DIMENSIONS=1024
-   EMBEDDING_API_KEY=<pod_bearer_token>    # TEI is key-gated (public proxy)
-   RERANKER_PROVIDER=api
-   RERANKER_BASE_URL=https://<pod-id>-8081.proxy.runpod.net   # root, no /rerank
-   RERANKER_API_KEY=<pod_bearer_token>     # TEI is key-gated (public proxy)
-   KG_EXTRACTION_CONCURRENCY=10
-   ```
-
-   The embedder/reranker ports are on RunPod's **public** proxy, so podlink gates
-   them with the same bearer as the LLM — ragline must send it (above) or its
-   embedding/rerank calls get 401.
-
-## Tests
-
-```bash
-python3 tests/test_driver_smoke.py   # stub-based; no RunPod SDK / GPU needed
-```
+The pod id (and URLs) **changes on every POD UP** (terminate/recreate), so this is a
+per-session block. All three services need the bearer — blank keys → 401 on
+embedder/reranker. The embedder serves **4096-dim** vectors, so ragline's Qdrant
+collection must be 4096; a collection built at another dimension is incompatible and
+must be recreated + re-ingested. See ragline's `deploy/POD_STATUS.md`.
 
 ## Security
 
 - Bound to `127.0.0.1` only — never exposed on the network.
-- State-changing POSTs require a per-process token (`X-Podlink-Token`), which
-  blocks browser-based CSRF from other sites. This does **not** protect against a
-  malicious process already running as your user.
-- Secrets never reach the browser; only the RunPod driver reads them.
+- State-changing POSTs require a per-process token (`X-Podlink-Token`), blocking
+  browser-based CSRF. POD DOWN has a server-side destructive-action guard (refuses to
+  terminate without a Network Volume unless the caller confirms). Neither defends
+  against a malicious process already running as your user.
+- Secrets never reach the browser; only the RunPod driver reads them, and error
+  messages carry the exception *type* only (never `str(e)`, which can embed keys).
+- The SDK's env-echoing `create_pod` stdout is captured and discarded so secrets
+  don't leak to logs.
+
+## Tests
+
+```bash
+./.venv/bin/python tests/test_driver_smoke.py   # stub-based; no RunPod SDK / GPU needed
+```
 
 ## Layout
 
 ```
 podlink/
-├─ pod_control/   # vendored pod-control scripts (see PROVENANCE.md)
-├─ pod_image/     # bundled 3-service image: Dockerfile + supervisor + wrappers
-├─ tests/         # stub-based driver smoke tests (no SDK/GPU needed)
+├─ start.sh        # single-command launcher (resolves the volume id, then run.sh)
+├─ run.sh          # hardened uvicorn launch (localhost bind, no arg pass-through)
+├─ pod_control/    # vendored pod-control scripts (see PROVENANCE.md)
+├─ pod_image/      # bundled 3-service image: Dockerfile + supervisor + wrappers
+├─ tests/          # stub-based driver smoke tests
 └─ app/
-   ├─ session.py         # thread-safe pod state machine
-   ├─ runpod_driver.py   # non-interactive start/stop over pod_control
-   ├─ server.py          # FastAPI routes + SSE
-   └─ static/            # two-button UI
+   ├─ session.py         # thread-safe pod state machine + snapshot
+   ├─ runpod_driver.py   # non-interactive start/terminate + health/test over pod_control
+   ├─ server.py          # FastAPI routes + SSE + watchdogs
+   └─ static/            # the console UI (index.html + app.js)
 ```
