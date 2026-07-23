@@ -245,7 +245,6 @@ def test_arm_billing_sets_auto_terminate_when_configured():
     try:
         s = PodSession()
         rd._arm_billing(s)
-        snap = s.snapshot() if False else None       # snapshot needs a live state; check field directly
         check("billing_started_at set", s.billing_started_at is not None)
         check("auto_terminate_at ~ now+30m",
               s.auto_terminate_at is not None and 1750 <= (s.auto_terminate_at - s.billing_started_at) <= 1810)
