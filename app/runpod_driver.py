@@ -48,8 +48,19 @@ def _sleep_or_cancel(session: PodSession, seconds: float) -> bool:
 
 
 def _read_secret(getter) -> str:
-    """Read a secret and register it for verbatim redaction in the egress log."""
-    value = getter()                        # vendored getter; may sys.exit if missing
+    """Read a secret and register it for verbatim redaction in the egress log.
+
+    The vendored getter calls sys.exit() (raising SystemExit — a BaseException)
+    when a secret is missing, mis-permissioned, or empty. SystemExit slips past
+    the `except Exception` handlers in start()/stop() and the /pods route, which
+    would silently kill the stop worker (session stuck STOPPING while the pod
+    keeps billing) or crash the server. Convert it to a normal RuntimeError so
+    those handlers catch it and surface a recoverable error.
+    """
+    try:
+        value = getter()                    # vendored getter; sys.exit on missing/bad
+    except SystemExit as e:                  # missing / mis-permissioned / empty secret
+        raise RuntimeError("secret unavailable — check ~/.config/podlink") from e
     egress_logger.register_secret(value)    # strip this exact value from any log line
     return value
 
@@ -73,6 +84,15 @@ def list_pods() -> list[dict]:
             "cost_per_hr": p.get("costPerHr"),
         })
     return pods
+
+
+def network_volume_configured() -> bool:
+    """True when a RunPod Network Volume is set (weights persist across terminate).
+
+    When False, POD DOWN's terminate DESTROYS the ~36 GB of downloaded weights, so
+    the web UI warns before terminating — mirroring the CLI pod_down.py prompt.
+    """
+    return bool(pod_up.NETWORK_VOLUME_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -108,16 +128,19 @@ def start(session: PodSession) -> None:
             session.commit_running()                      # -> RUNNING (unless a stop won)
             return
 
-        # ---- Auto: create or resume the podlink vLLM pod ----
+        # ---- Auto: adopt a RUNNING podlink pod, else create a fresh one ----
+        # The lifecycle is terminate/recreate (see stop()), so we never resume. A
+        # non-RUNNING pod named `podlink` here is a leftover — crashed, or still
+        # being reaped after a terminate. Resuming it would error (a terminating
+        # pod can't resume), and a quick DOWN->UP would then fail instead of just
+        # making a new pod. So we adopt ONLY a RUNNING pod and otherwise create
+        # fresh; RunPod reaps the dead one.
         existing = pod_up.find_existing()                 # is a pod already named podlink?
-        if existing is not None:                          # yes — adopt it instead of duplicating
-            pod_id = existing["id"]                       # its RunPod id
+        if existing is not None and existing.get("desiredStatus") == "RUNNING":
+            pod_id = existing["id"]                       # adopt the live pod
             # Capture the id before anything can block — closes the billing race.
-            session.update(pod_id=pod_id, phase="adopting existing pod")
-            if existing.get("desiredStatus") != "RUNNING":  # it's stopped -> resume it
-                session.update(phase="resuming stopped pod")
-                runpod.resume_pod(pod_id, gpu_count=1)    # SDK requires gpu_count
-        else:                                             # no pod yet — create one
+            session.update(pod_id=pod_id, phase="adopting running pod")
+        else:                                             # none, or a dead/reaping leftover
             pod = _create_with_fallback(session)          # resolve RTX Pro 6000 + create
             if pod is None:                               # cancel arrived during create
                 return                                    # let the stop worker take over
@@ -233,37 +256,40 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def stop(session: PodSession) -> None:
-    """Stop the pod (GPU billing off, volume kept) and VERIFY it actually stopped.
+    """Terminate the pod (GPU + pod released; weights persist on the Network
+    Volume) and VERIFY it actually left RUNNING.
 
-    Works whether the pod is still provisioning or fully RUNNING. Never trusts
-    pod_state.json alone — resolves the pod id from live memory or by name so a
-    pod created before the state file existed is still caught.
+    Terminate, not stop: a stopped pod is host-pinned and can fail to resume when
+    that host has no free GPU. Works whether the pod is still provisioning or fully
+    RUNNING. Never trusts pod_state.json alone — resolves the pod id from live
+    memory or by name so a pod created before the state file existed is still caught.
     """
     try:
         runpod.api_key = _read_secret(_secrets.runpod_api_key)       # authenticate the SDK
 
         pod_id = _resolve_pod_id(session)                # find the pod however we can
-        if pod_id is None:                               # genuinely nothing exists to stop
-            session.update(state=State.IDLE, phase="no pod found — nothing to stop",
+        if pod_id is None:                               # genuinely nothing exists to terminate
+            session.update(state=State.IDLE, phase="no pod found — nothing to terminate",
                            pod_id=None, proxy_url=None)   # settle back to IDLE
             return
 
-        session.update(pod_id=pod_id, phase=f"stopping pod {pod_id}")  # progress text
-        runpod.stop_pod(pod_id)                          # end GPU billing (volume preserved)
+        session.update(pod_id=pod_id, phase=f"terminating pod {pod_id}")  # progress text
+        runpod.terminate_pod(pod_id)                     # release the GPU (weights persist on the Network Volume)
 
-        if _verify_stopped(session, pod_id):             # confirm it actually left RUNNING
-            session.update(state=State.IDLE, phase="stopped — GPU billing ended",
+        if _verify_terminated(session, pod_id):          # confirm it left RUNNING / vanished
+            _clear_state_file()                          # drop pod_state.json so a stale id can't resurface
+            session.update(state=State.IDLE, phase="terminated — GPU released",
                            pod_id=None, proxy_url=None)   # safe: back to IDLE
         else:                                            # could NOT confirm — do not lie
             session.update(
                 state=State.ERROR,                       # loud error state, buttons stay live
-                phase="STOP NOT VERIFIED — check RunPod dashboard immediately",
-                error="stop_pod issued but pod did not leave RUNNING within "
+                phase="TERMINATE NOT VERIFIED — check RunPod dashboard immediately",
+                error="terminate_pod issued but pod did not leave RUNNING within "
                       f"{STOP_VERIFY_TIMEOUT_S}s; it may still be charging.",
             )
-    except Exception as e:  # noqa: BLE001                # surface any stop failure
+    except Exception as e:  # noqa: BLE001                # surface any terminate failure
         # Type only — never interpolate str(e); it may leak request context/secrets.
-        session.update(state=State.ERROR, phase="error during stop",
+        session.update(state=State.ERROR, phase="error during terminate",
                        error=f"{type(e).__name__} — check the RunPod dashboard for details")
 
 
@@ -290,16 +316,38 @@ def _resolve_pod_id(session: PodSession) -> str | None:
     return None                                          # nothing found anywhere
 
 
-def _verify_stopped(session: PodSession, pod_id: str) -> bool:
-    """Confirm the pod left RUNNING (or vanished) — proof GPU billing has ceased."""
+def _clear_state_file() -> None:
+    """Remove pod_state.json after a confirmed terminate.
+
+    The disk fallback in _resolve_pod_id reads this file; leaving it after the
+    pod is destroyed lets a later Down hand terminate_pod an already-dead id,
+    which flips the UI to a spurious ERROR. Best-effort — cleanup never fails Down.
+    """
+    try:
+        pod_up.STATE_PATH.unlink(missing_ok=True)        # gone-or-not, end up with no file
+    except Exception:  # noqa: BLE001 — cleanup is best-effort, never fatal to a stop
+        pass
+
+
+def _verify_terminated(session: PodSession, pod_id: str) -> bool:
+    """Confirm the pod left RUNNING (or is gone) — proof the GPU has been released.
+
+    terminate_pod already succeeded, so a subsequent get_pod may return None OR
+    raise (the pod is being deleted and is no longer retrievable). Both mean 'not
+    running', so we treat either as terminated rather than reporting a false
+    failure on the get_pod call.
+    """
     deadline = time.time() + STOP_VERIFY_TIMEOUT_S       # absolute give-up time
     while time.time() < deadline:                        # poll until confirmed or timeout
-        pod = runpod.get_pod(pod_id)                     # fetch current record
+        try:
+            pod = runpod.get_pod(pod_id)                 # fetch current record
+        except Exception:  # noqa: BLE001                # pod already deleted / not retrievable
+            return True                                  # terminate was accepted => gone
         if pod is None:                                  # pod gone entirely
             return True                                  # => definitely not billing GPU
         status = pod.get("desiredStatus")                # e.g. "EXITED"/"STOPPED"
-        session.update(phase=f"verifying stop… ({status})")  # progress text
-        if status and status != "RUNNING":               # left RUNNING => GPU billing ended
+        session.update(phase=f"verifying termination… ({status})")  # progress text
+        if status and status != "RUNNING":               # left RUNNING => GPU released
             return True
         time.sleep(3)                                    # brief pause before re-checking
     return False                                         # could not confirm within the window

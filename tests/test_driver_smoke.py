@@ -25,8 +25,10 @@ sys.path.insert(0, str(ROOT))                      # import the `app` package
 fake_runpod = types.ModuleType("runpod")
 fake_runpod.api_key = None
 fake_runpod._gpus = [                              # what resolve_gpu_id sees
-    {"id": "NVIDIA GeForce RTX 5090", "displayName": "RTX 5090"},
-    {"id": "NVIDIA RTX PRO 6000 Blackwell WE", "displayName": "RTX PRO 6000 Blackwell Workstation Edition"},
+    # resolve_gpu_id requires memoryInGb >= 90 and skips MIG slices, so entries
+    # carry a realistic memoryInGb (the 96 GB card qualifies; the 5090 does not).
+    {"id": "NVIDIA GeForce RTX 5090", "displayName": "RTX 5090", "memoryInGb": 32},
+    {"id": "NVIDIA RTX PRO 6000 Blackwell WE", "displayName": "RTX PRO 6000 Blackwell Workstation Edition", "memoryInGb": 96},
 ]
 fake_runpod.get_gpus = lambda: fake_runpod._gpus
 fake_runpod.get_pods = lambda: []
@@ -34,7 +36,17 @@ fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "RUNNING", 
 fake_runpod.create_pod = lambda **kw: {"id": "newpod123", **kw}
 fake_runpod.resume_pod = lambda pod_id, **kw: None
 fake_runpod.stop_pod = lambda pod_id: None
+fake_runpod.terminate_pod = lambda pod_id: None    # POD DOWN now terminates (weights on the volume)
 sys.modules["runpod"] = fake_runpod
+
+# pod_up.py does `from runpod.error import QueryError` at import time (create-retry
+# lottery), so the fake SDK must expose that submodule or the driver import fails.
+fake_runpod_error = types.ModuleType("runpod.error")
+class QueryError(Exception):                        # noqa: E742 — mirrors the real class name
+    pass
+fake_runpod_error.QueryError = QueryError
+fake_runpod.error = fake_runpod_error
+sys.modules["runpod.error"] = fake_runpod_error
 
 # --- fake secrets -----------------------------------------------------------
 fake_secrets = types.ModuleType("_secrets")
@@ -134,6 +146,66 @@ def test_create_aborts_on_cancel_before_create():
           rd._create_with_fallback(s) is None)
 
 
+def test_stop_terminates_and_lands_idle():
+    # POD DOWN calls runpod.terminate_pod (not stop_pod), verifies the pod left
+    # RUNNING, clears the state file, and settles to IDLE. Covers the refactor.
+    terminated = {}
+    saved_term = fake_runpod.terminate_pod
+    saved_get = fake_runpod.get_pod
+    saved_state = rd.pod_up.STATE_PATH
+    scratch = Path("/tmp/podlink_smoke_state.json")     # never touch the real pod_state.json
+    scratch.write_text('{"pod_id": "podX"}')            # something for _clear_state_file to remove
+    fake_runpod.terminate_pod = lambda pod_id: terminated.__setitem__("id", pod_id)
+    fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "EXITED"}  # verify passes at once
+    rd.pod_up.STATE_PATH = scratch
+    try:
+        s = PodSession()
+        s.try_begin_start(None)      # -> STARTING
+        s.pod_id = "podX"            # known id so _resolve_pod_id short-circuits
+        s.try_begin_stop()           # -> STOPPING (raises cancel)
+        rd.stop(s)
+        snap = s.snapshot()
+        check("stop() calls terminate_pod with the pod id", terminated.get("id") == "podX")
+        check("stop() lands IDLE after verifying it left RUNNING", snap["state"] == "IDLE")
+        check("stop() clears pod_state.json after terminate", not scratch.exists())
+    finally:
+        fake_runpod.terminate_pod = saved_term
+        fake_runpod.get_pod = saved_get
+        rd.pod_up.STATE_PATH = saved_state
+        scratch.unlink(missing_ok=True)
+
+
+def test_read_secret_converts_systemexit():
+    # The vendored secret readers sys.exit() (SystemExit, a BaseException) on a
+    # missing/bad secret; _read_secret must convert it to a catchable RuntimeError
+    # so the driver's `except Exception` handlers recover instead of the worker
+    # dying with the session stuck STOPPING and the pod still billing.
+    def missing():
+        raise SystemExit("Missing secret: ~/.config/podlink/runpod_api_key")
+    outcome = "no-raise"
+    try:
+        rd._read_secret(missing)
+    except RuntimeError:
+        outcome = "RuntimeError"
+    except SystemExit:
+        outcome = "SystemExit"
+    check("_read_secret converts SystemExit -> RuntimeError", outcome == "RuntimeError")
+
+
+def test_verify_terminated_true_when_get_pod_raises():
+    # After terminate_pod succeeds, get_pod may raise (pod already deleted); that
+    # must read as 'terminated', not a false failure.
+    saved_get = fake_runpod.get_pod
+    def boom(pod_id):
+        raise RuntimeError("pod not found")
+    fake_runpod.get_pod = boom
+    try:
+        check("_verify_terminated True when get_pod raises",
+              rd._verify_terminated(PodSession(), "podX") is True)
+    finally:
+        fake_runpod.get_pod = saved_get
+
+
 if __name__ == "__main__":
     print("driver smoke tests:")
     test_resolve_gpu_id_matches_rtx_pro_6000()
@@ -142,4 +214,7 @@ if __name__ == "__main__":
     test_all_ready_waits_for_stragglers_then_times_out()
     test_all_ready_cancels_promptly()
     test_create_aborts_on_cancel_before_create()
+    test_stop_terminates_and_lands_idle()
+    test_read_secret_converts_systemexit()
+    test_verify_terminated_true_when_get_pod_raises()
     print("all driver smoke tests passed.")

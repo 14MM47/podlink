@@ -6,6 +6,7 @@ That's how the 'single egress' demo claim stays honest from day one.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -66,8 +67,13 @@ def _now_iso() -> str:
 
 
 def _append(record: dict) -> None:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOG_PATH.open("a") as f:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)  # private dir for new trees
+    # Create 0600 (not the umask default 0644): the audit log records outbound
+    # hosts/paths/timings and shouldn't be world-readable. fchmod also tightens a
+    # log that pre-existed at looser perms.
+    fd = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:                        # fdopen takes ownership of fd
+        os.fchmod(fd, 0o600)                             # enforce even on a pre-existing file
         f.write(json.dumps(record) + "\n")
 
 

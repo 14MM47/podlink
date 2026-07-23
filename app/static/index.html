@@ -48,6 +48,14 @@
     .phase { margin-top: .5rem; font-size: .95rem; opacity: .85; }
     .error { margin-top: .5rem; font-size: .9rem; color: #ff8a8a; }
     .meta { margin-top: .35rem; font-size: .78rem; opacity: .5; word-break: break-all; }
+    /* Shown only when no Network Volume is set: POD DOWN would destroy weights. */
+    .volwarn {
+      display: none; max-width: 460px; text-align: center; line-height: 1.4;
+      background: #3a1f1f; color: #ffb4b4; border: 1px solid #7a2f2f;
+      border-radius: 8px; padding: .55rem .8rem; font-size: .82rem;
+    }
+    .volwarn.show { display: block; }
+    .volwarn code { font-size: .78rem; opacity: .85; }
   </style>
 </head>
 <body>
@@ -58,6 +66,11 @@
       <option value="">Auto — create/resume the podlink pod</option>
     </select>
     <button id="refresh" class="mini" title="Refresh pod list">⟳</button>
+  </div>
+  <div id="volwarn" class="volwarn">
+    ⚠ No RunPod <b>Network Volume</b> configured — <b>POD&nbsp;DOWN will terminate
+    the pod and destroy the downloaded model weights</b>, so the next POD&nbsp;UP
+    re-downloads ~36&nbsp;GB. Set <code>PODLINK_NETWORK_VOLUME_ID</code> to persist them.
   </div>
   <div class="buttons">
     <button id="up">POD&nbsp;UP</button>

@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,7 +28,6 @@ from pathlib import Path
 import runpod
 from runpod.error import QueryError
 from rich import print as rprint
-from rich.prompt import Confirm
 
 import _secrets
 
@@ -86,19 +86,31 @@ EXPOSED_PORT = ",".join(f"{p}/http" for p in SERVICE_PORTS.values())
 CONTAINER_DISK_GB = 55    # must hold the bundled image (~38 GB on the 24.04/CUDA-12.9
                           # base) + vLLM's torch_compile_cache (~1-2 GB, on container
                           # disk, not the volume) + scratch. 40 GB was too tight.
-# The /workspace volume holds the persistent HF cache (LLM + both TEI models).
-# This is a pod-scoped Data Volume: it survives STOP/RESUME (podlink's lifecycle)
-# but is destroyed on TERMINATE. To make it terminate-safe, pass a pre-created
-# network_volume_id to create_pod instead (region-bound).
-# 50 GB holds the BALANCED profile (~36 GB weights) with headroom for download
-# temp files. container_disk + volume is the per-pod disk the Secure host must
-# have free: an oversized ask gets rejected with "this machine does not have the
-# resources" (130 GB failed; a manual 30+50=80 GB deploy succeeded). Keep it lean;
-# bump (and re-create) only if you later A/B a second LLM.
-VOLUME_GB = 50
+# Persistent HF-cache storage mounted at /workspace. Two modes:
+#   * NETWORK VOLUME (preferred) — set NETWORK_VOLUME_ID to a volume created in
+#     RunPod (Storage -> Network Volumes). It SURVIVES terminate, so the up/down
+#     cycle is terminate/recreate: create finds ANY host (reliable — no host-pinning),
+#     and the ~36 GB of weights are kept on the volume (no re-download). Trade-off:
+#     the volume is REGION-LOCKED to its data center, so the pod only deploys where
+#     the volume lives — pick a region with RTX PRO 6000 stock; RunPod pins the pod
+#     to that DC automatically when a networkVolumeId is given.
+#   * DATA VOLUME (fallback, NETWORK_VOLUME_ID left empty) — a pod-scoped volume of
+#     VOLUME_GB that is DESTROYED on terminate (weights re-download) and forces the
+#     fragile stop/resume model (resume fails when the pinned host has no free GPU:
+#     "not enough free GPUs on the host machine").
+# Supplied via the environment so the infra id is NOT committed into source and
+# the CLI and the web app read one shared value. Empty => Data Volume fallback
+# (weights are DESTROYED on terminate). Export PODLINK_NETWORK_VOLUME_ID before
+# launching podlink (or in its service env) to enable terminate-safe persistence.
+NETWORK_VOLUME_ID = os.environ.get("PODLINK_NETWORK_VOLUME_ID", "").strip()
+VOLUME_GB = 50             # only used when NETWORK_VOLUME_ID is empty (Data Volume)
 VOLUME_MOUNT = "/workspace"
 MAX_MODEL_LEN = 32768
 GPU_MEMORY_UTILIZATION = 0.70   # caps vLLM so the two TEI services fit on 96 GB
+# SSH is handy for first-boot debug / pre-warm but opens an extra surface on every
+# pod. On by default (preserves debugging during bring-up); set PODLINK_START_SSH=0
+# to deploy without it once the image is trusted.
+START_SSH = os.environ.get("PODLINK_START_SSH", "1").strip().lower() not in ("0", "false", "no", "")
 
 # The specs never publish RunPod's exact GPU type id for the RTX Pro 6000, so we
 # resolve it live (resolve_gpu_id) by matching this substring against the catalog.
@@ -232,6 +244,27 @@ def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None =
         "MAX_MODEL_LEN": str(MAX_MODEL_LEN),
         "GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
     }
+    # Persistent storage: a Network Volume (survives terminate; region-locked) when
+    # NETWORK_VOLUME_ID is set, else a pod-scoped Data Volume (destroyed on terminate).
+    create_kwargs = dict(
+        name=POD_NAME,
+        image_name=IMAGE,
+        template_id=template_id,          # carries the ghcr pull credential
+        gpu_type_id=gpu_type_id,
+        cloud_type="SECURE",
+        gpu_count=1,
+        container_disk_in_gb=CONTAINER_DISK_GB,
+        volume_mount_path=VOLUME_MOUNT,
+        ports=EXPOSED_PORT,               # "8000/http,8080/http,8081/http"
+        env=env,
+        support_public_ip=False,          # all traffic via RunPod's HTTPS proxy
+        start_ssh=START_SSH,              # SSH for first-boot debug (PODLINK_START_SSH=0 to disable)
+    )
+    if NETWORK_VOLUME_ID:
+        create_kwargs["network_volume_id"] = NETWORK_VOLUME_ID  # persists across terminate
+    else:
+        create_kwargs["volume_in_gb"] = VOLUME_GB               # pod-scoped, lost on terminate
+
     # Retry the host-selection lottery (see _RETRYABLE_CREATE_ERRORS). A failed
     # create allocates nothing, so retrying is free; Ctrl-C aborts.
     last_err: QueryError | None = None
@@ -244,21 +277,7 @@ def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None =
             # to stdout (terminal + any captured logs). Capture and discard that stdout
             # so the secrets never leak; we use the return value, not the print.
             with contextlib.redirect_stdout(io.StringIO()):
-                return runpod.create_pod(
-                    name=POD_NAME,
-                    image_name=IMAGE,
-                    template_id=template_id,  # carries the ghcr pull credential
-                    gpu_type_id=gpu_type_id,
-                    cloud_type="SECURE",
-                    gpu_count=1,
-                    volume_in_gb=VOLUME_GB,
-                    container_disk_in_gb=CONTAINER_DISK_GB,
-                    volume_mount_path=VOLUME_MOUNT,
-                    ports=EXPOSED_PORT,       # "8000/http,8080/http,8081/http"
-                    env=env,
-                    support_public_ip=False,  # all traffic via RunPod's HTTPS proxy
-                    start_ssh=True,           # SSH on for first-boot debug / pre-warm
-                )
+                return runpod.create_pod(**create_kwargs)
         except QueryError as e:
             if not any(s in str(e) for s in _RETRYABLE_CREATE_ERRORS):
                 raise                         # a real error (bad spec, auth, …) — surface it
@@ -345,22 +364,23 @@ def main() -> None:
     runpod.api_key = _secrets.runpod_api_key()
 
     existing = find_existing()
-    if existing:
+    if existing and existing.get("desiredStatus") == "RUNNING":
+        # A live pod already serves — adopt it and refresh the URLs on disk.
         pod_id = existing["id"]
-        status = existing.get("desiredStatus")
-        rprint(f"[yellow]Pod {POD_NAME!r} already exists[/]: id={pod_id} status={status}")
-        if status != "RUNNING":
-            if Confirm.ask("Resume it?", default=True):
-                rprint("[cyan]Resuming…[/]")
-                # resume_pod signature varies; SDK requires gpu_count
-                runpod.resume_pod(pod_id, gpu_count=1)
-                wait_for_running(pod_id)
-        # rewrite state file so we always have fresh URLs on disk
+        rprint(f"[yellow]Pod {POD_NAME!r} already RUNNING[/]: id={pod_id}")
         pod = runpod.get_pod(pod_id)
         gpu_type = (pod.get("machine", {}).get("gpuTypeId")
                     or pod.get("gpuTypeId") or "unknown")
         write_state({**pod, "id": pod_id}, gpu_type)
         return
+    if existing:
+        # Exists but not RUNNING: a leftover (crashed, or reaping after a
+        # terminate). We never resume — the lifecycle is terminate/recreate — so
+        # create a fresh pod; the Network Volume keeps the weights, and RunPod
+        # reaps the dead one.
+        rprint(f"[yellow]Pod {POD_NAME!r} exists but is "
+               f"{existing.get('desiredStatus')}[/] — creating a fresh pod "
+               f"(terminate/recreate lifecycle).")
 
     pod = try_create()
     pod_id = pod["id"]

@@ -19,11 +19,41 @@ POD UP provisions the **ragline three-service stack** on a single **RTX Pro 6000
 | Button | State it's live in | What it does |
 |--------|--------------------|--------------|
 | **POD UP** | IDLE / ERROR | Resolves the RTX Pro 6000 GPU id (live, via `runpod.get_gpus()`), creates or resumes the `podlink` pod, waits for `RUNNING`, then waits until **all three** services are healthy (LLM `/v1/models` + both TEI `/health` return `200`). |
-| **POD DOWN** | STARTING / RUNNING / ERROR | Cancels any in-flight start, **stops** the whole pod (GPU billing ends, model-weight volume kept), and **verifies** the pod left `RUNNING` before reporting safe. |
+| **POD DOWN** | STARTING / RUNNING / ERROR | Cancels any in-flight start, **terminates** the whole pod (GPU released), and **verifies** the pod left `RUNNING` before reporting safe. Model weights persist on the **Network Volume** (if configured) for a fast next up. |
 
 Pod Down is greyed out until Pod Up is pressed. The instant Pod Up starts, Pod Up
 greys out and Pod Down goes live — and stays live through the **entire**
 provisioning window, so you can kill the pod cleanly at any point.
+
+### Terminate, not stop — and the Network Volume
+
+POD DOWN **terminates** the pod rather than stopping it. A *stopped* pod is pinned
+to its original host and can fail to resume when that host has no free GPU
+(*"not enough free GPUs on the host machine"*); terminate always releases the GPU
+cleanly and the next POD UP creates a fresh pod on **any** host.
+
+So weights survive a terminate, podlink attaches a pre-created RunPod **Network
+Volume** (region-locked, survives terminate) at `/workspace`, where the image's
+`HF_HOME=/workspace/hf` cache lives. Set its id via the environment before
+launching podlink:
+
+```bash
+export PODLINK_NETWORK_VOLUME_ID=<your-network-volume-id>
+```
+
+Create the volume once in **RunPod → Storage → Network Volumes**, sized **75–100 GB**
+(holds the ~36 GB of weights plus download scratch), in a **data center that stocks
+the RTX Pro 6000** — the volume pins the pod to its region, so pick one with card
+availability. The SDK resolves the data-center automatically from the volume id.
+
+> **Cost:** a Network Volume bills storage 24/7 even with no pod running
+> (≈ $0.05–0.07/GB·month → ~$4–7/month for 75 GB). That is the price of skipping a
+> ~36 GB re-download on every POD UP.
+
+If `PODLINK_NETWORK_VOLUME_ID` is **unset**, podlink falls back to a pod-scoped
+Data Volume that is **destroyed on terminate** — the weights re-download on the
+next up. In that mode the web UI shows a red banner and POD DOWN asks you to
+confirm before destroying them.
 
 ### Target selection
 
@@ -36,10 +66,10 @@ Above the buttons, a **Target** dropdown chooses what Pod Up acts on:
   an arbitrary pod may not serve that endpoint).
 
 The selected pod's id is recorded the instant Pod Up is pressed, so Pod Down
-stops **that** pod — including if you hit Down immediately. Pod Down always
-**stops** (keeps the volume) regardless of which pod is selected. The list shows
-name, status, GPU, and hourly cost, and only ever exposes those fields — never a
-pod's environment (which can hold API keys).
+terminates **that** pod — including if you hit Down immediately. Pod Down always
+**terminates** regardless of which pod is selected. The list shows name, status,
+GPU, and hourly cost, and only ever exposes those fields — never a pod's
+environment (which can hold API keys).
 
 ### Why Pod Down is safe anywhere
 
@@ -47,10 +77,10 @@ RunPod bills at the full GPU rate from the moment a pod is **created**, not from
 `RUNNING` — and the original `pod_down.py` relied on `pod_state.json`, which
 `pod_up.py` writes only after the pod is fully up. podlink closes that gap: it
 captures the pod id the instant the pod is created and, failing that, finds the
-pod **by name**, so Pod Down can always locate and stop the pod even mid-boot
+pod **by name**, so Pod Down can always locate and terminate the pod even mid-boot
 before any state file exists. It then polls until the pod has actually left
-`RUNNING` before it tells you billing has stopped; if it can't confirm, it shows
-a loud `STOP NOT VERIFIED` error rather than a false "safe".
+`RUNNING` (or vanished) before it tells you billing has stopped; if it can't
+confirm, it shows a loud `TERMINATE NOT VERIFIED` error rather than a false "safe".
 
 ## Prerequisites
 
@@ -111,11 +141,13 @@ pip install -r requirements.txt
    `RERANK_MODEL_ID` / `LLM_QUANT`) exist on HF with a Blackwell-compatible quant
    (FP8 checkpoint, or AWQ-Marlin W4A16 — **never NVFP4** on `sm_120`).
 3. **Ensure the three secrets** are in place (above).
-4. **POD UP** — first boot resolves the GPU id, creates the pod, and downloads
-   weights to the `/workspace` volume (a one-time cost; later resumes are fast).
-   The `/workspace` volume is sized (`VOLUME_GB`, ~150 GB) to hold the persistent
-   HF cache so weights aren't re-downloaded each boot.
-5. **Wire ragline** — the UI shows the three proxy URLs (also saved in
+4. **Create the Network Volume** (75–100 GB, in an RTX-Pro-6000 region) and
+   `export PODLINK_NETWORK_VOLUME_ID=<id>` — see *Terminate, not stop* above.
+5. **POD UP** — first boot resolves the GPU id, creates the pod, and downloads
+   weights to the `/workspace` Network Volume (a one-time cost). Every later POD UP
+   creates a fresh pod that reuses the cached weights on the volume — no
+   re-download — so boot is fast.
+6. **Wire ragline** — the UI shows the three proxy URLs (also saved in
    `pod_state.json`). Point ragline's `.env` at them:
 
    ```dotenv

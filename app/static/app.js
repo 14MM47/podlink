@@ -9,9 +9,11 @@ const errorEl = document.getElementById("error");  // the error line
 const metaEl = document.getElementById("meta");    // pod id / proxy url line
 const podSelect = document.getElementById("podSelect");  // target-pod dropdown
 const refreshBtn = document.getElementById("refresh");   // reload-pod-list button
+const volwarn = document.getElementById("volwarn");      // "no Network Volume" banner
 
 let token = null;                                   // per-process CSRF token (fetched once)
 let lastState = null;                               // to reload pods on return to IDLE
+let lastSnap = null;                                // most recent status snapshot (for the Down guard)
 
 // Fetch the per-process CSRF token once (same-origin; cross-origin JS can't read it).
 async function loadToken() {
@@ -43,6 +45,10 @@ async function loadPods() {
 
 // Reflect a status snapshot into the UI.
 function render(s) {
+  lastSnap = s;                                     // remember it for the POD DOWN guard
+  // Warn when no Network Volume is set: POD DOWN (a terminate) destroys weights.
+  // `=== false` so an older frame without the field never flashes the banner.
+  volwarn.classList.toggle("show", s.network_volume_configured === false);
   badge.textContent = s.state;                      // show the current state
   phaseEl.textContent = s.phase || "";              // show progress text (or blank)
   errorEl.textContent = s.error || "";              // show error (or blank)
@@ -88,8 +94,20 @@ upBtn.addEventListener("click", () => {             // when POD UP is clicked
   send("/pod/up", { target: podSelect.value || null });  // pass the chosen target (or Auto)
 });
 downBtn.addEventListener("click", () => {           // when POD DOWN is clicked
+  // Destructive-action guard, fail CLOSED: only skip the warning when we
+  // positively know a Network Volume is set. Unknown (no snapshot yet, or the
+  // field absent) is treated as unsafe so an early click can't slip through.
+  const safe = lastSnap && lastSnap.network_volume_configured === true;
+  if (!safe) {
+    const ok = confirm(
+      "No RunPod Network Volume is confirmed configured.\n\n" +
+      "POD DOWN will TERMINATE the pod and may DESTROY the ~36 GB of downloaded " +
+      "model weights — the next POD UP would re-download them.\n\nTerminate anyway?"
+    );
+    if (!ok) return;                                // aborted; leave the button live
+  }
   downBtn.disabled = true;                          // optimistic; SSE will confirm
-  send("/pod/down");                                // ask the server to stop
+  send("/pod/down", { confirm: true });            // explicit confirmation for the server-side guard
 });
 refreshBtn.addEventListener("click", loadPods);     // manual pod-list refresh
 

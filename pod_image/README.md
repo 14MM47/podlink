@@ -13,16 +13,17 @@ One Docker image that runs **three co-resident services** on a single RTX Pro 60
 download on first boot into `$HF_HOME=/workspace/hf` (the persistent volume), so
 the download is a one-time cost and later resumes are fast.
 
-## Before you build — pin the two base images
+## Base images (already pinned)
 
-Edit the two `ARG`s at the top of `Dockerfile`:
+The two `ARG`s at the top of `Dockerfile` are pinned to Blackwell-capable builds —
+override them only to bump versions:
 
-- `VLLM_IMAGE` — **replace `PIN_BLACKWELL_CAPABLE_TAG`** with a `vllm/vllm-openai`
-  tag that supports Blackwell `sm_120`. podlink's older `v0.9.2` (CUDA 12.4) does
-  **not**; use a current Blackwell-capable release (check the RTX Pro 6000 vLLM
-  guides for a known-good tag).
-- `TEI_IMAGE` — defaults to `ghcr.io/huggingface/text-embeddings-inference:120-1.9`
-  (the sm_120 build). Bump the version as needed.
+- `VLLM_IMAGE` — `vllm/vllm-openai:v0.25.1-cu129-ubuntu2404` (CUDA 12.9, Ubuntu
+  24.04, `sm_120`). Use the `-cu129-ubuntu2404` variant, **not** the bare
+  `v0.25.1` tag (Ubuntu 22.04 / glibc 2.35, which the copied TEI binary needs 24.04
+  to satisfy). podlink's older `v0.9.2` (CUDA 12.4) does **not** support `sm_120`.
+- `TEI_IMAGE` — `ghcr.io/huggingface/text-embeddings-inference:120-1.9` (the sm_120
+  build). Bump the version as needed.
 
 ## Build & push
 

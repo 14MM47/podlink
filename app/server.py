@@ -11,6 +11,7 @@ from __future__ import annotations  # postponed annotation evaluation
 
 import asyncio                       # sleep between SSE pushes
 import json                          # serialise snapshots for SSE frames
+import re                            # validate the client-supplied pod id
 import secrets as pysecrets          # cryptographic token + constant-time compare
 import threading                     # run driver work off the request thread
 from pathlib import Path             # locate the static/ directory
@@ -27,6 +28,9 @@ SESSION = PodSession()               # the single, process-wide pod session
 # Per-process token; regenerated every launch so a stale token can't act.
 TOKEN = pysecrets.token_urlsafe(24)  # unguessable per-run secret
 STATIC_DIR = Path(__file__).resolve().parent / "static"  # …/app/static
+# RunPod pod ids are short lowercase-alnum strings; validate before any SDK call
+# so a malformed/injected target can't reach runpod.get_pod.
+_POD_ID_RE = re.compile(r"^[a-z0-9]{6,40}$")
 
 
 @app.middleware("http")
@@ -54,6 +58,19 @@ def _launch(target) -> None:
     threading.Thread(target=target, args=(SESSION,), daemon=True).start()  # non-blocking
 
 
+def _snapshot() -> dict:
+    """Session snapshot plus process-constant deploy flags the UI needs.
+
+    Adds `network_volume_configured` so the UI can warn that POD DOWN (a terminate)
+    will destroy the downloaded weights when no Network Volume is set. It's a
+    process constant, so emitting it on every SSE frame is cheap and the dedupe
+    in /events still works.
+    """
+    snap = SESSION.snapshot()                                 # base state + button flags
+    snap["network_volume_configured"] = runpod_driver.network_volume_configured()
+    return snap
+
+
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")   # serve the two-button page
@@ -72,7 +89,7 @@ def config() -> JSONResponse:
 
 @app.get("/status")
 def status() -> JSONResponse:
-    return JSONResponse(SESSION.snapshot())          # current state + button flags
+    return JSONResponse(_snapshot())                 # state + button flags + deploy flags
 
 
 @app.get("/pods")
@@ -89,20 +106,35 @@ def pods(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
 def pod_up(target: str | None = Body(default=None, embed=True),
            x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
     _require_token(x_podlink_token)                   # CSRF/token gate
-    if not SESSION.try_begin_start(target or None):  # atomically enter STARTING (None = Auto)
+    target = target or None                           # normalise "" -> None (Auto)
+    if target is not None and not _POD_ID_RE.match(target):  # reject a malformed id
+        raise HTTPException(status_code=400, detail="invalid pod id format")
+    if not SESSION.try_begin_start(target):          # atomically enter STARTING (None = Auto)
         # Not in a state where Up is allowed (already starting/running/stopping).
         raise HTTPException(status_code=409, detail="pod up not available in current state")
     _launch(runpod_driver.start)                     # provision in the background
-    return JSONResponse(SESSION.snapshot())          # echo the new state
+    return JSONResponse(_snapshot())                 # echo the new state
 
 
 @app.post("/pod/down")
-def pod_down(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+def pod_down(confirm: bool = Body(default=False, embed=True),
+             x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
     _require_token(x_podlink_token)                   # CSRF/token gate
+    # Server-side destructive-action guard. With no Network Volume, terminate
+    # DESTROYS the downloaded weights. The browser shows a confirm dialog, but
+    # that JS is bypassable (curl, a script, a stale tab), so the server itself
+    # refuses to terminate unless the caller explicitly confirms. With a volume
+    # configured, terminate is non-destructive and no confirmation is required.
+    if not runpod_driver.network_volume_configured() and not confirm:
+        raise HTTPException(
+            status_code=428,                          # Precondition Required
+            detail='no Network Volume configured — POD DOWN will destroy the '
+                   'downloaded model weights; resend with {"confirm": true} to proceed',
+        )
     if not SESSION.try_begin_stop():                 # atomically enter STOPPING + cancel
         raise HTTPException(status_code=409, detail="pod down not available in current state")
-    _launch(runpod_driver.stop)                      # stop + verify in the background
-    return JSONResponse(SESSION.snapshot())          # echo the new state
+    _launch(runpod_driver.stop)                      # terminate + verify in the background
+    return JSONResponse(_snapshot())                 # echo the new state
 
 
 @app.get("/events")
@@ -113,7 +145,7 @@ async def events(request: Request) -> StreamingResponse:
         while True:                                  # stream until client disconnects
             if await request.is_disconnected():      # browser closed the tab/stream
                 break                                # end the generator
-            snap = SESSION.snapshot()                # current state
+            snap = _snapshot()                       # current state + deploy flags
             if snap != last:                         # only emit on change (cheap dedupe)
                 yield f"data: {json.dumps(snap)}\n\n"  # SSE frame format
                 last = snap                          # remember what we sent

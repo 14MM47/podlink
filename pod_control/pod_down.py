@@ -1,7 +1,14 @@
-"""Stop (do not terminate) the Phase 0 pod.
+"""Terminate the pod (fully release the GPU).
 
-Stopped pods bill only for volume storage (~£0.005/hr). Model weights survive,
-so next pod_up.py resume skips the download.
+With the Network Volume model, "down" TERMINATES rather than stops: terminate
+releases the GPU cleanly (no host-pinning), and the ~36 GB of model weights
+persist on the Network Volume, so the next pod_up.py re-creates and reuses them
+without re-downloading. (If NETWORK_VOLUME_ID is empty — the Data Volume fallback
+— terminate DOES destroy the weights; they re-download on next up.)
+
+Stopping is deliberately not used: a stopped pod is pinned to its original host,
+and resuming fails when that host has no free GPU
+("not enough free GPUs on the host machine to start this pod").
 """
 from __future__ import annotations
 
@@ -14,6 +21,7 @@ from rich import print as rprint
 from rich.prompt import Confirm
 
 import _secrets
+from pod_up import NETWORK_VOLUME_ID
 
 STATE_PATH = Path(__file__).resolve().parents[1] / "pod_state.json"
 
@@ -27,20 +35,25 @@ def main() -> None:
     pod_id = state["pod_id"]
 
     pod = runpod.get_pod(pod_id)
-    current = pod.get("desiredStatus")
-    rprint(f"Pod {pod_id} current status: [bold]{current}[/]")
-
-    if current != "RUNNING":
-        rprint("[yellow]Pod not in RUNNING state; nothing to stop.[/]")
+    if pod is None:
+        rprint(f"[yellow]Pod {pod_id} no longer exists; nothing to terminate.[/]")
         return
+    rprint(f"Pod {pod_id} current status: [bold]{pod.get('desiredStatus')}[/]")
 
-    if not Confirm.ask("Stop the pod (volume preserved)?", default=True):
+    weights_note = (
+        "weights persist on the Network Volume for a fast next up"
+        if NETWORK_VOLUME_ID
+        else "NO Network Volume set — weights will be LOST and re-download on next up"
+    )
+    # default=False: terminate is destructive (releases the pod, and without a
+    # Network Volume destroys the weights), so a bare Enter must NOT terminate.
+    if not Confirm.ask(f"Terminate the pod ({weights_note})?", default=False):
         rprint("Aborted.")
         return
 
-    runpod.stop_pod(pod_id)
-    rprint(f"[green]Stop request sent for {pod_id}.[/]")
-    rprint("Volume storage continues to bill at the static rate; GPU billing ceases.")
+    runpod.terminate_pod(pod_id)
+    rprint(f"[green]Terminate request sent for {pod_id}.[/] GPU released; "
+           f"{weights_note}.")
 
 
 if __name__ == "__main__":
