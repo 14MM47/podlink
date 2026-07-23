@@ -37,6 +37,10 @@ let token = null;                                   // per-process CSRF token (f
 let lastState = null;                               // to reload pods on return to IDLE
 let lastSnap = null;                                // most recent status snapshot (for the Down guard)
 let envKey = null;                                  // pod_id:dim the .env block was last fetched for
+// Change-detection keys: only rebuild (and repaint) a panel when ITS data changed.
+// The cost meter ticks every second, so render() runs every second — without these
+// we'd rebuild the frosted-glass log panels every second for nothing.
+let mBadge, mPhase, mError, mMeta, mVol, mWarn, mTiles, mTest, mFeeds;
 
 // Fetch the per-process CSRF token once (same-origin; cross-origin JS can't read it).
 async function loadToken() {
@@ -157,31 +161,38 @@ function escapeHtml(s) {
 // Reflect a status snapshot into the UI.
 function render(s) {
   lastSnap = s;                                     // remember it for the POD DOWN guard
-  // Warn when no Network Volume is set: POD DOWN (a terminate) destroys weights.
-  // `=== false` so an older frame without the field never flashes the banner.
-  volwarn.classList.toggle("show", s.network_volume_configured === false);
-  badge.textContent = s.state;                      // show the current state
-  badge.dataset.state = s.state;                    // colour the pill by state (CSS)
-  phaseEl.textContent = s.phase || "";              // show progress text (or blank)
-  errorEl.textContent = s.error || "";              // show error (or blank)
-  // Show the pod id, and — for our three-service stack (proxy_url set on the
-  // Auto path) — the three service URLs, which are just pod-id + fixed ports.
-  if (s.pod_id) {
-    const pid = escapeHtml(s.pod_id);
-    let m = `<div><span class="k">pod</span> <span class="pid">${pid}</span></div>`;
-    if (s.proxy_url) {
-      const base = (port) => `https://${pid}-${port}.proxy.runpod.net`;
-      m += `<div class="urls">` +
-           `<span><b>llm</b> ${base(8000)}/v1</span>` +
-           `<span><b>embed</b> ${base(8080)}/v1</span>` +
-           `<span><b>rerank</b> ${base(8081)}</span></div>`;
+
+  // "no Network Volume" banner — only toggle on change.
+  const warn = s.network_volume_configured === false;
+  if (warn !== mWarn) { volwarn.classList.toggle("show", warn); mWarn = warn; }
+
+  // Badge / phase / error — tiny text, but gated to avoid churn (and animation restarts).
+  if (s.state !== mBadge) { badge.textContent = s.state; badge.dataset.state = s.state; mBadge = s.state; }
+  const ph = s.phase || ""; if (ph !== mPhase) { phaseEl.textContent = ph; mPhase = ph; }
+  const er = s.error || ""; if (er !== mError) { errorEl.textContent = er; mError = er; }
+
+  // Pod id + service URLs — rebuild only when the pod changes.
+  const metaKey = `${s.pod_id || ""}|${s.proxy_url || ""}`;
+  if (metaKey !== mMeta) {
+    if (s.pod_id) {
+      const pid = escapeHtml(s.pod_id);
+      let m = `<div><span class="k">pod</span> <span class="pid">${pid}</span></div>`;
+      if (s.proxy_url) {
+        const base = (port) => `https://${pid}-${port}.proxy.runpod.net`;
+        m += `<div class="urls">` +
+             `<span><b>llm</b> ${base(8000)}/v1</span>` +
+             `<span><b>embed</b> ${base(8080)}/v1</span>` +
+             `<span><b>rerank</b> ${base(8081)}</span></div>`;
+      }
+      metaEl.innerHTML = m;
+    } else {
+      metaEl.innerHTML = '<span class="muted">— no pod running —</span>';
     }
-    metaEl.innerHTML = m;
-  } else {
-    metaEl.innerHTML = '<span class="muted">— no pod running —</span>';
+    mMeta = metaKey;
   }
-  // Cost meter — live while a pod is up; a muted placeholder when idle (the line
-  // is always present, per the "indicators from startup" rule).
+
+  // Cost meter + auto-terminate countdown — these DO tick every second by design;
+  // they're single-line text so the per-second update is cheap.
   if (s.uptime_s != null) {
     let c = `up ${fmtDuration(s.uptime_s)}`;
     if (s.session_cost_usd != null) c += ` · <b>$${s.session_cost_usd.toFixed(2)}</b>`;
@@ -190,31 +201,32 @@ function render(s) {
   } else {
     costEl.innerHTML = '<span class="muted">— no pod running —</span>';
   }
-  // Auto-terminate row — always shown: a live countdown + Keep alive when armed,
-  // a muted "off" when not.
   if (s.auto_terminate_in_s != null) {
     autotermText.textContent = `auto-terminate in ${fmtDuration(s.auto_terminate_in_s)}`;
     autotermText.classList.remove("muted");
     keepaliveBtn.style.display = "";
-    keepaliveBtn.disabled = false;                  // re-enable each armed frame
+    keepaliveBtn.disabled = false;
   } else {
     autotermText.textContent = "auto-terminate: off";
     autotermText.classList.add("muted");
     keepaliveBtn.style.display = "none";
   }
-  // Network-volume info line (always present).
-  if (s.volume_id) {
-    volinfoEl.innerHTML = `Network Volume: <b>${escapeHtml(s.volume_id)}</b> · persistence <span class="on">ON</span>`;
-    volinfoEl.classList.remove("muted");
-  } else {
-    volinfoEl.innerHTML = 'Network Volume: <span class="muted">none — Data-Volume mode (weights not persisted)</span>';
+
+  // Network-volume info line — rebuild only when the volume changes.
+  const volKey = s.volume_id || "";
+  if (volKey !== mVol) {
+    volinfoEl.innerHTML = s.volume_id
+      ? `Network Volume: <b>${escapeHtml(s.volume_id)}</b> · persistence <span class="on">ON</span>`
+      : 'Network Volume: <span class="muted">none — Data-Volume mode (weights not persisted)</span>';
+    mVol = volKey;
   }
-  // Per-pod actions (test stack, copy .env) — enabled only once serving.
+
+  // Per-pod action button states — cheap toggles, every frame.
   const up = !!(s.pod_id && s.proxy_url);
-  teststackBtn.disabled = !up || !!s.test_running;   // disable while a test runs
+  teststackBtn.disabled = !up || !!s.test_running;
   copyenvBtn.disabled = !up;
-  // Outputs rail: auto-populate the client config block while a pod serves, and
-  // re-fetch once Test-stack detects the embedding dimension (fills EMBEDDING_DIMENSIONS).
+
+  // Outputs rail: auto-populate the client config block (already change-gated by envKey).
   const dim = s.test_result && s.test_result.embedding_dim;
   const key = up ? `${s.pod_id}:${dim || ""}` : null;
   if (key && key !== envKey) { envKey = key; fetchEnv(); }
@@ -222,17 +234,20 @@ function render(s) {
     envKey = "idle"; copiedEl.style.display = "none";
     envviewEl.innerHTML = '<span class="muted">— start a pod to generate the client config —</span>';
   }
-  renderTest(s);
-  // Per-service health tiles and the split status event feeds.
-  renderTiles(s.services);
-  renderFeeds(s.events);
-  // Server is the single source of truth for enablement.
-  upBtn.disabled = !s.up_enabled;                   // grey Up unless server allows it
-  downBtn.disabled = !s.down_enabled;               // grey Down unless server allows it
-  // The target can only be changed before a run starts (i.e. when Up is live).
+
+  // Expensive panels (glass, many rows) — rebuild ONLY when their data changed.
+  const testKey = JSON.stringify(s.test_result) + "|" + s.test_running;
+  if (testKey !== mTest) { renderTest(s); mTest = testKey; }
+  const tilesKey = JSON.stringify(s.services || {});
+  if (tilesKey !== mTiles) { renderTiles(s.services); mTiles = tilesKey; }
+  const feedsKey = JSON.stringify(s.events || []);
+  if (feedsKey !== mFeeds) { renderFeeds(s.events); mFeeds = feedsKey; }
+
+  // Enablement flags — cheap, every frame.
+  upBtn.disabled = !s.up_enabled;
+  downBtn.disabled = !s.down_enabled;
   podSelect.disabled = !s.up_enabled;
   refreshBtn.disabled = !s.up_enabled;
-  // Refresh the pod list whenever we settle back into a selectable state.
   if (s.state !== lastState) {
     if (s.up_enabled) loadPods();                   // IDLE or ERROR -> statuses may have changed
     lastState = s.state;
