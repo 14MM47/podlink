@@ -95,6 +95,7 @@ def _auto_terminate_watch() -> None:
             if (deadline and time.time() >= deadline
                     and SESSION.state in (State.STARTING, State.RUNNING)):
                 if SESSION.try_begin_stop():          # atomic: enter STOPPING + cancel
+                    SESSION.add_event("idle auto-terminate — deadline reached", "system")
                     SESSION.update(phase="idle auto-terminate — deadline reached")
                     _launch(runpod_driver.stop)       # terminate + verify in the background
         except Exception:  # noqa: BLE001 — a watchdog must never die on a transient error

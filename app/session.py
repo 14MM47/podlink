@@ -50,8 +50,11 @@ class PodSession:
         # Per-service health for the UI tiles: llm/embedder/reranker -> one of
         # unknown | pending | healthy | down.
         self.services: dict = _default_services()
-        # Streamed status feed: a ring buffer of (epoch, message) — phase changes
-        # (auto-recorded in update()) and health transitions (via add_event()).
+        # Streamed status feed: a ring buffer of (epoch, category, message).
+        # Categories split the feed into UI panels by source/function:
+        #   lifecycle — provisioning/teardown (phase changes, create retries)
+        #   health    — per-service up/down transitions
+        #   system    — errors, idle auto-terminate, safety notices
         self.events: list = []
         # Set by a Pod Down request; the start worker polls this and bails out.
         self.cancel = threading.Event()          # cross-thread "stop now" signal
@@ -112,18 +115,18 @@ class PodSession:
         with self._lock:                          # keep writes atomic vs snapshot()
             new_phase = fields.get("phase")
             if new_phase is not None and new_phase != self.phase:
-                self._record_event(new_phase)      # timeline entry for the transition
+                self._record_event(new_phase, "lifecycle")  # provisioning timeline entry
             for key, value in fields.items():      # apply each supplied field
                 setattr(self, key, value)          # e.g. self.phase = "…"
 
-    def add_event(self, message: str) -> None:
-        """Append a non-phase status event (e.g. a health transition) to the feed."""
+    def add_event(self, message: str, category: str = "lifecycle") -> None:
+        """Append a categorised status event (health transition, system notice) to the feed."""
         with self._lock:
-            self._record_event(message)
+            self._record_event(message, category)
 
-    def _record_event(self, message: str) -> None:
-        """Append (now, message) to the ring buffer. Caller must hold the lock."""
-        self.events.append((time.time(), message))
+    def _record_event(self, message: str, category: str) -> None:
+        """Append (now, category, message) to the ring buffer. Caller holds the lock."""
+        self.events.append((time.time(), category, message))
         if len(self.events) > _MAX_EVENTS:
             del self.events[:-_MAX_EVENTS]         # keep only the most recent
 
@@ -163,5 +166,6 @@ class PodSession:
                 "auto_terminate_in_s": auto_in,           # seconds until auto-off, or None
                 # Per-service health tiles + the streamed status event feed.
                 "services": dict(self.services),          # llm/embedder/reranker -> status
-                "events": [{"t": t, "msg": m} for t, m in self.events[-25:]],  # recent feed
+                "events": [{"t": t, "cat": c, "msg": m}   # recent feed, split by category in the UI
+                           for t, c, m in self.events[-40:]],
             }

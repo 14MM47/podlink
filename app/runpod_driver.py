@@ -198,6 +198,7 @@ def start(session: PodSession) -> None:
         # Type only — str(e) from the SDK/httpx can embed request context
         # (URLs, headers, the RunPod API key). The phase field already names
         # the failing step; full detail stays server-side / in the dashboard.
+        session.add_event(f"error during start: {type(e).__name__}", "system")
         session.update(state=State.ERROR, phase="error during start",
                        error=f"{type(e).__name__} — check the RunPod dashboard for details")
 
@@ -307,7 +308,7 @@ def _apply_health(session: PodSession, statuses: dict) -> None:
     old = session.services                               # last-known statuses
     for name, st in statuses.items():
         if old.get(name) != st:                          # a service changed state
-            session.add_event(f"{name}: {st}")           # streamed feed entry
+            session.add_event(f"{name}: {st}", "health")  # health-panel feed entry
     session.update(services=dict(statuses))              # refresh the tiles
 
 
@@ -398,6 +399,7 @@ def stop(session: PodSession) -> None:
             )
     except Exception as e:  # noqa: BLE001                # surface any terminate failure
         # Type only — never interpolate str(e); it may leak request context/secrets.
+        session.add_event(f"error during terminate: {type(e).__name__}", "system")
         session.update(state=State.ERROR, phase="error during terminate",
                        error=f"{type(e).__name__} — check the RunPod dashboard for details")
 

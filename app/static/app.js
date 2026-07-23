@@ -20,7 +20,11 @@ const tileEls = {                                        // service -> tile elem
   embedder: document.getElementById("tile-embedder"),
   reranker: document.getElementById("tile-reranker"),
 };
-const feedEl = document.getElementById("feed");          // streamed status event feed
+const feedEls = {                                        // event feed split by source/function
+  lifecycle: document.getElementById("feed-lifecycle"),  // provisioning + timeline
+  health: document.getElementById("feed-health"),        // per-service transitions
+  system: document.getElementById("feed-system"),        // errors / auto-terminate
+};
 
 let token = null;                                   // per-process CSRF token (fetched once)
 let lastState = null;                               // to reload pods on return to IDLE
@@ -74,17 +78,32 @@ function renderTiles(services) {
   }
 }
 
-// Render the streamed status event feed (oldest→newest), auto-scrolled to bottom.
-// Always visible; shows a muted placeholder until the first event arrives.
-function renderFeed(events) {
-  if (!events || !events.length) {
-    feedEl.innerHTML = '<div class="feed-row muted"><span class="msg">waiting for activity…</span></div>';
+// Render one feed panel (oldest→newest, auto-scrolled). withDelta adds a per-step
+// "+M:SS" delta from the previous row — that's the provisioning timeline.
+function renderPanel(el, rows, withDelta) {
+  if (!rows.length) {
+    el.innerHTML = '<div class="feed-row muted"><span class="msg">— none yet —</span></div>';
     return;
   }
-  feedEl.innerHTML = events.map(
-    (e) => `<div class="feed-row"><span class="ts">${fmtClock(e.t)}</span><span class="msg">${escapeHtml(e.msg)}</span></div>`
-  ).join("");
-  feedEl.scrollTop = feedEl.scrollHeight;  // keep the latest line in view
+  let prev = null;
+  el.innerHTML = rows.map((e) => {
+    let dt = "";
+    if (withDelta && prev !== null) {
+      dt = `<span class="dt">+${fmtDuration(Math.max(0, Math.round(e.t - prev)))}</span>`;
+    }
+    prev = e.t;
+    return `<div class="feed-row"><span class="ts">${fmtClock(e.t)}</span>${dt}<span class="msg">${escapeHtml(e.msg)}</span></div>`;
+  }).join("");
+  el.scrollTop = el.scrollHeight;          // keep the latest line in view
+}
+
+// Split the event feed into its three source/function panels.
+function renderFeeds(events) {
+  events = events || [];
+  const by = (cat) => events.filter((e) => (e.cat || "lifecycle") === cat);
+  renderPanel(feedEls.lifecycle, by("lifecycle"), true);   // timeline deltas here
+  renderPanel(feedEls.health, by("health"), false);
+  renderPanel(feedEls.system, by("system"), false);
 }
 
 // Minimal HTML-escape so a phase/message string can't inject markup.
@@ -136,9 +155,9 @@ function render(s) {
     autotermText.classList.add("muted");
     keepaliveBtn.style.display = "none";
   }
-  // Per-service health tiles and the streamed status event feed.
+  // Per-service health tiles and the split status event feeds.
   renderTiles(s.services);
-  renderFeed(s.events);
+  renderFeeds(s.events);
   // Server is the single source of truth for enablement.
   upBtn.disabled = !s.up_enabled;                   // grey Up unless server allows it
   downBtn.disabled = !s.down_enabled;               // grey Down unless server allows it

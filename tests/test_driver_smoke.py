@@ -261,7 +261,7 @@ def test_phase_change_records_event():
     s.update(phase="creating pod")
     s.update(phase="creating pod")            # same -> no new event
     s.update(phase="all services healthy")
-    msgs = [m for _, m in s.events]
+    msgs = [m for _, _c, m in s.events]
     check("phase changes recorded once each",
           msgs == ["creating pod", "all services healthy"])
 
@@ -275,7 +275,7 @@ def test_apply_health_updates_tiles_and_logs_transitions():
           snap_services == {"llm": "healthy", "embedder": "healthy", "reranker": "down"})
     # Transitions logged: llm pending, embedder healthy, reranker pending (first pass),
     # then llm healthy, reranker down (embedder unchanged -> not re-logged).
-    msgs = [m for _, m in s.events]
+    msgs = [m for _, _c, m in s.events]
     check("health transitions logged, unchanged not re-logged",
           msgs == ["llm: pending", "embedder: healthy", "reranker: pending",
                    "llm: healthy", "reranker: down"])
@@ -313,7 +313,7 @@ def test_create_retries_then_succeeds_and_logs():
         pod = rd._create_with_fallback(s)
         check("retries then succeeds on the 3rd attempt", pod == {"id": "pod-ok"} and calls["n"] == 3)
         check("retry attempts logged to the event feed",
-              any("no host with capacity" in m for _, m in s.events))
+              any("no host with capacity" in m for _, _c, m in s.events))
     finally:
         (rd.pod_up.create_pod_once, rd.pod_up.ensure_template,
          rd.pod_up.resolve_gpu_id, rd._sleep_or_cancel) = saved
