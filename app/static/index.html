@@ -56,6 +56,16 @@
       color: #ffcf8a; font-variant-numeric: tabular-nums;
     }
     .muted { opacity: .4; }                 /* greyed placeholder for idle indicators */
+    .volinfo { margin-top: .5rem; font-size: .78rem; opacity: .7; word-break: break-all; }
+    .actions { margin-top: .8rem; display: flex; gap: .6rem; justify-content: center; flex-wrap: wrap; }
+    .copied { color: #7fd7a2; font-size: .8rem; margin-left: .2rem; }
+    .envview {
+      display: none; margin-top: .7rem; width: min(560px, 94vw); max-height: 30vh; overflow: auto;
+      background: #12151b; border: 1px solid #232833; border-radius: 8px;
+      padding: .6rem .7rem; font-size: .74rem; line-height: 1.5; white-space: pre;
+      text-align: left; color: #cdd3df; font-family: ui-monospace, monospace;
+    }
+    .envview.show { display: block; }
     /* Per-service health tiles — always visible, grey until a pod exists */
     .tiles { display: flex; gap: .5rem; margin-top: .8rem; justify-content: center; }
     .tile {
@@ -122,6 +132,12 @@
       <button id="keepalive" class="mini">Keep alive</button>
     </div>
     <div id="meta" class="meta"></div>
+    <div id="volinfo" class="volinfo"></div>
+    <div id="actions" class="actions">
+      <button id="copyenv" class="mini">Copy ragline .env</button>
+      <span id="copied" class="copied" style="display:none">copied ✓</span>
+    </div>
+    <pre id="envview" class="envview"></pre>
   </div>
   <div id="tiles" class="tiles">
     <div class="tile" data-status="unknown" id="tile-llm"><span class="dot"></span>LLM</div>

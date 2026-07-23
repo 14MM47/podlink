@@ -25,6 +25,11 @@ const feedEls = {                                        // event feed split by 
   health: document.getElementById("feed-health"),        // per-service transitions
   system: document.getElementById("feed-system"),        // errors / auto-terminate
 };
+const volinfoEl = document.getElementById("volinfo");    // network-volume info line
+const actionsEl = document.getElementById("actions");    // per-pod action buttons
+const copyenvBtn = document.getElementById("copyenv");   // copy ragline .env
+const copiedEl = document.getElementById("copied");      // "copied ✓" flash
+const envviewEl = document.getElementById("envview");    // the .env block, viewable
 
 let token = null;                                   // per-process CSRF token (fetched once)
 let lastState = null;                               // to reload pods on return to IDLE
@@ -155,6 +160,17 @@ function render(s) {
     autotermText.classList.add("muted");
     keepaliveBtn.style.display = "none";
   }
+  // Network-volume info line (always present).
+  if (s.volume_id) {
+    volinfoEl.innerHTML = `Network Volume: <b>${escapeHtml(s.volume_id)}</b> · persistence ON`;
+    volinfoEl.classList.remove("muted");
+  } else {
+    volinfoEl.innerHTML = 'Network Volume: <span class="muted">none — Data-Volume mode (weights not persisted)</span>';
+  }
+  // Per-pod actions (copy .env) — only meaningful once the pod is serving.
+  const up = !!(s.pod_id && s.proxy_url);
+  actionsEl.style.visibility = up ? "visible" : "hidden";
+  if (!up) { envviewEl.classList.remove("show"); copiedEl.style.display = "none"; }
   // Per-service health tiles and the split status event feeds.
   renderTiles(s.services);
   renderFeeds(s.events);
@@ -207,6 +223,19 @@ refreshBtn.addEventListener("click", loadPods);     // manual pod-list refresh
 keepaliveBtn.addEventListener("click", () => {      // cancel the pending auto-terminate
   keepaliveBtn.disabled = true;                     // optimistic; SSE re-enables on next frame
   send("/pod/keepalive");
+});
+copyenvBtn.addEventListener("click", async () => {  // fetch + copy the ragline .env block
+  if (!token) await loadToken();
+  try {
+    const r = await fetch("/pod/ragline-env", { headers: { "X-Podlink-Token": token } });
+    if (!r.ok) return;
+    const env = (await r.json()).env;
+    envviewEl.textContent = env;                    // reveal it so it's visible + selectable
+    envviewEl.classList.add("show");
+    try { await navigator.clipboard.writeText(env); } catch { /* clipboard may be blocked; text is shown */ }
+    copiedEl.style.display = "inline";
+    setTimeout(() => { copiedEl.style.display = "none"; }, 2000);
+  } catch { /* transient — user can retry */ }
 });
 
 // Live updates via SSE, with a polling fallback if the stream drops.

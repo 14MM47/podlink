@@ -102,6 +102,29 @@ def _auto_terminate_watch() -> None:
             pass
 
 
+def _ragline_env(pod_id: str) -> str:
+    """The ragline .env block for this pod: proxy URLs + model names, with the
+    bearer left as a PLACEHOLDER (never the real secret — it must not reach the
+    browser). The user pastes their pod_bearer_token where marked. EMBEDDING_
+    DIMENSIONS is intentionally left for 'Test stack' to detect, since it depends
+    on what the embedder actually serves."""
+    pu = runpod_driver.pod_up
+    base = lambda port: f"https://{pod_id}-{port}.proxy.runpod.net"   # noqa: E731
+    return "\n".join([
+        f"LLM_BASE_URL={base(8000)}/v1",
+        "LLM_MODEL=ragline-llm",
+        "LLM_API_KEY=<your pod_bearer_token>",
+        f"EMBEDDING_BASE_URL={base(8080)}/v1",
+        f"EMBEDDING_MODEL={pu.EMBED_MODEL_ID}",
+        "# EMBEDDING_DIMENSIONS=  <- run 'Test stack' to detect the served dimension",
+        "EMBEDDING_API_KEY=<your pod_bearer_token>",
+        "RERANKER_PROVIDER=api",
+        f"RERANKER_BASE_URL={base(8081)}",
+        "RERANKER_API_KEY=<your pod_bearer_token>",
+        "KG_EXTRACTION_CONCURRENCY=10",
+    ])
+
+
 def _snapshot() -> dict:
     """Session snapshot plus process-constant deploy flags the UI needs.
 
@@ -112,6 +135,7 @@ def _snapshot() -> dict:
     """
     snap = SESSION.snapshot()                                 # base state + button flags
     snap["network_volume_configured"] = runpod_driver.network_volume_configured()
+    snap["volume_id"] = runpod_driver.pod_up.NETWORK_VOLUME_ID or None  # for the volume panel
     return snap
 
 
@@ -187,6 +211,16 @@ def pod_keepalive(x_podlink_token: str | None = Header(default=None)) -> JSONRes
     _require_token(x_podlink_token)                  # CSRF/token gate
     SESSION.update(auto_terminate_at=None)           # cancel the pending auto-terminate
     return JSONResponse(_snapshot())                 # echo the new state
+
+
+@app.get("/pod/ragline-env")
+def ragline_env(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+    """The ragline .env block for the running pod (bearer left as a placeholder)."""
+    _require_token(x_podlink_token)                  # token gate (consistency)
+    pod_id = SESSION.pod_id
+    if not pod_id:
+        raise HTTPException(status_code=409, detail="no pod running")
+    return JSONResponse({"env": _ragline_env(pod_id)})
 
 
 # Background daemon threads for the process lifetime: idle-safety watchdog and
