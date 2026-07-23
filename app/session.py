@@ -50,6 +50,10 @@ class PodSession:
         # Per-service health for the UI tiles: llm/embedder/reranker -> one of
         # unknown | pending | healthy | down.
         self.services: dict = _default_services()
+        # Stack test: last result from the "Test stack" button (real completion +
+        # embedding + rerank probes), and whether one is currently running.
+        self.test_result: dict | None = None
+        self.test_running: bool = False
         # Streamed status feed: a ring buffer of (epoch, category, message).
         # Categories split the feed into UI panels by source/function:
         #   lifecycle — provisioning/teardown (phase changes, create retries)
@@ -81,6 +85,8 @@ class PodSession:
             self.billing_started_at = None                   # billing clock starts at pod creation
             self.auto_terminate_at = None                    # re-armed by the driver once a pod exists
             self.services = _default_services()              # fresh health tiles for the new pod
+            self.test_result = None                          # clear any prior stack-test result
+            self.test_running = False
             self.cancel.clear()                             # ensure a fresh (un-cancelled) run
             return True                                     # caller may launch the worker
 
@@ -166,6 +172,8 @@ class PodSession:
                 "auto_terminate_in_s": auto_in,           # seconds until auto-off, or None
                 # Per-service health tiles + the streamed status event feed.
                 "services": dict(self.services),          # llm/embedder/reranker -> status
+                "test_result": self.test_result,          # last stack-test result, or None
+                "test_running": self.test_running,        # a stack test is in flight
                 "events": [{"t": t, "cat": c, "msg": m}   # recent feed, split by category in the UI
                            for t, c, m in self.events[-40:]],
             }

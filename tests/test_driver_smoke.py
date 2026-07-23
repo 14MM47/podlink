@@ -80,6 +80,22 @@ def install_fake_client(status_for):
     rd.egress_logger.client = _client
 
 
+def install_fake_post(fn):
+    """fn(url, body) -> (status, json). Patch rd.egress_logger.client for POST (test_stack)."""
+    class _JResp:
+        def __init__(self, st, d): self.status_code = st; self._d = d
+        def json(self): return self._d
+    @contextlib.contextmanager
+    def _client(timeout=60.0):
+        class _C:
+            def post(self, url, headers=None, json=None):
+                return _JResp(*fn(url, json))
+            def get(self, url, headers=None):
+                return _Resp(200)
+        yield _C()
+    rd.egress_logger.client = _client
+
+
 def check(name, cond):
     print(f"  {'PASS' if cond else 'FAIL'}  {name}")
     if not cond:
@@ -319,6 +335,43 @@ def test_create_retries_then_succeeds_and_logs():
          rd.pod_up.resolve_gpu_id, rd._sleep_or_cancel) = saved
 
 
+def test_stack_probes_all_three_and_detects_dim():
+    # test_stack POSTs a real completion/embedding/rerank; success records pass +
+    # latency and detects the embedding dimension from the vector length.
+    def responder(url, body):
+        if "chat/completions" in url:
+            return (200, {"choices": [{"message": {"content": "pong"}}]})
+        if "embeddings" in url:
+            return (200, {"data": [{"embedding": [0.0] * 4096}]})
+        if "rerank" in url:
+            return (200, [{"index": 0, "score": 0.91}, {"index": 1, "score": 0.02}])
+        return (404, None)
+    install_fake_post(responder)
+    s = PodSession(); s.try_begin_start(None); s.state = State.RUNNING; s.pod_id = "podABC"
+    rd.test_stack(s)
+    tr = s.test_result
+    check("stack test marks all_ok", tr["all_ok"] is True)
+    check("stack test detects embedding dim (4096)", tr["embedding_dim"] == 4096)
+    check("stack test parses reranker top score", "0.91" in tr["services"]["reranker"]["detail"])
+    check("stack test clears test_running", s.test_running is False)
+
+
+def test_stack_flags_service_failure():
+    def responder(url, body):
+        if "embeddings" in url:
+            return (503, None)                       # embedder down
+        if "chat/completions" in url:
+            return (200, {"choices": [{}]})
+        if "rerank" in url:
+            return (200, [{"index": 0, "score": 0.5}])
+        return (404, None)
+    install_fake_post(responder)
+    s = PodSession(); s.try_begin_start(None); s.state = State.RUNNING; s.pod_id = "podABC"
+    rd.test_stack(s)
+    check("failing embedder marked not-ok", s.test_result["services"]["embedder"]["ok"] is False)
+    check("all_ok False when a service fails", s.test_result["all_ok"] is False)
+
+
 def test_create_non_retryable_error_surfaces():
     # A non-capacity QueryError (bad spec/auth) must NOT be retried — it surfaces.
     from runpod.error import QueryError as QE
@@ -356,5 +409,7 @@ if __name__ == "__main__":
     test_apply_health_updates_tiles_and_logs_transitions()
     test_probe_health_once_marks_healthy_and_down()
     test_create_retries_then_succeeds_and_logs()
+    test_stack_probes_all_three_and_detects_dim()
+    test_stack_flags_service_failure()
     test_create_non_retryable_error_surfaces()
     print("all driver smoke tests passed.")

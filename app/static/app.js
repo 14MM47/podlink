@@ -30,6 +30,8 @@ const actionsEl = document.getElementById("actions");    // per-pod action butto
 const copyenvBtn = document.getElementById("copyenv");   // copy ragline .env
 const copiedEl = document.getElementById("copied");      // "copied ✓" flash
 const envviewEl = document.getElementById("envview");    // the .env block, viewable
+const teststackBtn = document.getElementById("teststack");    // run the stack test
+const testresultEl = document.getElementById("testresult");   // its result rows
 
 let token = null;                                   // per-process CSRF token (fetched once)
 let lastState = null;                               // to reload pods on return to IDLE
@@ -102,6 +104,33 @@ function renderPanel(el, rows, withDelta) {
   el.scrollTop = el.scrollHeight;          // keep the latest line in view
 }
 
+// Render the stack-test state: "running…", a per-service pass/fail + latency
+// table, or nothing when no test has run for this pod.
+function renderTest(s) {
+  if (s.test_running) {
+    testresultEl.innerHTML = '<span class="muted">running stack test…</span>';
+    testresultEl.classList.add("show");
+    return;
+  }
+  const tr = s.test_result;
+  if (!tr) { testresultEl.classList.remove("show"); testresultEl.innerHTML = ""; return; }
+  if (tr.error) {
+    testresultEl.innerHTML = `<div class="tr-row" style="color:#ff8a8a">test error: ${escapeHtml(tr.error)}</div>`;
+    testresultEl.classList.add("show");
+    return;
+  }
+  const svc = tr.services || {};
+  const row = (name) => {
+    const r = svc[name] || {};
+    const mark = r.ok ? '<span style="color:#7fd7a2">✓</span>' : '<span style="color:#ff8a8a">✗</span>';
+    return `<div class="tr-row">${mark} ${name} · ${r.latency_ms ?? "?"}ms · ${escapeHtml(r.detail || "")}</div>`;
+  };
+  let html = ["llm", "embedder", "reranker"].map(row).join("");
+  if (tr.embedding_dim) html += `<div class="tr-row muted">embedding dimension: ${tr.embedding_dim}</div>`;
+  testresultEl.innerHTML = html;
+  testresultEl.classList.add("show");
+}
+
 // Split the event feed into its three source/function panels.
 function renderFeeds(events) {
   events = events || [];
@@ -167,10 +196,12 @@ function render(s) {
   } else {
     volinfoEl.innerHTML = 'Network Volume: <span class="muted">none — Data-Volume mode (weights not persisted)</span>';
   }
-  // Per-pod actions (copy .env) — only meaningful once the pod is serving.
+  // Per-pod actions (test stack, copy .env) — only meaningful once serving.
   const up = !!(s.pod_id && s.proxy_url);
   actionsEl.style.visibility = up ? "visible" : "hidden";
+  teststackBtn.disabled = !up || !!s.test_running;   // disable while a test runs
   if (!up) { envviewEl.classList.remove("show"); copiedEl.style.display = "none"; }
+  renderTest(s);
   // Per-service health tiles and the split status event feeds.
   renderTiles(s.services);
   renderFeeds(s.events);
@@ -223,6 +254,10 @@ refreshBtn.addEventListener("click", loadPods);     // manual pod-list refresh
 keepaliveBtn.addEventListener("click", () => {      // cancel the pending auto-terminate
   keepaliveBtn.disabled = true;                     // optimistic; SSE re-enables on next frame
   send("/pod/keepalive");
+});
+teststackBtn.addEventListener("click", () => {      // run a real completion+embedding+rerank
+  teststackBtn.disabled = true;                     // optimistic; SSE reflects test_running
+  send("/pod/test");
 });
 copyenvBtn.addEventListener("click", async () => {  // fetch + copy the ragline .env block
   if (!token) await loadToken();

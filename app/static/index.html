@@ -66,6 +66,12 @@
       text-align: left; color: #cdd3df; font-family: ui-monospace, monospace;
     }
     .envview.show { display: block; }
+    .testresult {
+      display: none; margin-top: .6rem; font-size: .82rem; line-height: 1.6;
+      font-variant-numeric: tabular-nums;
+    }
+    .testresult.show { display: block; }
+    .tr-row { display: flex; gap: .45rem; justify-content: center; }
     /* Per-service health tiles — always visible, grey until a pod exists */
     .tiles { display: flex; gap: .5rem; margin-top: .8rem; justify-content: center; }
     .tile {
@@ -134,9 +140,11 @@
     <div id="meta" class="meta"></div>
     <div id="volinfo" class="volinfo"></div>
     <div id="actions" class="actions">
+      <button id="teststack" class="mini">Test stack</button>
       <button id="copyenv" class="mini">Copy ragline .env</button>
       <span id="copied" class="copied" style="display:none">copied ✓</span>
     </div>
+    <div id="testresult" class="testresult"></div>
     <pre id="envview" class="envview"></pre>
   </div>
   <div id="tiles" class="tiles">

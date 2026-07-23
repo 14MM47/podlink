@@ -110,13 +110,18 @@ def _ragline_env(pod_id: str) -> str:
     on what the embedder actually serves."""
     pu = runpod_driver.pod_up
     base = lambda port: f"https://{pod_id}-{port}.proxy.runpod.net"   # noqa: E731
+    # Fill EMBEDDING_DIMENSIONS from a stack-test detection if one has run.
+    tr = SESSION.test_result or {}
+    dim = tr.get("embedding_dim")
+    dim_line = (f"EMBEDDING_DIMENSIONS={dim}" if dim
+                else "# EMBEDDING_DIMENSIONS=  <- run 'Test stack' to detect the served dimension")
     return "\n".join([
         f"LLM_BASE_URL={base(8000)}/v1",
         "LLM_MODEL=ragline-llm",
         "LLM_API_KEY=<your pod_bearer_token>",
         f"EMBEDDING_BASE_URL={base(8080)}/v1",
         f"EMBEDDING_MODEL={pu.EMBED_MODEL_ID}",
-        "# EMBEDDING_DIMENSIONS=  <- run 'Test stack' to detect the served dimension",
+        dim_line,
         "EMBEDDING_API_KEY=<your pod_bearer_token>",
         "RERANKER_PROVIDER=api",
         f"RERANKER_BASE_URL={base(8081)}",
@@ -221,6 +226,18 @@ def ragline_env(x_podlink_token: str | None = Header(default=None)) -> JSONRespo
     if not pod_id:
         raise HTTPException(status_code=409, detail="no pod running")
     return JSONResponse({"env": _ragline_env(pod_id)})
+
+
+@app.post("/pod/test")
+def pod_test(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+    """Run a real completion + embedding + rerank against the pod, in the background."""
+    _require_token(x_podlink_token)                  # CSRF/token gate
+    if SESSION.state != State.RUNNING or not SESSION.pod_id:
+        raise HTTPException(status_code=409, detail="pod not running")
+    if SESSION.test_running:
+        raise HTTPException(status_code=409, detail="a stack test is already running")
+    _launch(runpod_driver.test_stack)                # fire the three probes off-thread
+    return JSONResponse(_snapshot())
 
 
 # Background daemon threads for the process lifetime: idle-safety watchdog and

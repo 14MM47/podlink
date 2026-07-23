@@ -322,6 +322,89 @@ def probe_health_once(session: PodSession, pod_id: str) -> None:
     _apply_health(session, statuses)
 
 
+def _timed_post(url: str, headers: dict, body: dict) -> tuple:
+    """One audited POST. Returns (ok, latency_ms, status_or_None, json_or_None)."""
+    t0 = time.time()
+    try:
+        with egress_logger.client(timeout=60.0) as c:   # audited; real inference can be slow
+            r = c.post(url, headers=headers, json=body)
+        ms = int((time.time() - t0) * 1000)
+        try:
+            data = r.json()
+        except Exception:  # noqa: BLE001                # non-JSON body
+            data = None
+        return (r.status_code == 200, ms, r.status_code, data)
+    except Exception:  # noqa: BLE001                    # connection error / timeout
+        return (False, int((time.time() - t0) * 1000), None, None)
+
+
+def test_stack(session: PodSession) -> None:
+    """Fire a REAL completion + embedding + rerank at the three services, recording
+    pass/fail + latency (and the embedding dimension) into session.test_result.
+
+    Uses the same endpoints ragline will: vLLM OpenAI-compat /v1/chat/completions,
+    TEI OpenAI-compat /v1/embeddings, and TEI native /rerank. Runs in a background
+    thread (launched by /pod/test)."""
+    try:
+        pod_id = session.pod_id
+        if not pod_id:
+            session.update(test_running=False, test_result={"error": "no pod running"})
+            return
+        bearer = _read_secret(_secrets.bearer_token)     # gates all three services
+        auth = {"Authorization": f"Bearer {bearer}"}
+        urls = pod_up.service_urls(pod_id)
+        session.update(test_running=True)
+        session.add_event("stack test started", "system")
+        services: dict = {}
+
+        # 1) LLM — OpenAI chat completion (served-model-name is fixed to ragline-llm).
+        ok, ms, status, data = _timed_post(
+            f"{urls['llm']}/v1/chat/completions", auth,
+            {"model": "ragline-llm",
+             "messages": [{"role": "user", "content": "ping"}],
+             "max_tokens": 1, "temperature": 0})
+        services["llm"] = {"ok": ok, "latency_ms": ms,
+                           "detail": "completion ok" if ok else f"HTTP {status}"}
+        session.add_event(f"stack test — llm {'ok' if ok else 'FAIL'} {ms}ms", "health")
+
+        # 2) Embedder — OpenAI embeddings; the vector length is the served dimension.
+        ok, ms, status, data = _timed_post(
+            f"{urls['embedder']}/v1/embeddings", auth,
+            {"model": pod_up.EMBED_MODEL_ID, "input": "hello world"})
+        dim = None
+        try:
+            dim = len(data["data"][0]["embedding"])
+        except Exception:  # noqa: BLE001                # unexpected shape
+            pass
+        services["embedder"] = {"ok": bool(ok and dim), "latency_ms": ms,
+                                "detail": f"{dim}-dim" if dim else f"HTTP {status}"}
+        session.add_event(
+            f"stack test — embedder {'ok' if ok else 'FAIL'} {ms}ms"
+            f"{f' ({dim}-dim)' if dim else ''}", "health")
+
+        # 3) Reranker — TEI native /rerank (query + candidate texts).
+        ok, ms, status, data = _timed_post(
+            f"{urls['reranker']}/rerank", auth,
+            {"query": "what does podlink do",
+             "texts": ["podlink controls a RunPod GPU pod", "an unrelated sentence"]})
+        top = None
+        try:
+            top = round(max(x["score"] for x in data), 3)  # TEI returns [{index, score}, ...]
+        except Exception:  # noqa: BLE001
+            pass
+        services["reranker"] = {"ok": ok, "latency_ms": ms,
+                                "detail": f"top score {top}" if top is not None else (f"HTTP {status}" if not ok else "ok")}
+        session.add_event(f"stack test — reranker {'ok' if ok else 'FAIL'} {ms}ms", "health")
+
+        all_ok = all(s["ok"] for s in services.values())
+        session.update(test_running=False,
+                       test_result={"services": services, "embedding_dim": dim, "all_ok": all_ok})
+        session.add_event(f"stack test {'PASSED' if all_ok else 'had failures'}", "system")
+    except Exception as e:  # noqa: BLE001               # never let the test thread die silently
+        session.add_event(f"stack test error: {type(e).__name__}", "system")
+        session.update(test_running=False, test_result={"error": type(e).__name__})
+
+
 def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
     """Poll all three services until each returns 200 (or cancel/timeout).
 
@@ -388,7 +471,8 @@ def stop(session: PodSession) -> None:
             session.update(state=State.IDLE, phase="terminated — GPU released",
                            pod_id=None, proxy_url=None,   # safe: back to IDLE
                            billing_started_at=None, cost_per_hr=None, auto_terminate_at=None,  # stop the meter
-                           services={n: "unknown" for n in SERVICES})  # clear the health tiles
+                           services={n: "unknown" for n in SERVICES},  # clear the health tiles
+                           test_result=None, test_running=False)  # clear the stack-test result
 
         else:                                            # could NOT confirm — do not lie
             session.update(
