@@ -1,0 +1,5 @@
+# Lint config — correctness-focused (pyflakes + syntax), not style-nitpicky.
+line-length = 120
+
+[lint]
+select = ["F", "E9"]   # unused/undefined names, redefs, syntax errors

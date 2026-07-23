@@ -102,12 +102,11 @@ def _auto_terminate_watch() -> None:
             pass
 
 
-def _ragline_env(pod_id: str) -> str:
-    """The ragline .env block for this pod: proxy URLs + model names, with the
+def _client_env(pod_id: str) -> str:
+    """The RAG-client .env block for this pod: proxy URLs + model names, with the
     bearer left as a PLACEHOLDER (never the real secret — it must not reach the
-    browser). The user pastes their pod_bearer_token where marked. EMBEDDING_
-    DIMENSIONS is intentionally left for 'Test stack' to detect, since it depends
-    on what the embedder actually serves."""
+    browser). Paste your pod_bearer_token where marked. EMBEDDING_DIMENSIONS is
+    left for 'Test stack' to detect, since it depends on what the embedder serves."""
     pu = runpod_driver.pod_up
     base = lambda port: f"https://{pod_id}-{port}.proxy.runpod.net"   # noqa: E731
     # Fill EMBEDDING_DIMENSIONS from a stack-test detection if one has run.
@@ -117,7 +116,7 @@ def _ragline_env(pod_id: str) -> str:
                 else "# EMBEDDING_DIMENSIONS=  <- run 'Test stack' to detect the served dimension")
     return "\n".join([
         f"LLM_BASE_URL={base(8000)}/v1",
-        "LLM_MODEL=ragline-llm",
+        f"LLM_MODEL={pu.LLM_SERVED_NAME}",
         "LLM_API_KEY=<your pod_bearer_token>",
         f"EMBEDDING_BASE_URL={base(8080)}/v1",
         f"EMBEDDING_MODEL={pu.EMBED_MODEL_ID}",
@@ -218,14 +217,14 @@ def pod_keepalive(x_podlink_token: str | None = Header(default=None)) -> JSONRes
     return JSONResponse(_snapshot())                 # echo the new state
 
 
-@app.get("/pod/ragline-env")
-def ragline_env(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
-    """The ragline .env block for the running pod (bearer left as a placeholder)."""
+@app.get("/pod/env")
+def client_env(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+    """The RAG-client .env block for the running pod (bearer left as a placeholder)."""
     _require_token(x_podlink_token)                  # token gate (consistency)
     pod_id = SESSION.pod_id
     if not pod_id:
         raise HTTPException(status_code=409, detail="no pod running")
-    return JSONResponse({"env": _ragline_env(pod_id)})
+    return JSONResponse({"env": _client_env(pod_id)})
 
 
 @app.post("/pod/test")

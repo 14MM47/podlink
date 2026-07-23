@@ -12,6 +12,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${HOME}/.config/podlink"
+CONF_FILE="${CONFIG_DIR}/podlink.conf"         # optional: exports PODLINK_IMAGE etc.
 VOL_FILE="${CONFIG_DIR}/network_volume_id"     # the id is infra, not a secret, but kept here for tidiness
 CHECK_ONLY=0
 [[ "${1:-}" == "--check" ]] && CHECK_ONLY=1
@@ -19,6 +20,14 @@ CHECK_ONLY=0
 say()  { printf '%s\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }
 ok()   { printf '\033[32m%s\033[0m\n' "$*"; }
+
+# --- 0. Load the stack config (PODLINK_IMAGE, registry auth, served name, …) ---
+# Account/stack-specific values live in a local, gitignored file, not in source.
+if [[ -f "${CONF_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CONF_FILE}"
+  say "Loaded stack config from ${CONF_FILE}"
+fi
 
 # --- 1. Resolve the Network Volume id --------------------------------------
 # Priority: an already-exported env var wins (explicit override); else a saved
@@ -97,6 +106,11 @@ if [[ "${CHECK_ONLY}" == "1" ]]; then
       warn "  ✗ ${f} MISSING"
     fi
   done
+  say ""
+  say "Stack config:"
+  if [[ -n "${PODLINK_IMAGE:-}" ]]; then ok "  ✓ PODLINK_IMAGE = ${PODLINK_IMAGE}"; else warn "  ✗ PODLINK_IMAGE not set (required — see README / ${CONF_FILE})"; fi
+  say "  served model name: ${PODLINK_LLM_SERVED_NAME:-llm}"
+  if [[ -n "${PODLINK_REGISTRY_AUTH_ID:-}" ]]; then say "  registry auth: set (private image)"; else say "  registry auth: none (public image)"; fi
   say ""
   if [[ -n "${PODLINK_NETWORK_VOLUME_ID}" ]]; then
     say "Volume mode: network volume ${PODLINK_NETWORK_VOLUME_ID}"

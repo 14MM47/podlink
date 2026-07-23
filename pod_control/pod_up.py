@@ -2,9 +2,9 @@
 
 If a pod named POD_NAME already exists, prints its state and exits 0.
 Otherwise creates a new Secure Cloud pod on a single RTX Pro 6000 (96 GB,
-Blackwell) running the ragline three-service stack from ONE bundled image:
+Blackwell) running a bundled RAG inference stack from ONE image:
 
-    :8000  vLLM        LLM (chat + KG extraction), served as ragline-llm
+    :8000  vLLM        LLM (OpenAI-compatible /v1)
     :8080  TEI         embedder  (/v1/embeddings, /health)
     :8081  TEI         reranker  (/rerank, /health)
 
@@ -31,7 +31,7 @@ from rich import print as rprint
 
 import _secrets
 
-POD_NAME = "podlink"
+POD_NAME = os.environ.get("PODLINK_POD_NAME", "podlink")
 
 # RunPod's on-demand finder lands on a random Secure host; some lack free
 # disk/resources and reject the pod ("This machine does not have the resources…")
@@ -46,36 +46,35 @@ _RETRYABLE_CREATE_ERRORS = (
     "instances available",
 )
 
-# --- the bundled three-service image (build + push from ../pod_image) ---------
-# Must equal the tag you `docker push`. Blackwell-capable (Dockerfile pins vLLM
-# v0.25.1 / sm_120). podlink must NOT pass docker_args at create time, so the
-# image's own CMD (supervisord) runs.
-IMAGE = "ghcr.io/14mm47/ragline-pod:2026-07"  # <-- must match what you push
+# --- the bundled multi-service image (build + push from ../pod_image) ----------
+# Set PODLINK_IMAGE to the tag you `docker push` (no default — it's your image).
+# The image bundles an LLM + embedder + reranker under supervisord for a RAG
+# pipeline. podlink must NOT pass docker_args at create time, so the image's own
+# CMD runs. Account-specific values are read from the environment, never source,
+# so this repo stays generic.
+IMAGE = os.environ.get("PODLINK_IMAGE", "").strip()
 
-# The image is PRIVATE (ghcr.io), so RunPod needs registry pull-creds on EVERY
-# pull — first boot, a resume that relocates to a new host, and any recreate. The
-# runpod SDK's create_pod CANNOT attach registry auth directly; only a TEMPLATE
-# carries containerRegistryAuthId. So ensure_template() bundles this credential id
-# (the "ghcr-ragline-pod" cred from RunPod → Settings → Container Registry Auth)
-# into a template, and the pod deploys from that template_id. Keep the registry
-# PAT long-lived — if it expires, re-pulls fail.
-CONTAINER_REGISTRY_AUTH_ID = "REDACTED_REGISTRY_AUTH_ID"
-TEMPLATE_NAME = "ragline-pod"   # RunPod template bundling IMAGE + the registry cred
+# If the image is PRIVATE, RunPod needs registry pull-creds on EVERY pull, and the
+# SDK's create_pod cannot attach them directly — only a TEMPLATE carries a
+# containerRegistryAuthId. ensure_template() bundles this credential id (from RunPod
+# → Settings → Container Registry Auth) into a template the pod deploys from. Leave
+# PODLINK_REGISTRY_AUTH_ID empty for a PUBLIC image (no auth needed).
+CONTAINER_REGISTRY_AUTH_ID = os.environ.get("PODLINK_REGISTRY_AUTH_ID", "").strip()
+TEMPLATE_NAME = os.environ.get("PODLINK_TEMPLATE_NAME", "podlink-pod")
 
-# --- models the pod serves (VERIFIED balanced profile — repo IDs confirmed on
-# live HF pages; awq_marlin is the reliable W4A16 path on sm_120) --------------
-# The LLM served-model-name is fixed to ragline-llm inside the image wrapper.
-LLM_MODEL_ID = "stelterlab/Qwen3-30B-A3B-Instruct-2507-AWQ"   # Apache-2.0, 30B/3.3B active MoE
-EMBED_MODEL_ID = "Qwen/Qwen3-Embedding-8B"                    # Apache-2.0, #1 MMTEB
-RERANK_MODEL_ID = "BAAI/bge-reranker-v2-m3"                   # TEI-native cross-encoder
-# vLLM --quantization. LEAVE EMPTY for this checkpoint: stelterlab/Qwen3-30B-A3B-
-# Instruct-2507-AWQ was produced with llm-compressor, so its config declares the
-# quant as "compressed-tensors" (W4A16 AWQ). Forcing "awq_marlin" CONFLICTS with
-# that and vLLM refuses to start ("... does not match ..."). Empty lets vLLM
-# auto-detect compressed-tensors from the checkpoint and select the Marlin W4A16
-# kernel on sm_120 itself. (For a gpt-oss LLM you'd set "mxfp4" + the image would
-# need --enforce-eager; NEVER "nvfp4" on sm_120.)
-LLM_QUANT = ""
+# --- models the pod serves (sensible RAG defaults; override via env) -----------
+# These defaults are a balanced 96 GB profile; point PODLINK_*_MODEL_ID at your own.
+LLM_MODEL_ID = os.environ.get("PODLINK_LLM_MODEL_ID", "stelterlab/Qwen3-30B-A3B-Instruct-2507-AWQ")
+EMBED_MODEL_ID = os.environ.get("PODLINK_EMBED_MODEL_ID", "Qwen/Qwen3-Embedding-8B")
+RERANK_MODEL_ID = os.environ.get("PODLINK_RERANK_MODEL_ID", "BAAI/bge-reranker-v2-m3")
+# vLLM's --served-model-name. A client's model field must match this EXACTLY or
+# requests 404. Must equal what the image serves; the image wrapper reads
+# LLM_SERVED_NAME from env, and podlink passes it through.
+LLM_SERVED_NAME = os.environ.get("PODLINK_LLM_SERVED_NAME", "llm")
+# vLLM --quantization. Empty auto-detects — correct for a compressed-tensors AWQ
+# checkpoint (forcing "awq_marlin" conflicts and vLLM refuses to start). For a
+# gpt-oss LLM set "mxfp4"; NEVER "nvfp4" on sm_120.
+LLM_QUANT = os.environ.get("PODLINK_LLM_QUANT", "")
 
 # --- the three service ports, exposed via RunPod's HTTPS proxy ----------------
 SERVICE_PORTS = {"llm": 8000, "embedder": 8080, "reranker": 8081}
@@ -143,6 +142,9 @@ def ensure_template() -> str:
     Secrets are NOT put in the template (env=[] by default) — the bearer/HF token
     stay in the pod-level env, so nothing sensitive lands in a persistent template.
     """
+    if not IMAGE:
+        raise RuntimeError("PODLINK_IMAGE is not set — set it to your pushed image tag "
+                           "(e.g. in ~/.config/podlink/podlink.conf; see the README).")
     if TEMPLATE_STATE_PATH.exists():
         st = json.loads(TEMPLATE_STATE_PATH.read_text())
         if (st.get("template_id")
@@ -154,18 +156,20 @@ def ensure_template() -> str:
         rprint("[yellow]template_state.json is stale (IMAGE or credential changed) "
                "— creating a new template.[/]")
 
-    rprint(f"[bold cyan]Creating template[/] {TEMPLATE_NAME!r} for private image {IMAGE} …")
+    rprint(f"[bold cyan]Creating template[/] {TEMPLATE_NAME!r} for image {IMAGE} …")
     # docker_start_cmd omitted -> the mutation sends dockerArgs "" -> the image's
     # own CMD (supervisord) runs, launching all three services. Ports/disk mirror
     # the pod so the template is self-consistent; the pod re-specifies them anyway.
-    tmpl = runpod.create_template(
+    tmpl_kwargs = dict(
         name=TEMPLATE_NAME,
         image_name=IMAGE,
-        registry_auth_id=CONTAINER_REGISTRY_AUTH_ID,
         container_disk_in_gb=CONTAINER_DISK_GB,
         ports=EXPOSED_PORT,
         is_serverless=False,
     )
+    if CONTAINER_REGISTRY_AUTH_ID:            # private image only; omit for a public one
+        tmpl_kwargs["registry_auth_id"] = CONTAINER_REGISTRY_AUTH_ID
+    tmpl = runpod.create_template(**tmpl_kwargs)
     template_id = tmpl["id"]
     TEMPLATE_STATE_PATH.write_text(json.dumps({
         "template_id": template_id,
@@ -234,6 +238,7 @@ def _pod_env(bearer: str, hf: str) -> dict:
         "TEI_API_KEY": bearer,
         # which models to serve + how to size vLLM (read by the image wrappers)
         "LLM_MODEL_ID": LLM_MODEL_ID,
+        "LLM_SERVED_NAME": LLM_SERVED_NAME,   # vLLM --served-model-name (client model must match)
         "EMBED_MODEL_ID": EMBED_MODEL_ID,
         "RERANK_MODEL_ID": RERANK_MODEL_ID,
         "LLM_QUANT": LLM_QUANT,
@@ -355,7 +360,7 @@ def write_state(pod: dict, gpu_type_id: str) -> None:
         "service_urls": urls,              # all three: llm / embedder / reranker
         "models": {
             "llm": LLM_MODEL_ID,
-            "served_as": "ragline-llm",
+            "served_as": LLM_SERVED_NAME,
             "embedder": EMBED_MODEL_ID,
             "reranker": RERANK_MODEL_ID,
         },

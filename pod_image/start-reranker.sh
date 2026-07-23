@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch the TEI reranker on :8081. TEI auto-detects a cross-encoder / sequence-
-# classification model and exposes /rerank (which ragline's ApiReranker POSTs to)
+# classification model and exposes /rerank (the client POSTs {query, texts} to it)
 # plus /health (podlink gates readiness on it). Keyless internally.
 set -euo pipefail
 

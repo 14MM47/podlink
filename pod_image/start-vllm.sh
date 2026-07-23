@@ -6,9 +6,10 @@
 # the pod (the RunPod web terminal cannot be disabled).
 set -euo pipefail
 
-# --served-model-name is fixed to ragline-llm: ragline's LLM_MODEL must match it
-# exactly or requests 404 (see ragline deploy/spec_doc.md §5).
-SERVED_NAME="ragline-llm"
+# --served-model-name comes from the pod env (podlink passes LLM_SERVED_NAME, from
+# PODLINK_LLM_SERVED_NAME). A client's model field must match it exactly or requests
+# 404. Defaults to "llm".
+SERVED_NAME="${LLM_SERVED_NAME:-llm}"
 
 # Quantization is optional: an already-quantized checkpoint (e.g. an official FP8
 # build) is auto-detected, so only pass --quantization when LLM_QUANT is set

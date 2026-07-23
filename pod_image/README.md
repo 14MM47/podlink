@@ -1,11 +1,11 @@
 # podlink bundled pod image
 
 One Docker image that runs **three co-resident services** on a single RTX Pro 6000
-(96 GB, Blackwell) — the exact stack ragline's deploy spec asks for:
+(96 GB, Blackwell) — a bundled LLM + embedder + reranker stack for a RAG pipeline:
 
 | Port | Service | Endpoints podlink gates on |
 |------|---------|----------------------------|
-| 8000 | vLLM (LLM: chat + KG extraction), served as `ragline-llm` | `GET /v1/models` → 200 |
+| 8000 | vLLM (LLM), served as `$LLM_SERVED_NAME` (default `llm`) | `GET /v1/models` → 200 |
 | 8080 | TEI embedder | `GET /health` → 200 |
 | 8081 | TEI reranker | `GET /health` → 200 |
 
@@ -31,13 +31,13 @@ override them only to bump versions:
 cd podlink/pod_image
 
 # Pick your registry path. RunPod must be able to pull it.
-IMAGE=ghcr.io/<you>/ragline-pod:2026-07
+IMAGE=ghcr.io/<you>/rag-pod:latest
 
 docker build -t "$IMAGE" .
 docker push "$IMAGE"
 ```
 
-Then set `IMAGE = "<that value>"` in `pod_control/pod_up.py`.
+Then point podlink at it: `export PODLINK_IMAGE="<that value>"`.
 
 - **Private registry?** Add the pull credentials in RunPod (Settings → Container
   Registry Auth) so the pod can pull. Those creds live in RunPod, never in
@@ -50,20 +50,21 @@ podlink's `create_pod` passes these as env — you don't set them here:
 | Env | Purpose |
 |-----|---------|
 | `LLM_MODEL_ID` / `EMBED_MODEL_ID` / `RERANK_MODEL_ID` | the three HF repos to serve |
+| `LLM_SERVED_NAME` | vLLM `--served-model-name` (a client's model field must match; default `llm`) |
 | `LLM_QUANT` | vLLM `--quantization` (e.g. `awq_marlin`); leave empty for an FP8 checkpoint |
 | `MAX_MODEL_LEN`, `GPU_MEMORY_UTILIZATION` | vLLM sizing (defaults 32768 / 0.70) |
 | `VLLM_API_KEY` | vLLM bearer (read natively by vLLM; never on argv) |
 | `TEI_API_KEY` | gates both TEI services; the wrappers `export API_KEY=$TEI_API_KEY` so TEI reads it from env (not argv). Same value as the vLLM bearer. |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | weight-pull token, seen by all three services |
 
-`--served-model-name` is hard-coded to `ragline-llm` in `start-vllm.sh` to match
-ragline's `LLM_MODEL`.
+`--served-model-name` comes from `LLM_SERVED_NAME` (podlink passes it from
+`PODLINK_LLM_SERVED_NAME`); a client's `LLM_MODEL` must match it.
 
 ## Validate on the real card before locking `IMAGE`
 
 The build can succeed and still fail at runtime on Blackwell. On a live RTX Pro 6000:
 
-1. `curl -H "Authorization: Bearer $VLLM_API_KEY" :8000/v1/models` lists `ragline-llm`.
+1. `curl -H "Authorization: Bearer $VLLM_API_KEY" :8000/v1/models` lists your served model.
 2. `curl -H "Authorization: Bearer $TEI_API_KEY" :8080/health` and `:8081/health`
    return 200 — and confirm a request **without** the key is rejected (401), i.e.
    the pinned TEI build honors the `API_KEY` env var. If it does not, the ports

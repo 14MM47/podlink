@@ -27,7 +27,7 @@ const feedEls = {                                        // event feed split by 
 };
 const volinfoEl = document.getElementById("volinfo");    // network-volume info line
 const actionsEl = document.getElementById("actions");    // per-pod action buttons
-const copyenvBtn = document.getElementById("copyenv");   // copy ragline .env
+const copyenvBtn = document.getElementById("copyenv");   // copy the client config
 const copiedEl = document.getElementById("copied");      // "copied ✓" flash
 const envviewEl = document.getElementById("envview");    // the .env block, viewable
 const teststackBtn = document.getElementById("teststack");    // run the stack test
@@ -165,7 +165,7 @@ function render(s) {
   phaseEl.textContent = s.phase || "";              // show progress text (or blank)
   errorEl.textContent = s.error || "";              // show error (or blank)
   // Show the pod id, and — for our three-service stack (proxy_url set on the
-  // Auto path) — the three ragline URLs, which are just pod-id + fixed ports.
+  // Auto path) — the three service URLs, which are just pod-id + fixed ports.
   if (s.pod_id) {
     const pid = escapeHtml(s.pod_id);
     let m = `<div><span class="k">pod</span> <span class="pid">${pid}</span></div>`;
@@ -213,14 +213,14 @@ function render(s) {
   const up = !!(s.pod_id && s.proxy_url);
   teststackBtn.disabled = !up || !!s.test_running;   // disable while a test runs
   copyenvBtn.disabled = !up;
-  // Outputs rail: auto-populate the ragline .env block while a pod serves, and
+  // Outputs rail: auto-populate the client config block while a pod serves, and
   // re-fetch once Test-stack detects the embedding dimension (fills EMBEDDING_DIMENSIONS).
   const dim = s.test_result && s.test_result.embedding_dim;
   const key = up ? `${s.pod_id}:${dim || ""}` : null;
   if (key && key !== envKey) { envKey = key; fetchEnv(); }
   else if (!up && envKey !== "idle") {
     envKey = "idle"; copiedEl.style.display = "none";
-    envviewEl.innerHTML = '<span class="muted">— start a pod to generate the ragline config —</span>';
+    envviewEl.innerHTML = '<span class="muted">— start a pod to generate the client config —</span>';
   }
   renderTest(s);
   // Per-service health tiles and the split status event feeds.
@@ -239,11 +239,11 @@ function render(s) {
   }
 }
 
-// Fetch the ragline .env block for the running pod and show it in the outputs rail.
+// Fetch the client config block for the running pod and show it in the outputs rail.
 async function fetchEnv() {
   if (!token) await loadToken();
   try {
-    const r = await fetch("/pod/ragline-env", { headers: { "X-Podlink-Token": token } });
+    const r = await fetch("/pod/env", { headers: { "X-Podlink-Token": token } });
     if (!r.ok) return;                              // 409 before a pod is up — leave the placeholder
     envviewEl.textContent = (await r.json()).env;   // plain text (selectable, copyable)
   } catch { /* transient — a later frame retries */ }
@@ -290,7 +290,7 @@ teststackBtn.addEventListener("click", () => {      // run a real completion+emb
   teststackBtn.disabled = true;                     // optimistic; SSE reflects test_running
   send("/pod/test");
 });
-copyenvBtn.addEventListener("click", async () => {  // copy the shown ragline .env block
+copyenvBtn.addEventListener("click", async () => {  // copy the shown client config block
   await fetchEnv();                                 // ensure it's current (fills envview)
   const env = envviewEl.textContent || "";
   if (!env || env.trim().startsWith("—")) return;   // still the placeholder — nothing to copy

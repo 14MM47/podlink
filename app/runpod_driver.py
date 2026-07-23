@@ -342,9 +342,9 @@ def test_stack(session: PodSession) -> None:
     """Fire a REAL completion + embedding + rerank at the three services, recording
     pass/fail + latency (and the embedding dimension) into session.test_result.
 
-    Uses the same endpoints ragline will: vLLM OpenAI-compat /v1/chat/completions,
-    TEI OpenAI-compat /v1/embeddings, and TEI native /rerank. Runs in a background
-    thread (launched by /pod/test)."""
+    Uses the same endpoints a RAG client will: vLLM OpenAI-compat
+    /v1/chat/completions, TEI OpenAI-compat /v1/embeddings, and TEI native /rerank.
+    Runs in a background thread (launched by /pod/test)."""
     try:
         pod_id = session.pod_id
         if not pod_id:
@@ -357,10 +357,10 @@ def test_stack(session: PodSession) -> None:
         session.add_event("stack test started", "system")
         services: dict = {}
 
-        # 1) LLM — OpenAI chat completion (served-model-name is fixed to ragline-llm).
+        # 1) LLM — OpenAI chat completion (model must equal vLLM --served-model-name).
         ok, ms, status, data = _timed_post(
             f"{urls['llm']}/v1/chat/completions", auth,
-            {"model": "ragline-llm",
+            {"model": pod_up.LLM_SERVED_NAME,
              "messages": [{"role": "user", "content": "ping"}],
              "max_tokens": 1, "temperature": 0})
         services["llm"] = {"ok": ok, "latency_ms": ms,
@@ -408,9 +408,9 @@ def test_stack(session: PodSession) -> None:
 def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
     """Poll all three services until each returns 200 (or cancel/timeout).
 
-    "Pod ready" = LLM /v1/models AND embedder /health AND reranker /health, per
-    the ragline spec. Each service is dropped from the poll set once healthy; the
-    per-service tiles and the phase text report which are still coming up.
+    "Pod ready" = LLM /v1/models AND embedder /health AND reranker /health. Each
+    service is dropped from the poll set once healthy; the per-service tiles and
+    the phase text report which are still coming up.
     """
     bearer = _read_secret(_secrets.bearer_token)         # gates all three services
     probes = _service_probes(pod_id, bearer)             # service -> (url, headers)
