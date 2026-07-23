@@ -51,14 +51,13 @@
     .cost { margin-top: .5rem; font-size: .9rem; font-variant-numeric: tabular-nums; opacity: .9; }
     .cost b { color: #7fd7a2; }
     .autoterm {
-      margin-top: .45rem; font-size: .85rem; display: none;
+      margin-top: .45rem; font-size: .85rem; display: flex;
       align-items: center; justify-content: center; gap: .5rem;
       color: #ffcf8a; font-variant-numeric: tabular-nums;
     }
-    .autoterm.show { display: flex; }
-    /* Per-service health tiles */
-    .tiles { display: none; gap: .5rem; margin-top: .8rem; justify-content: center; }
-    .tiles.show { display: flex; }
+    .muted { opacity: .4; }                 /* greyed placeholder for idle indicators */
+    /* Per-service health tiles — always visible, grey until a pod exists */
+    .tiles { display: flex; gap: .5rem; margin-top: .8rem; justify-content: center; }
     .tile {
       display: flex; align-items: center; gap: .4rem;
       background: #1b1f27; border: 1px solid #2f3542; border-radius: 8px;
@@ -71,12 +70,12 @@
     .tile[data-status="unknown"] .dot { background: #6b7280; }
     /* Streamed status event feed */
     .feed {
-      display: none; margin-top: 1rem; width: min(460px, 92vw); max-height: 34vh;
+      display: block; margin-top: 1rem; width: min(460px, 92vw);
+      min-height: 2.4rem; max-height: 34vh;
       overflow-y: auto; background: #12151b; border: 1px solid #232833;
       border-radius: 8px; padding: .5rem .65rem; font-size: .78rem; line-height: 1.5;
       font-variant-numeric: tabular-nums;
     }
-    .feed.show { display: block; }
     .feed-row { display: flex; gap: .6rem; opacity: .9; }
     .feed-row .ts { color: #6b7280; flex: 0 0 auto; }
     .feed-row .msg { word-break: break-word; }

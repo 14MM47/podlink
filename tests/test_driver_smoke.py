@@ -291,6 +291,53 @@ def test_probe_health_once_marks_healthy_and_down():
     check("reranker down (503)", s.services["reranker"] == "down")
 
 
+def test_create_retries_then_succeeds_and_logs():
+    # A retryable capacity error retries and is reported to the event feed; a later
+    # attempt that succeeds returns the pod. _sleep_or_cancel is stubbed so the test
+    # doesn't actually wait.
+    from runpod.error import QueryError as QE
+    calls = {"n": 0}
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise QE("There are no longer any instances available with the requested specifications")
+        return {"id": "pod-ok"}
+    saved = (rd.pod_up.create_pod_once, rd.pod_up.ensure_template,
+             rd.pod_up.resolve_gpu_id, rd._sleep_or_cancel)
+    rd.pod_up.create_pod_once = flaky
+    rd.pod_up.ensure_template = lambda: "tmpl1"
+    rd.pod_up.resolve_gpu_id = lambda: "gpuX"
+    rd._sleep_or_cancel = lambda session, secs: False   # instant, not cancelled
+    try:
+        s = PodSession(); s.try_begin_start(None)
+        pod = rd._create_with_fallback(s)
+        check("retries then succeeds on the 3rd attempt", pod == {"id": "pod-ok"} and calls["n"] == 3)
+        check("retry attempts logged to the event feed",
+              any("no host with capacity" in m for _, m in s.events))
+    finally:
+        (rd.pod_up.create_pod_once, rd.pod_up.ensure_template,
+         rd.pod_up.resolve_gpu_id, rd._sleep_or_cancel) = saved
+
+
+def test_create_non_retryable_error_surfaces():
+    # A non-capacity QueryError (bad spec/auth) must NOT be retried — it surfaces.
+    from runpod.error import QueryError as QE
+    saved = (rd.pod_up.create_pod_once, rd.pod_up.ensure_template, rd.pod_up.resolve_gpu_id)
+    rd.pod_up.create_pod_once = lambda *a, **k: (_ for _ in ()).throw(QE("invalid gpu spec"))
+    rd.pod_up.ensure_template = lambda: "t"
+    rd.pod_up.resolve_gpu_id = lambda: "g"
+    try:
+        s = PodSession(); s.try_begin_start(None)
+        raised = False
+        try:
+            rd._create_with_fallback(s)
+        except QE:
+            raised = True
+        check("non-retryable create error surfaces (not retried)", raised)
+    finally:
+        (rd.pod_up.create_pod_once, rd.pod_up.ensure_template, rd.pod_up.resolve_gpu_id) = saved
+
+
 if __name__ == "__main__":
     print("driver smoke tests:")
     test_resolve_gpu_id_matches_rtx_pro_6000()
@@ -308,4 +355,6 @@ if __name__ == "__main__":
     test_phase_change_records_event()
     test_apply_health_updates_tiles_and_logs_transitions()
     test_probe_health_once_marks_healthy_and_down()
+    test_create_retries_then_succeeds_and_logs()
+    test_create_non_retryable_error_surfaces()
     print("all driver smoke tests passed.")

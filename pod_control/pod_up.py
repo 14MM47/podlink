@@ -213,20 +213,16 @@ def resolve_gpu_id(match: str = GPU_MATCH) -> str:
     return candidates[0]
 
 
-def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None = None) -> dict:
-    """Create the pod from the bundled image. Model config is passed via env; the
-    image's supervisor launches all three services. No docker_args (that would
-    override the image CMD).
+def is_retryable_create_error(e: Exception) -> bool:
+    """True when a create failure is the transient host-capacity lottery — safe to
+    retry (a failed create allocates nothing). See _RETRYABLE_CREATE_ERRORS."""
+    return any(s in str(e) for s in _RETRYABLE_CREATE_ERRORS)
 
-    template_id supplies the private-registry credential (the SDK can't attach it
-    to a pod directly). It defaults to None and is resolved via ensure_template()
-    here, so BOTH entry points work unchanged — the CLI try_create() and the web-UI
-    driver's pod_up.create_pod(gpu_id, bearer, hf) 3-arg call. imageName is still
-    sent alongside; RunPod pulls it using the template's containerRegistryAuthId.
-    Secrets live here in env, never in the persistent template."""
-    if template_id is None:
-        template_id = ensure_template()
-    env = {
+
+def _pod_env(bearer: str, hf: str) -> dict:
+    """The pod's runtime env — secrets + model config, read by the image wrappers.
+    Secrets live here (pod env), never in the persistent template."""
+    return {
         # weight-pull token, seen by all three services in the container
         "HF_TOKEN": hf,
         "HUGGING_FACE_HUB_TOKEN": hf,     # some loaders read this name instead
@@ -244,6 +240,14 @@ def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None =
         "MAX_MODEL_LEN": str(MAX_MODEL_LEN),
         "GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
     }
+
+
+def create_pod_once(gpu_type_id: str, bearer: str, hf: str, template_id: str) -> dict:
+    """ONE create attempt from the bundled image. Raises QueryError (retryable via
+    is_retryable_create_error, or a real error) on failure; returns the pod on
+    success. Callers own the retry policy — the CLI create_pod loop below, and the
+    web driver's cancel-aware, UI-reporting loop. No docker_args (that would
+    override the image CMD). template_id carries the private-registry credential."""
     # Persistent storage: a Network Volume (survives terminate; region-locked) when
     # NETWORK_VOLUME_ID is set, else a pod-scoped Data Volume (destroyed on terminate).
     create_kwargs = dict(
@@ -256,7 +260,7 @@ def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None =
         container_disk_in_gb=CONTAINER_DISK_GB,
         volume_mount_path=VOLUME_MOUNT,
         ports=EXPOSED_PORT,               # "8000/http,8080/http,8081/http"
-        env=env,
+        env=_pod_env(bearer, hf),
         support_public_ip=False,          # all traffic via RunPod's HTTPS proxy
         start_ssh=START_SSH,              # SSH for first-boot debug (PODLINK_START_SSH=0 to disable)
     )
@@ -264,22 +268,27 @@ def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None =
         create_kwargs["network_volume_id"] = NETWORK_VOLUME_ID  # persists across terminate
     else:
         create_kwargs["volume_in_gb"] = VOLUME_GB               # pod-scoped, lost on terminate
+    # runpod 1.7.13's create_pod does `print(f"raw_response: {raw_response}")`, and
+    # raw_response echoes the pod env — HF_TOKEN and the VLLM/TEI bearer — to stdout.
+    # Capture and discard that stdout so the secrets never leak; we use the return value.
+    with contextlib.redirect_stdout(io.StringIO()):
+        return runpod.create_pod(**create_kwargs)
 
-    # Retry the host-selection lottery (see _RETRYABLE_CREATE_ERRORS). A failed
-    # create allocates nothing, so retrying is free; Ctrl-C aborts.
+
+def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None = None) -> dict:
+    """CLI path: resolve the template, then retry the host-selection lottery, printing
+    progress to the terminal. The web driver does NOT use this — it runs its own
+    cancel-aware loop over create_pod_once so retries are visible in the UI."""
+    if template_id is None:
+        template_id = ensure_template()
     last_err: QueryError | None = None
     for attempt in range(1, CREATE_RETRIES + 1):
         rprint(f"[bold cyan]Creating pod[/] on [bold]{gpu_type_id}[/] "
                f"(template {template_id}) — attempt {attempt}/{CREATE_RETRIES} …")
         try:
-            # runpod 1.7.13's create_pod does `print(f"raw_response: {raw_response}")`,
-            # and raw_response echoes the pod env — HF_TOKEN and the VLLM/TEI bearer —
-            # to stdout (terminal + any captured logs). Capture and discard that stdout
-            # so the secrets never leak; we use the return value, not the print.
-            with contextlib.redirect_stdout(io.StringIO()):
-                return runpod.create_pod(**create_kwargs)
+            return create_pod_once(gpu_type_id, bearer, hf, template_id)
         except QueryError as e:
-            if not any(s in str(e) for s in _RETRYABLE_CREATE_ERRORS):
+            if not is_retryable_create_error(e):
                 raise                         # a real error (bad spec, auth, …) — surface it
             last_err = e
             if attempt < CREATE_RETRIES:

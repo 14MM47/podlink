@@ -30,6 +30,7 @@ if str(POD_CONTROL_DIR) not in sys.path:              # avoid duplicate entries 
     sys.path.insert(0, str(POD_CONTROL_DIR))          # front of path so our copy wins
 
 import runpod            # noqa: E402  RunPod SDK (imported after sys.path tweak)
+from runpod.error import QueryError  # noqa: E402  raised by create_pod on the capacity lottery
 import _secrets          # noqa: E402  vendored secret reader (0600/ownership checked)
 import egress_logger     # noqa: E402  vendored audited httpx client
 import pod_up            # noqa: E402  vendored: constants + find_existing/create_pod/…
@@ -201,12 +202,32 @@ def start(session: PodSession) -> None:
                        error=f"{type(e).__name__} — check the RunPod dashboard for details")
 
 
+def _create_retries() -> int:
+    """How many create attempts before giving up. Env-tunable; default 40 (~10 min
+    at the 15s delay). Because POD DOWN can cancel mid-loop, a generous default is
+    safe — it rides out a transient EU-RO capacity shortage instead of failing at 15."""
+    try:
+        return max(1, int(os.environ.get("PODLINK_CREATE_RETRIES", "40")))
+    except ValueError:
+        return 40
+
+
+def _create_retry_delay() -> int:
+    """Seconds between create attempts (env-tunable, default 15)."""
+    try:
+        return max(5, int(os.environ.get("PODLINK_CREATE_RETRY_DELAY", "15")))
+    except ValueError:
+        return 15
+
+
 def _create_with_fallback(session: PodSession) -> dict | None:
     """Resolve the RTX Pro 6000 id and create the pod (no GPU fallback).
 
     The bundled image + models are sized for the 96 GB card, so a smaller GPU
-    would OOM rather than help — we target one card and let any create error
-    surface to start()'s handler.
+    would OOM rather than help — we target one card. The host-selection lottery is
+    retried HERE (not in the vendored create_pod) so every attempt is reported to
+    the UI event feed and each inter-attempt wait is cancel-aware — POD DOWN
+    interrupts the wait immediately.
     """
     bearer = _read_secret(_secrets.bearer_token)         # -> pod env VLLM_API_KEY
     hf = _read_secret(_secrets.hf_token)                 # -> weight-pull token (all 3 services)
@@ -214,10 +235,28 @@ def _create_with_fallback(session: PodSession) -> dict | None:
         return None
     session.update(phase="resolving RTX Pro 6000 GPU id")  # live catalog lookup
     gpu_id = pod_up.resolve_gpu_id()                     # exact RunPod gpu_type_id
-    if session.cancel.is_set():                          # Down pressed during the lookup
+    if session.cancel.is_set():
         return None
-    session.update(phase=f"creating pod on {gpu_id}")    # progress text
-    return pod_up.create_pod(gpu_id, bearer, hf)         # blocking SDK call; returns pod dict
+    session.update(phase="ensuring pod template")        # registry-cred template (cached)
+    template_id = pod_up.ensure_template()
+    retries, delay = _create_retries(), _create_retry_delay()
+    for attempt in range(1, retries + 1):
+        if session.cancel.is_set():                      # Down pressed between attempts
+            return None
+        session.update(phase=f"creating pod on {gpu_id} — attempt {attempt}/{retries}")
+        try:
+            return pod_up.create_pod_once(gpu_id, bearer, hf, template_id)  # one attempt
+        except QueryError as e:
+            if not pod_up.is_retryable_create_error(e):  # real error (bad spec/auth) — surface it
+                raise
+            session.add_event(                           # visible in the UI feed
+                f"no host with capacity yet — attempt {attempt}/{retries}; retrying in {delay}s")
+            if attempt < retries and _sleep_or_cancel(session, delay):  # cancel-aware wait
+                return None
+    raise RuntimeError(
+        f"no Secure host in the volume's region accepted the pod after {retries} "
+        f"attempts (~{retries * delay // 60} min). RTX PRO 6000 capacity is transient — "
+        f"press POD UP to keep trying, or try again later.")
 
 
 def _wait_for_running(session: PodSession, pod_id: str) -> bool:

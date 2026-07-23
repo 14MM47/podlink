@@ -66,25 +66,24 @@ function fmtClock(epochSec) {
   return new Date(epochSec * 1000).toLocaleTimeString();
 }
 
-// Render the per-service health tiles from the services map.
+// Render the per-service health tiles. Always visible; grey (unknown) until a pod
+// exists, per the "indicators present from startup" rule.
 function renderTiles(services) {
-  if (!services) { tilesEl.classList.remove("show"); return; }
-  let any = false;
   for (const [name, el] of Object.entries(tileEls)) {
-    const st = services[name] || "unknown";
-    el.dataset.status = st;
-    if (st !== "unknown") any = true;
+    el.dataset.status = (services && services[name]) || "unknown";
   }
-  tilesEl.classList.toggle("show", any);   // hide the row entirely when nothing is known
 }
 
 // Render the streamed status event feed (oldest→newest), auto-scrolled to bottom.
+// Always visible; shows a muted placeholder until the first event arrives.
 function renderFeed(events) {
-  if (!events || !events.length) { feedEl.classList.remove("show"); feedEl.innerHTML = ""; return; }
+  if (!events || !events.length) {
+    feedEl.innerHTML = '<div class="feed-row muted"><span class="msg">waiting for activity…</span></div>';
+    return;
+  }
   feedEl.innerHTML = events.map(
     (e) => `<div class="feed-row"><span class="ts">${fmtClock(e.t)}</span><span class="msg">${escapeHtml(e.msg)}</span></div>`
   ).join("");
-  feedEl.classList.add("show");
   feedEl.scrollTop = feedEl.scrollHeight;  // keep the latest line in view
 }
 
@@ -115,22 +114,27 @@ function render(s) {
   } else {
     metaEl.textContent = "";                        // no pod -> blank
   }
-  // Cost meter — shown while a pod is up (uptime_s non-null); blank when IDLE.
+  // Cost meter — live while a pod is up; a muted placeholder when idle (the line
+  // is always present, per the "indicators from startup" rule).
   if (s.uptime_s != null) {
     let c = `up ${fmtDuration(s.uptime_s)}`;
     if (s.session_cost_usd != null) c += ` · <b>$${s.session_cost_usd.toFixed(2)}</b>`;
     if (s.cost_per_hr != null) c += ` ($${Number(s.cost_per_hr).toFixed(2)}/hr)`;
     costEl.innerHTML = c;
   } else {
-    costEl.textContent = "";
+    costEl.innerHTML = '<span class="muted">— no pod running —</span>';
   }
-  // Auto-terminate countdown + keep-alive button (only when a deadline is armed).
+  // Auto-terminate row — always shown: a live countdown + Keep alive when armed,
+  // a muted "off" when not.
   if (s.auto_terminate_in_s != null) {
     autotermText.textContent = `auto-terminate in ${fmtDuration(s.auto_terminate_in_s)}`;
-    autotermEl.classList.add("show");
+    autotermText.classList.remove("muted");
+    keepaliveBtn.style.display = "";
     keepaliveBtn.disabled = false;                  // re-enable each armed frame
   } else {
-    autotermEl.classList.remove("show");
+    autotermText.textContent = "auto-terminate: off";
+    autotermText.classList.add("muted");
+    keepaliveBtn.style.display = "none";
   }
   // Per-service health tiles and the streamed status event feed.
   renderTiles(s.services);
