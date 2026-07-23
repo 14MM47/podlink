@@ -60,6 +60,24 @@ def _launch(target) -> None:
 
 
 _WATCH_INTERVAL_S = 15               # how often the idle watchdog checks the deadline
+_HEALTH_INTERVAL_S = 30              # how often to re-probe the three services while RUNNING
+
+
+def _health_watch() -> None:
+    """Background poller: re-probe the three services while the pod is RUNNING so
+    the health tiles reflect ongoing state (a service that dies shows as down).
+
+    Only runs in RUNNING — bring-up already probes in _wait_for_all_ready. Each
+    pass is 3 audited GETs, so the interval is kept modest to bound egress-log
+    growth.
+    """
+    while True:
+        time.sleep(_HEALTH_INTERVAL_S)
+        try:
+            if SESSION.state == State.RUNNING and SESSION.pod_id:
+                runpod_driver.probe_health_once(SESSION, SESSION.pod_id)
+        except Exception:  # noqa: BLE001 — a watchdog must never die on a transient error
+            pass
 
 
 def _auto_terminate_watch() -> None:
@@ -170,8 +188,10 @@ def pod_keepalive(x_podlink_token: str | None = Header(default=None)) -> JSONRes
     return JSONResponse(_snapshot())                 # echo the new state
 
 
-# Idle-safety watchdog — one daemon thread for the process lifetime.
+# Background daemon threads for the process lifetime: idle-safety watchdog and
+# the continuous service-health poller.
 threading.Thread(target=_auto_terminate_watch, daemon=True).start()
+threading.Thread(target=_health_watch, daemon=True).start()
 
 
 @app.get("/events")

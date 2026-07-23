@@ -56,6 +56,30 @@
       color: #ffcf8a; font-variant-numeric: tabular-nums;
     }
     .autoterm.show { display: flex; }
+    /* Per-service health tiles */
+    .tiles { display: none; gap: .5rem; margin-top: .8rem; justify-content: center; }
+    .tiles.show { display: flex; }
+    .tile {
+      display: flex; align-items: center; gap: .4rem;
+      background: #1b1f27; border: 1px solid #2f3542; border-radius: 8px;
+      padding: .35rem .6rem; font-size: .8rem;
+    }
+    .tile .dot { width: .6rem; height: .6rem; border-radius: 50%; background: #6b7280; }
+    .tile[data-status="healthy"] .dot { background: #2fbf71; box-shadow: 0 0 6px #2fbf7188; }
+    .tile[data-status="pending"] .dot { background: #e6a740; }
+    .tile[data-status="down"]    .dot { background: #d64545; }
+    .tile[data-status="unknown"] .dot { background: #6b7280; }
+    /* Streamed status event feed */
+    .feed {
+      display: none; margin-top: 1rem; width: min(460px, 92vw); max-height: 34vh;
+      overflow-y: auto; background: #12151b; border: 1px solid #232833;
+      border-radius: 8px; padding: .5rem .65rem; font-size: .78rem; line-height: 1.5;
+      font-variant-numeric: tabular-nums;
+    }
+    .feed.show { display: block; }
+    .feed-row { display: flex; gap: .6rem; opacity: .9; }
+    .feed-row .ts { color: #6b7280; flex: 0 0 auto; }
+    .feed-row .msg { word-break: break-word; }
     /* Shown only when no Network Volume is set: POD DOWN would destroy weights. */
     .volwarn {
       display: none; max-width: 460px; text-align: center; line-height: 1.4;
@@ -95,6 +119,12 @@
     </div>
     <div id="meta" class="meta"></div>
   </div>
+  <div id="tiles" class="tiles">
+    <div class="tile" data-status="unknown" id="tile-llm"><span class="dot"></span>LLM</div>
+    <div class="tile" data-status="unknown" id="tile-embedder"><span class="dot"></span>embedder</div>
+    <div class="tile" data-status="unknown" id="tile-reranker"><span class="dot"></span>reranker</div>
+  </div>
+  <div id="feed" class="feed"></div>
   <script src="/app.js"></script>
 </body>
 </html>

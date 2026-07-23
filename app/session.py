@@ -23,6 +23,14 @@ class State(str, enum.Enum):           # str-mixin so `.value` JSON-serialises c
     ERROR = "ERROR"        # something failed; both buttons live so the user can recover
 
 
+SERVICES = ("llm", "embedder", "reranker")   # the three services whose health we track
+_MAX_EVENTS = 60                              # ring-buffer cap for the status event feed
+
+
+def _default_services() -> dict:
+    return {name: "unknown" for name in SERVICES}
+
+
 class PodSession:
     def __init__(self) -> None:                 # construct the single shared session
         self._lock = threading.Lock()           # guards every read/write below
@@ -39,6 +47,12 @@ class PodSession:
         # Idle safety: epoch after which the watchdog auto-terminates the pod, or
         # None when disarmed / no auto-terminate configured.
         self.auto_terminate_at: float | None = None
+        # Per-service health for the UI tiles: llm/embedder/reranker -> one of
+        # unknown | pending | healthy | down.
+        self.services: dict = _default_services()
+        # Streamed status feed: a ring buffer of (epoch, message) — phase changes
+        # (auto-recorded in update()) and health transitions (via add_event()).
+        self.events: list = []
         # Set by a Pod Down request; the start worker polls this and bails out.
         self.cancel = threading.Event()          # cross-thread "stop now" signal
 
@@ -63,6 +77,7 @@ class PodSession:
             self.cost_per_hr = None                          # reset the cost meter for the new run
             self.billing_started_at = None                   # billing clock starts at pod creation
             self.auto_terminate_at = None                    # re-armed by the driver once a pod exists
+            self.services = _default_services()              # fresh health tiles for the new pod
             self.cancel.clear()                             # ensure a fresh (un-cancelled) run
             return True                                     # caller may launch the worker
 
@@ -89,10 +104,28 @@ class PodSession:
     # --- generic field updates -------------------------------------------
 
     def update(self, **fields) -> None:
-        """Set one or more fields under the lock (phase, pod_id, error, …)."""
+        """Set one or more fields under the lock (phase, pod_id, error, …).
+
+        A changed `phase` is auto-appended to the status event feed, so the feed
+        is a timestamped progress history without instrumenting every call site.
+        """
         with self._lock:                          # keep writes atomic vs snapshot()
+            new_phase = fields.get("phase")
+            if new_phase is not None and new_phase != self.phase:
+                self._record_event(new_phase)      # timeline entry for the transition
             for key, value in fields.items():      # apply each supplied field
                 setattr(self, key, value)          # e.g. self.phase = "…"
+
+    def add_event(self, message: str) -> None:
+        """Append a non-phase status event (e.g. a health transition) to the feed."""
+        with self._lock:
+            self._record_event(message)
+
+    def _record_event(self, message: str) -> None:
+        """Append (now, message) to the ring buffer. Caller must hold the lock."""
+        self.events.append((time.time(), message))
+        if len(self.events) > _MAX_EVENTS:
+            del self.events[:-_MAX_EVENTS]         # keep only the most recent
 
     # --- read side --------------------------------------------------------
 
@@ -128,4 +161,7 @@ class PodSession:
                 "session_cost_usd": session_cost,         # cost_per_hr * uptime, or None
                 # Idle auto-terminate countdown.
                 "auto_terminate_in_s": auto_in,           # seconds until auto-off, or None
+                # Per-service health tiles + the streamed status event feed.
+                "services": dict(self.services),          # llm/embedder/reranker -> status
+                "events": [{"t": t, "msg": m} for t, m in self.events[-25:]],  # recent feed
             }

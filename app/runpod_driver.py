@@ -34,7 +34,7 @@ import _secrets          # noqa: E402  vendored secret reader (0600/ownership ch
 import egress_logger     # noqa: E402  vendored audited httpx client
 import pod_up            # noqa: E402  vendored: constants + find_existing/create_pod/…
 
-from .session import PodSession, State  # our state machine types
+from .session import PodSession, State, SERVICES  # our state machine types + service names
 
 # How long to wait, in seconds, for each phase before declaring failure.
 RUNNING_TIMEOUT_S = 900   # RunPod allocation + container boot
@@ -241,23 +241,56 @@ def _wait_for_running(session: PodSession, pod_id: str) -> bool:
     raise RuntimeError(f"pod {pod_id} did not reach RUNNING within {RUNNING_TIMEOUT_S}s")
 
 
-def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
-    """Poll all three services until each returns 200 (or cancel/timeout).
-
-    "Pod ready" = LLM /v1/models AND embedder /health AND reranker /health, per
-    the ragline spec. All three services are gated by the same bearer (their
-    ports are on RunPod's public proxy), so every probe carries it. Each service
-    is dropped from the poll set once healthy, and the phase text reports which
-    are still coming up.
-    """
-    bearer = _read_secret(_secrets.bearer_token)         # gates all three services
-    auth = {"Authorization": f"Bearer {bearer}"}         # same header for each probe
+def _service_probes(pod_id: str, bearer: str) -> dict:
+    """Map each service to its (health-url, auth-headers). All three are gated by
+    the same bearer (their ports are on RunPod's public proxy)."""
+    auth = {"Authorization": f"Bearer {bearer}"}
     urls = pod_up.service_urls(pod_id)                   # {llm,embedder,reranker: base URL}
-    probes = {                                           # service -> (url, headers)
+    return {
         "llm":      (f"{urls['llm']}/v1/models",   auth),
         "embedder": (f"{urls['embedder']}/health", auth),
         "reranker": (f"{urls['reranker']}/health", auth),
     }
+
+
+def _probe_service(url: str, headers: dict) -> bool:
+    """One audited GET; True iff it returned 200 (connection refused => False)."""
+    try:
+        with egress_logger.client(timeout=15.0) as c:    # audited httpx client
+            return c.get(url, headers=headers).status_code == 200
+    except Exception:  # noqa: BLE001                    # refused/timeout while booting
+        return False
+
+
+def _apply_health(session: PodSession, statuses: dict) -> None:
+    """Write per-service statuses onto the session, logging each transition to the
+    event feed (so the tiles and the streamed feed stay in sync)."""
+    old = session.services                               # last-known statuses
+    for name, st in statuses.items():
+        if old.get(name) != st:                          # a service changed state
+            session.add_event(f"{name}: {st}")           # streamed feed entry
+    session.update(services=dict(statuses))              # refresh the tiles
+
+
+def probe_health_once(session: PodSession, pod_id: str) -> None:
+    """Probe all three services once and update the health tiles — used by the
+    background poller while RUNNING (healthy | down)."""
+    bearer = _read_secret(_secrets.bearer_token)
+    probes = _service_probes(pod_id, bearer)
+    statuses = {name: ("healthy" if _probe_service(url, headers) else "down")
+                for name, (url, headers) in probes.items()}
+    _apply_health(session, statuses)
+
+
+def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
+    """Poll all three services until each returns 200 (or cancel/timeout).
+
+    "Pod ready" = LLM /v1/models AND embedder /health AND reranker /health, per
+    the ragline spec. Each service is dropped from the poll set once healthy; the
+    per-service tiles and the phase text report which are still coming up.
+    """
+    bearer = _read_secret(_secrets.bearer_token)         # gates all three services
+    probes = _service_probes(pod_id, bearer)             # service -> (url, headers)
     ready: set[str] = set()                              # services confirmed 200
     deadline = time.time() + READY_TIMEOUT_S             # absolute give-up time
     while time.time() < deadline:                        # loop until deadline
@@ -266,14 +299,12 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
         for name, (url, headers) in probes.items():      # probe each not-yet-ready service
             if name in ready:                            # already up — skip
                 continue
-            try:
-                with egress_logger.client(timeout=15.0) as c:   # audited httpx client
-                    r = c.get(url, headers=headers)      # probe the endpoint
-                if r.status_code == 200:                 # this service is serving
-                    ready.add(name)
-            except Exception:  # noqa: BLE001            # connection refused while booting
-                pass                                     # keep waiting on this one
+            if _probe_service(url, headers):             # this service is serving
+                ready.add(name)
+        # Reflect per-service health onto the tiles (healthy vs still pending).
+        _apply_health(session, {n: ("healthy" if n in ready else "pending") for n in probes})
         if len(ready) == len(probes):                    # all three healthy
+            session.update(phase="all services healthy")
             return True                                  # start is complete
         pending = [n for n in probes if n not in ready]  # what's still loading
         session.update(phase=f"waiting for services… "
@@ -305,7 +336,8 @@ def stop(session: PodSession) -> None:
         if pod_id is None:                               # genuinely nothing exists to terminate
             session.update(state=State.IDLE, phase="no pod found — nothing to terminate",
                            pod_id=None, proxy_url=None,   # settle back to IDLE
-                           billing_started_at=None, cost_per_hr=None, auto_terminate_at=None)
+                           billing_started_at=None, cost_per_hr=None, auto_terminate_at=None,
+                           services={n: "unknown" for n in SERVICES})
             return
 
         session.update(pod_id=pod_id, phase=f"terminating pod {pod_id}")  # progress text
@@ -315,7 +347,9 @@ def stop(session: PodSession) -> None:
             _clear_state_file()                          # drop pod_state.json so a stale id can't resurface
             session.update(state=State.IDLE, phase="terminated — GPU released",
                            pod_id=None, proxy_url=None,   # safe: back to IDLE
-                           billing_started_at=None, cost_per_hr=None, auto_terminate_at=None)  # stop the meter
+                           billing_started_at=None, cost_per_hr=None, auto_terminate_at=None,  # stop the meter
+                           services={n: "unknown" for n in SERVICES})  # clear the health tiles
+
         else:                                            # could NOT confirm — do not lie
             session.update(
                 state=State.ERROR,                       # loud error state, buttons stay live

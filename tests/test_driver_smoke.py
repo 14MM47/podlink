@@ -254,6 +254,43 @@ def test_arm_billing_no_auto_terminate_when_disabled():
             _os.environ["PODLINK_AUTO_TERMINATE_MIN"] = saved
 
 
+def test_phase_change_records_event():
+    # A changed phase auto-appends to the streamed event feed; an unchanged one
+    # does not.
+    s = PodSession()
+    s.update(phase="creating pod")
+    s.update(phase="creating pod")            # same -> no new event
+    s.update(phase="all services healthy")
+    msgs = [m for _, m in s.events]
+    check("phase changes recorded once each",
+          msgs == ["creating pod", "all services healthy"])
+
+
+def test_apply_health_updates_tiles_and_logs_transitions():
+    s = PodSession()
+    rd._apply_health(s, {"llm": "pending", "embedder": "healthy", "reranker": "pending"})
+    rd._apply_health(s, {"llm": "healthy", "embedder": "healthy", "reranker": "down"})
+    snap_services = s.services
+    check("tiles reflect latest statuses",
+          snap_services == {"llm": "healthy", "embedder": "healthy", "reranker": "down"})
+    # Transitions logged: llm pending, embedder healthy, reranker pending (first pass),
+    # then llm healthy, reranker down (embedder unchanged -> not re-logged).
+    msgs = [m for _, m in s.events]
+    check("health transitions logged, unchanged not re-logged",
+          msgs == ["llm: pending", "embedder: healthy", "reranker: pending",
+                   "llm: healthy", "reranker: down"])
+
+
+def test_probe_health_once_marks_healthy_and_down():
+    # Stub the egress client so llm/embedder are 200 and reranker is 503.
+    install_fake_client(lambda url: 503 if "8081" in url else 200)
+    s = PodSession()
+    rd.probe_health_once(s, "podX")
+    check("llm healthy", s.services["llm"] == "healthy")
+    check("embedder healthy", s.services["embedder"] == "healthy")
+    check("reranker down (503)", s.services["reranker"] == "down")
+
+
 if __name__ == "__main__":
     print("driver smoke tests:")
     test_resolve_gpu_id_matches_rtx_pro_6000()
@@ -268,4 +305,7 @@ if __name__ == "__main__":
     test_cost_meter_derives_from_billing_and_rate()
     test_arm_billing_sets_auto_terminate_when_configured()
     test_arm_billing_no_auto_terminate_when_disabled()
+    test_phase_change_records_event()
+    test_apply_health_updates_tiles_and_logs_transitions()
+    test_probe_health_once_marks_healthy_and_down()
     print("all driver smoke tests passed.")

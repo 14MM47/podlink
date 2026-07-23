@@ -14,6 +14,13 @@ const costEl = document.getElementById("cost");          // uptime + running cos
 const autotermEl = document.getElementById("autoterm");  // auto-terminate countdown row
 const autotermText = document.getElementById("autotermText");  // its text span
 const keepaliveBtn = document.getElementById("keepalive");     // cancel auto-terminate
+const tilesEl = document.getElementById("tiles");        // per-service health tiles row
+const tileEls = {                                        // service -> tile element
+  llm: document.getElementById("tile-llm"),
+  embedder: document.getElementById("tile-embedder"),
+  reranker: document.getElementById("tile-reranker"),
+};
+const feedEl = document.getElementById("feed");          // streamed status event feed
 
 let token = null;                                   // per-process CSRF token (fetched once)
 let lastState = null;                               // to reload pods on return to IDLE
@@ -54,6 +61,39 @@ function fmtDuration(sec) {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+// Local wall-clock time (HH:MM:SS) for a unix-epoch-seconds event timestamp.
+function fmtClock(epochSec) {
+  return new Date(epochSec * 1000).toLocaleTimeString();
+}
+
+// Render the per-service health tiles from the services map.
+function renderTiles(services) {
+  if (!services) { tilesEl.classList.remove("show"); return; }
+  let any = false;
+  for (const [name, el] of Object.entries(tileEls)) {
+    const st = services[name] || "unknown";
+    el.dataset.status = st;
+    if (st !== "unknown") any = true;
+  }
+  tilesEl.classList.toggle("show", any);   // hide the row entirely when nothing is known
+}
+
+// Render the streamed status event feed (oldest→newest), auto-scrolled to bottom.
+function renderFeed(events) {
+  if (!events || !events.length) { feedEl.classList.remove("show"); feedEl.innerHTML = ""; return; }
+  feedEl.innerHTML = events.map(
+    (e) => `<div class="feed-row"><span class="ts">${fmtClock(e.t)}</span><span class="msg">${escapeHtml(e.msg)}</span></div>`
+  ).join("");
+  feedEl.classList.add("show");
+  feedEl.scrollTop = feedEl.scrollHeight;  // keep the latest line in view
+}
+
+// Minimal HTML-escape so a phase/message string can't inject markup.
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 // Reflect a status snapshot into the UI.
 function render(s) {
   lastSnap = s;                                     // remember it for the POD DOWN guard
@@ -92,6 +132,9 @@ function render(s) {
   } else {
     autotermEl.classList.remove("show");
   }
+  // Per-service health tiles and the streamed status event feed.
+  renderTiles(s.services);
+  renderFeed(s.events);
   // Server is the single source of truth for enablement.
   upBtn.disabled = !s.up_enabled;                   // grey Up unless server allows it
   downBtn.disabled = !s.down_enabled;               // grey Down unless server allows it
