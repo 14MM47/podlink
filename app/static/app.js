@@ -36,6 +36,7 @@ const testresultEl = document.getElementById("testresult");   // its result rows
 let token = null;                                   // per-process CSRF token (fetched once)
 let lastState = null;                               // to reload pods on return to IDLE
 let lastSnap = null;                                // most recent status snapshot (for the Down guard)
+let envKey = null;                                  // pod_id:dim the .env block was last fetched for
 
 // Fetch the per-process CSRF token once (same-origin; cross-origin JS can't read it).
 async function loadToken() {
@@ -81,7 +82,10 @@ function fmtClock(epochSec) {
 // exists, per the "indicators present from startup" rule.
 function renderTiles(services) {
   for (const [name, el] of Object.entries(tileEls)) {
-    el.dataset.status = (services && services[name]) || "unknown";
+    const st = (services && services[name]) || "unknown";
+    el.dataset.status = st;
+    const stEl = el.querySelector(".st");
+    if (stEl) stEl.textContent = st === "unknown" ? "" : st;   // show the word, blank when unknown
   }
 }
 
@@ -109,14 +113,12 @@ function renderPanel(el, rows, withDelta) {
 function renderTest(s) {
   if (s.test_running) {
     testresultEl.innerHTML = '<span class="muted">running stack test…</span>';
-    testresultEl.classList.add("show");
     return;
   }
   const tr = s.test_result;
-  if (!tr) { testresultEl.classList.remove("show"); testresultEl.innerHTML = ""; return; }
+  if (!tr) { testresultEl.innerHTML = '<span class="muted">— not run —</span>'; return; }
   if (tr.error) {
     testresultEl.innerHTML = `<div class="tr-row" style="color:#ff8a8a">test error: ${escapeHtml(tr.error)}</div>`;
-    testresultEl.classList.add("show");
     return;
   }
   const svc = tr.services || {};
@@ -128,7 +130,6 @@ function renderTest(s) {
   let html = ["llm", "embedder", "reranker"].map(row).join("");
   if (tr.embedding_dim) html += `<div class="tr-row muted">embedding dimension: ${tr.embedding_dim}</div>`;
   testresultEl.innerHTML = html;
-  testresultEl.classList.add("show");
 }
 
 // Split the event feed into its three source/function panels.
@@ -153,19 +154,23 @@ function render(s) {
   // `=== false` so an older frame without the field never flashes the banner.
   volwarn.classList.toggle("show", s.network_volume_configured === false);
   badge.textContent = s.state;                      // show the current state
+  badge.dataset.state = s.state;                    // colour the pill by state (CSS)
   phaseEl.textContent = s.phase || "";              // show progress text (or blank)
   errorEl.textContent = s.error || "";              // show error (or blank)
   // Show the pod id, and — for our three-service stack (proxy_url set on the
   // Auto path) — the three ragline URLs, which are just pod-id + fixed ports.
   if (s.pod_id) {
-    let m = `pod ${s.pod_id}`;
+    const pid = escapeHtml(s.pod_id);
+    let m = `<span class="k">pod</span> ${pid}`;
     if (s.proxy_url) {
-      const base = (port) => `https://${s.pod_id}-${port}.proxy.runpod.net`;
-      m += ` · llm ${base(8000)}/v1 · embed ${base(8080)}/v1 · rerank ${base(8081)}`;
+      const base = (port) => `https://${pid}-${port}.proxy.runpod.net`;
+      m += `<div class="urls"><span class="k">llm</span> ${base(8000)}/v1 · ` +
+           `<span class="k">embed</span> ${base(8080)}/v1 · ` +
+           `<span class="k">rerank</span> ${base(8081)}</div>`;
     }
-    metaEl.textContent = m;
+    metaEl.innerHTML = m;
   } else {
-    metaEl.textContent = "";                        // no pod -> blank
+    metaEl.innerHTML = '<span class="muted">— no pod running —</span>';
   }
   // Cost meter — live while a pod is up; a muted placeholder when idle (the line
   // is always present, per the "indicators from startup" rule).
@@ -196,11 +201,19 @@ function render(s) {
   } else {
     volinfoEl.innerHTML = 'Network Volume: <span class="muted">none — Data-Volume mode (weights not persisted)</span>';
   }
-  // Per-pod actions (test stack, copy .env) — only meaningful once serving.
+  // Per-pod actions (test stack, copy .env) — enabled only once serving.
   const up = !!(s.pod_id && s.proxy_url);
-  actionsEl.style.visibility = up ? "visible" : "hidden";
   teststackBtn.disabled = !up || !!s.test_running;   // disable while a test runs
-  if (!up) { envviewEl.classList.remove("show"); copiedEl.style.display = "none"; }
+  copyenvBtn.disabled = !up;
+  // Outputs rail: auto-populate the ragline .env block while a pod serves, and
+  // re-fetch once Test-stack detects the embedding dimension (fills EMBEDDING_DIMENSIONS).
+  const dim = s.test_result && s.test_result.embedding_dim;
+  const key = up ? `${s.pod_id}:${dim || ""}` : null;
+  if (key && key !== envKey) { envKey = key; fetchEnv(); }
+  else if (!up && envKey !== "idle") {
+    envKey = "idle"; copiedEl.style.display = "none";
+    envviewEl.innerHTML = '<span class="muted">— start a pod to generate the ragline config —</span>';
+  }
   renderTest(s);
   // Per-service health tiles and the split status event feeds.
   renderTiles(s.services);
@@ -216,6 +229,16 @@ function render(s) {
     if (s.up_enabled) loadPods();                   // IDLE or ERROR -> statuses may have changed
     lastState = s.state;
   }
+}
+
+// Fetch the ragline .env block for the running pod and show it in the outputs rail.
+async function fetchEnv() {
+  if (!token) await loadToken();
+  try {
+    const r = await fetch("/pod/ragline-env", { headers: { "X-Podlink-Token": token } });
+    if (!r.ok) return;                              // 409 before a pod is up — leave the placeholder
+    envviewEl.textContent = (await r.json()).env;   // plain text (selectable, copyable)
+  } catch { /* transient — a later frame retries */ }
 }
 
 // POST a control action with the token header (+ optional JSON body).
@@ -259,18 +282,13 @@ teststackBtn.addEventListener("click", () => {      // run a real completion+emb
   teststackBtn.disabled = true;                     // optimistic; SSE reflects test_running
   send("/pod/test");
 });
-copyenvBtn.addEventListener("click", async () => {  // fetch + copy the ragline .env block
-  if (!token) await loadToken();
-  try {
-    const r = await fetch("/pod/ragline-env", { headers: { "X-Podlink-Token": token } });
-    if (!r.ok) return;
-    const env = (await r.json()).env;
-    envviewEl.textContent = env;                    // reveal it so it's visible + selectable
-    envviewEl.classList.add("show");
-    try { await navigator.clipboard.writeText(env); } catch { /* clipboard may be blocked; text is shown */ }
-    copiedEl.style.display = "inline";
-    setTimeout(() => { copiedEl.style.display = "none"; }, 2000);
-  } catch { /* transient — user can retry */ }
+copyenvBtn.addEventListener("click", async () => {  // copy the shown ragline .env block
+  await fetchEnv();                                 // ensure it's current (fills envview)
+  const env = envviewEl.textContent || "";
+  if (!env || env.trim().startsWith("—")) return;   // still the placeholder — nothing to copy
+  try { await navigator.clipboard.writeText(env); } catch { /* clipboard blocked; text is shown to select */ }
+  copiedEl.style.display = "inline";
+  setTimeout(() => { copiedEl.style.display = "none"; }, 2000);
 });
 
 // Live updates via SSE, with a polling fallback if the stream drops.
