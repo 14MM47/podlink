@@ -97,13 +97,15 @@ function renderPanel(el, rows, withDelta) {
     return;
   }
   let prev = null;
-  el.innerHTML = rows.map((e) => {
+  const last = rows.length - 1;
+  el.innerHTML = rows.map((e, i) => {
     let dt = "";
     if (withDelta && prev !== null) {
       dt = `<span class="dt">+${fmtDuration(Math.max(0, Math.round(e.t - prev)))}</span>`;
     }
     prev = e.t;
-    return `<div class="feed-row"><span class="ts">${fmtClock(e.t)}</span>${dt}<span class="msg">${escapeHtml(e.msg)}</span></div>`;
+    const cls = i === last ? "feed-row latest" : "feed-row";   // highlight the newest line
+    return `<div class="${cls}"><span class="ts">${fmtClock(e.t)}</span>${dt}<span class="msg">${escapeHtml(e.msg)}</span></div>`;
   }).join("");
   el.scrollTop = el.scrollHeight;          // keep the latest line in view
 }
@@ -124,11 +126,16 @@ function renderTest(s) {
   const svc = tr.services || {};
   const row = (name) => {
     const r = svc[name] || {};
-    const mark = r.ok ? '<span style="color:#7fd7a2">✓</span>' : '<span style="color:#ff8a8a">✗</span>';
-    return `<div class="tr-row">${mark} ${name} · ${r.latency_ms ?? "?"}ms · ${escapeHtml(r.detail || "")}</div>`;
+    const ck = r.ok ? '<span class="ck">✓</span>' : '<span class="ck" style="color:#ff9a9a">✗</span>';
+    return `<div class="tr-row">${ck}<span class="svc">${name}</span>` +
+           `<span class="ms">${r.latency_ms ?? "?"}ms</span>` +
+           `<span class="note">· ${escapeHtml(r.detail || "")}</span></div>`;
   };
   let html = ["llm", "embedder", "reranker"].map(row).join("");
-  if (tr.embedding_dim) html += `<div class="tr-row muted">embedding dimension: ${tr.embedding_dim}</div>`;
+  if (tr.embedding_dim) {
+    html += `<div class="tr-row muted"><span class="ck"> </span><span class="svc"></span>` +
+            `<span class="note">embedding dimension: ${tr.embedding_dim}</span></div>`;
+  }
   testresultEl.innerHTML = html;
 }
 
@@ -161,12 +168,13 @@ function render(s) {
   // Auto path) — the three ragline URLs, which are just pod-id + fixed ports.
   if (s.pod_id) {
     const pid = escapeHtml(s.pod_id);
-    let m = `<span class="k">pod</span> ${pid}`;
+    let m = `<div><span class="k">pod</span> <span class="pid">${pid}</span></div>`;
     if (s.proxy_url) {
       const base = (port) => `https://${pid}-${port}.proxy.runpod.net`;
-      m += `<div class="urls"><span class="k">llm</span> ${base(8000)}/v1 · ` +
-           `<span class="k">embed</span> ${base(8080)}/v1 · ` +
-           `<span class="k">rerank</span> ${base(8081)}</div>`;
+      m += `<div class="urls">` +
+           `<span><b>llm</b> ${base(8000)}/v1</span>` +
+           `<span><b>embed</b> ${base(8080)}/v1</span>` +
+           `<span><b>rerank</b> ${base(8081)}</span></div>`;
     }
     metaEl.innerHTML = m;
   } else {
@@ -196,7 +204,7 @@ function render(s) {
   }
   // Network-volume info line (always present).
   if (s.volume_id) {
-    volinfoEl.innerHTML = `Network Volume: <b>${escapeHtml(s.volume_id)}</b> · persistence ON`;
+    volinfoEl.innerHTML = `Network Volume: <b>${escapeHtml(s.volume_id)}</b> · persistence <span class="on">ON</span>`;
     volinfoEl.classList.remove("muted");
   } else {
     volinfoEl.innerHTML = 'Network Volume: <span class="muted">none — Data-Volume mode (weights not persisted)</span>';
