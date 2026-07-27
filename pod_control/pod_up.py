@@ -104,8 +104,13 @@ CONTAINER_DISK_GB = 55    # must hold the bundled image (~38 GB on the 24.04/CUD
 NETWORK_VOLUME_ID = os.environ.get("PODLINK_NETWORK_VOLUME_ID", "").strip()
 VOLUME_GB = 50             # only used when NETWORK_VOLUME_ID is empty (Data Volume)
 VOLUME_MOUNT = "/workspace"
-MAX_MODEL_LEN = 32768
-GPU_MEMORY_UTILIZATION = 0.70   # caps vLLM so the two TEI services fit on 96 GB
+# vLLM sizing — env-overridable like the model ids (the image wrappers already
+# read MAX_MODEL_LEN / GPU_MEMORY_UTILIZATION from the pod env, so no image
+# rebuild is needed to retune). Raise GPU share only alongside a smaller
+# embedder: at 0.70 the two TEI services fit; a big-LLM profile (e.g. a ~66 GB
+# Int4 MoE + a 4B embedder) wants ~0.85.
+MAX_MODEL_LEN = int(os.environ.get("PODLINK_MAX_MODEL_LEN", "32768"))
+GPU_MEMORY_UTILIZATION = float(os.environ.get("PODLINK_GPU_MEMORY_UTILIZATION", "0.70"))
 # SSH is handy for first-boot debug / pre-warm but opens an extra surface on every
 # pod. On by default (preserves debugging during bring-up); set PODLINK_START_SSH=0
 # to deploy without it once the image is trusted.
