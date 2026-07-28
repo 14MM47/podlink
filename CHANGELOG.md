@@ -15,7 +15,16 @@ All notable changes to podlink are documented here. The format loosely follows
 - `PODLINK_VOLUME_GB` — size the pod-scoped Data Volume to the stack's weights.
 - `PODLINK_MAX_MODEL_LEN` / `PODLINK_GPU_MEMORY_UTILIZATION` env overrides
   (previously hard-coded constants; image wrappers already read them).
+- `PODLINK_VLLM_EXTRA_ARGS` — extra `vllm serve` flags via the image wrapper
+  (image ≥ `2026-07b`), e.g. bounded-multimodal caps or `--language-model-only`.
+- `PODLINK_PYTORCH_CUDA_ALLOC_CONF` — allocator tuning passthrough
+  (e.g. `expandable_segments:True`).
 - `--check` now prints the active profile, model ids, and vLLM sizing.
+
+### Fixed
+- Template recreation on an image change no longer collides with the account's
+  existing template: names are suffixed with the image tag
+  (`podlink-pod-<tag>`), fixing POD UP dying at "ensuring pod template".
 
 ## [0.1.0] — 2026-07-23
 

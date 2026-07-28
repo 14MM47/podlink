@@ -118,6 +118,8 @@ export PODLINK_NETWORK_VOLUME_ID=<volume-id>         # terminate-safe weight per
 | `PODLINK_LLM_QUANT` | *(empty)* | vLLM `--quantization` (empty auto-detects). |
 | `PODLINK_NETWORK_VOLUME_ID` | *(empty)* | Network Volume id. Empty ⇒ Data-Volume fallback (weights destroyed on terminate). `start.sh` prompts/saves this. `none` ⇒ **explicitly** volume-less: skips the saved-id/prompt fallback. |
 | `PODLINK_MAX_MODEL_LEN` / `PODLINK_GPU_MEMORY_UTILIZATION` | `32768` / `0.70` | vLLM context cap and GPU share (the rest hosts the two TEI services). |
+| `PODLINK_VLLM_EXTRA_ARGS` | *(empty)* | Extra `vllm serve` flags, space-separated (e.g. `--language-model-only`, or bounded-multimodal caps). JSON values must be compact — the wrapper word-splits. |
+| `PODLINK_PYTORCH_CUDA_ALLOC_CONF` | *(empty)* | Passed to the pod as `PYTORCH_CUDA_ALLOC_CONF` (e.g. `expandable_segments:True`). |
 | `PODLINK_VOLUME_GB` | `50` | Pod-scoped Data-Volume size when no Network Volume is set — size it to your weights. |
 | `PODLINK_POD_NAME` / `PODLINK_TEMPLATE_NAME` | `podlink` / `podlink-pod` | RunPod pod + template names. |
 | `PODLINK_AUTO_TERMINATE_MIN` | `0` (off) | Idle auto-terminate window, minutes. |

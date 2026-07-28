@@ -164,12 +164,20 @@ def ensure_template() -> str:
         rprint("[yellow]template_state.json is stale (IMAGE or credential changed) "
                "— creating a new template.[/]")
 
-    rprint(f"[bold cyan]Creating template[/] {TEMPLATE_NAME!r} for image {IMAGE} …")
+    # Template names are unique per RunPod account and there is no delete-by-name
+    # here, so a fixed name collides the moment a template for an older image
+    # exists (create fails, POD UP dies at "ensuring pod template"). Suffix with
+    # the image tag so every image revision gets its own name.
+    tag = IMAGE.rsplit(":", 1)[-1] if ":" in IMAGE else "latest"
+    slug = "".join(c if c.isalnum() or c == "-" else "-" for c in tag)
+    template_name = f"{TEMPLATE_NAME}-{slug}"
+
+    rprint(f"[bold cyan]Creating template[/] {template_name!r} for image {IMAGE} …")
     # docker_start_cmd omitted -> the mutation sends dockerArgs "" -> the image's
     # own CMD (supervisord) runs, launching all three services. Ports/disk mirror
     # the pod so the template is self-consistent; the pod re-specifies them anyway.
     tmpl_kwargs = dict(
-        name=TEMPLATE_NAME,
+        name=template_name,
         image_name=IMAGE,
         container_disk_in_gb=CONTAINER_DISK_GB,
         ports=EXPOSED_PORT,
@@ -234,7 +242,7 @@ def is_retryable_create_error(e: Exception) -> bool:
 def _pod_env(bearer: str, hf: str) -> dict:
     """The pod's runtime env — secrets + model config, read by the image wrappers.
     Secrets live here (pod env), never in the persistent template."""
-    return {
+    env = {
         # weight-pull token, seen by all three services in the container
         "HF_TOKEN": hf,
         "HUGGING_FACE_HUB_TOKEN": hf,     # some loaders read this name instead
@@ -253,6 +261,16 @@ def _pod_env(bearer: str, hf: str) -> dict:
         "MAX_MODEL_LEN": str(MAX_MODEL_LEN),
         "GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
     }
+    # Optional tuning passthroughs — only sent when set, so the image defaults
+    # stay authoritative otherwise.
+    for src, dst in (
+        ("PODLINK_VLLM_EXTRA_ARGS", "VLLM_EXTRA_ARGS"),          # extra vllm serve flags
+        ("PODLINK_PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"),  # allocator tuning
+    ):
+        val = os.environ.get(src, "").strip()
+        if val:
+            env[dst] = val
+    return env
 
 
 def create_pod_once(gpu_type_id: str, bearer: str, hf: str, template_id: str) -> dict:

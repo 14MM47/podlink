@@ -20,10 +20,19 @@ if [[ -n "${LLM_QUANT:-}" ]]; then
   QUANT_FLAG=(--quantization "${LLM_QUANT}")
 fi
 
+# Optional extra vLLM flags, space-separated (e.g. "--language-model-only" to
+# serve a multimodal checkpoint text-only, shedding vision weights + the
+# encoder cache). Deliberately word-split.
+EXTRA_ARGS=()
+if [[ -n "${VLLM_EXTRA_ARGS:-}" ]]; then
+  read -r -a EXTRA_ARGS <<< "${VLLM_EXTRA_ARGS}"
+fi
+
 exec vllm serve "${LLM_MODEL_ID}" \
   --served-model-name "${SERVED_NAME}" \
   "${QUANT_FLAG[@]}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.70}" \
   --max-model-len "${MAX_MODEL_LEN:-32768}" \
   --host 0.0.0.0 \
-  --port 8000
+  --port 8000 \
+  "${EXTRA_ARGS[@]}"
