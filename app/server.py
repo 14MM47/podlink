@@ -11,6 +11,7 @@ from __future__ import annotations  # postponed annotation evaluation
 
 import asyncio                       # sleep between SSE pushes
 import json                          # serialise snapshots for SSE frames
+import os                            # active-profile name from the launch env
 import re                            # validate the client-supplied pod id
 import secrets as pysecrets          # cryptographic token + constant-time compare
 import threading                     # run driver work off the request thread
@@ -140,6 +141,8 @@ def _snapshot() -> dict:
     snap = SESSION.snapshot()                                 # base state + button flags
     snap["network_volume_configured"] = runpod_driver.network_volume_configured()
     snap["volume_id"] = runpod_driver.pod_up.NETWORK_VOLUME_ID or None  # for the volume panel
+    snap["active_profile"] = os.environ.get("PODLINK_PROFILE") or None  # start.sh --profile
+    snap["llm_model_id"] = runpod_driver.pod_up.LLM_MODEL_ID   # which stack this launch serves
     return snap
 
 

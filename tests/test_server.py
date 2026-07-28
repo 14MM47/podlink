@@ -38,6 +38,24 @@ def test_config_and_status():
     snap = client.get("/status").json()
     check("/status has state + button flags", {"state", "up_enabled", "down_enabled"} <= set(snap))
     check("/status carries the deploy flag", "network_volume_configured" in snap)
+    check("/status carries the llm model id",
+          snap.get("llm_model_id") == server.runpod_driver.pod_up.LLM_MODEL_ID)
+
+
+def test_status_active_profile():
+    import os
+
+    old = os.environ.pop("PODLINK_PROFILE", None)
+    try:
+        check("no profile -> active_profile null",
+              client.get("/status").json()["active_profile"] is None)
+        os.environ["PODLINK_PROFILE"] = "agentic"
+        check("profile env -> active_profile echoed",
+              client.get("/status").json()["active_profile"] == "agentic")
+    finally:
+        os.environ.pop("PODLINK_PROFILE", None)
+        if old is not None:
+            os.environ["PODLINK_PROFILE"] = old
 
 
 def test_token_gate():
@@ -91,6 +109,7 @@ def test_env_and_test_guards():
 if __name__ == "__main__":
     print("server tests:")
     test_config_and_status()
+    test_status_active_profile()
     test_token_gate()
     test_pod_up_validation()
     test_down_guard()

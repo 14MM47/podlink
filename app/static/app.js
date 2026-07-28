@@ -212,12 +212,17 @@ function render(s) {
     keepaliveBtn.style.display = "none";
   }
 
-  // Network-volume info line — rebuild only when the volume changes.
-  const volKey = s.volume_id || "";
+  // Deploy-info lines (profile / model / volume are process constants) —
+  // rebuild only when they change.
+  const volKey = `${s.active_profile || ""}|${s.llm_model_id || ""}|${s.volume_id || ""}`;
   if (volKey !== mVol) {
-    volinfoEl.innerHTML = s.volume_id
+    const profileLine = s.active_profile
+      ? `Profile: <b>${escapeHtml(s.active_profile)}</b> · ${escapeHtml(s.llm_model_id || "")}<br>`
+      : "";
+    const volLine = s.volume_id
       ? `Network Volume: <b>${escapeHtml(s.volume_id)}</b> · persistence <span class="on">ON</span>`
       : 'Network Volume: <span class="muted">none — Data-Volume mode (weights not persisted)</span>';
+    volinfoEl.innerHTML = profileLine + volLine;
     mVol = volKey;
   }
 

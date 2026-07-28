@@ -116,11 +116,36 @@ export PODLINK_NETWORK_VOLUME_ID=<volume-id>         # terminate-safe weight per
 | `PODLINK_LLM_MODEL_ID` / `PODLINK_EMBED_MODEL_ID` / `PODLINK_RERANK_MODEL_ID` | balanced 96 GB defaults | HF repos the image serves. |
 | `PODLINK_LLM_SERVED_NAME` | `llm` | vLLM `--served-model-name`; a client's model field must match. |
 | `PODLINK_LLM_QUANT` | *(empty)* | vLLM `--quantization` (empty auto-detects). |
-| `PODLINK_NETWORK_VOLUME_ID` | *(empty)* | Network Volume id. Empty ⇒ Data-Volume fallback (weights destroyed on terminate). `start.sh` prompts/saves this. |
+| `PODLINK_NETWORK_VOLUME_ID` | *(empty)* | Network Volume id. Empty ⇒ Data-Volume fallback (weights destroyed on terminate). `start.sh` prompts/saves this. `none` ⇒ **explicitly** volume-less: skips the saved-id/prompt fallback. |
+| `PODLINK_MAX_MODEL_LEN` / `PODLINK_GPU_MEMORY_UTILIZATION` | `32768` / `0.70` | vLLM context cap and GPU share (the rest hosts the two TEI services). |
+| `PODLINK_VOLUME_GB` | `50` | Pod-scoped Data-Volume size when no Network Volume is set — size it to your weights. |
 | `PODLINK_POD_NAME` / `PODLINK_TEMPLATE_NAME` | `podlink` / `podlink-pod` | RunPod pod + template names. |
 | `PODLINK_AUTO_TERMINATE_MIN` | `0` (off) | Idle auto-terminate window, minutes. |
 | `PODLINK_CREATE_RETRIES` / `PODLINK_CREATE_RETRY_DELAY` | `40` / `15` | Host-capacity retry attempts and delay. |
 | `PODLINK_START_SSH` | `1` (on) | Enable SSH on the pod for first-boot debug. |
+
+### Profiles — switching between whole stacks
+
+One podlink can drive several model stacks (one at a time — it's one GPU). Put
+shared values (image, registry auth) in `podlink.conf` and each stack's settings
+in `~/.config/podlink/profiles/<name>.conf`; launch with:
+
+```bash
+./start.sh --profile heavy       # sources profiles/heavy.conf AFTER the base conf
+./start.sh --check --profile heavy   # verify which stack would deploy, spend nothing
+```
+
+Profile files are sourced after the base conf, so their `export`s win. A profile
+typically sets the model ids, served name, `PODLINK_MAX_MODEL_LEN`,
+`PODLINK_GPU_MEMORY_UTILIZATION`, and its own `PODLINK_NETWORK_VOLUME_ID` — either
+a dedicated volume, or the sentinel `none` for a deliberately volume-less stack
+(weights re-download each POD UP; the console's red no-volume banner is expected
+in that mode, and `PODLINK_VOLUME_GB` should be sized to hold the weights).
+`PODLINK_PROFILE=<name>` in the environment does the same as `--profile`; the
+active profile and LLM are shown in the console and in `--check`. Switching
+stacks = POD DOWN, relaunch with the other profile, POD UP. Models are pod env,
+not image content — profiles never need an image rebuild, and same-image
+profiles reuse the cached RunPod template.
 
 ## Pod image (build once)
 

@@ -102,7 +102,10 @@ CONTAINER_DISK_GB = 55    # must hold the bundled image (~38 GB on the 24.04/CUD
 # (weights are DESTROYED on terminate). Export PODLINK_NETWORK_VOLUME_ID before
 # launching podlink (or in its service env) to enable terminate-safe persistence.
 NETWORK_VOLUME_ID = os.environ.get("PODLINK_NETWORK_VOLUME_ID", "").strip()
-VOLUME_GB = 50             # only used when NETWORK_VOLUME_ID is empty (Data Volume)
+# Only used when NETWORK_VOLUME_ID is empty (Data Volume). Env-overridable so a
+# volume-less profile can size the pod-scoped scratch to its weights (a ~76 GB
+# big-LLM stack needs ~120, the default 30B stack fits in 50).
+VOLUME_GB = int(os.environ.get("PODLINK_VOLUME_GB", "50"))
 VOLUME_MOUNT = "/workspace"
 # vLLM sizing — env-overridable like the model ids (the image wrappers already
 # read MAX_MODEL_LEN / GPU_MEMORY_UTILIZATION from the pod env, so no image

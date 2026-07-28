@@ -3,6 +3,20 @@
 All notable changes to podlink are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow SemVer.
 
+## [0.2.0] — 2026-07-28
+
+### Added
+- **Profiles**: `./start.sh --profile <name>` (or `PODLINK_PROFILE`) overlays
+  `~/.config/podlink/profiles/<name>.conf` on the base conf, so one podlink
+  switches between whole stacks per launch. Active profile + LLM shown in the
+  console (`/status`: `active_profile`, `llm_model_id`) and in `--check`.
+- `PODLINK_NETWORK_VOLUME_ID=none` sentinel — explicitly volume-less launch that
+  skips the saved-id/prompt fallback (Data-Volume mode, weights re-download).
+- `PODLINK_VOLUME_GB` — size the pod-scoped Data Volume to the stack's weights.
+- `PODLINK_MAX_MODEL_LEN` / `PODLINK_GPU_MEMORY_UTILIZATION` env overrides
+  (previously hard-coded constants; image wrappers already read them).
+- `--check` now prints the active profile, model ids, and vLLM sizing.
+
 ## [0.1.0] — 2026-07-23
 
 First public release.

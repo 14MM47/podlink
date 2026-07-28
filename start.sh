@@ -6,16 +6,27 @@
 # ready, then hands off to the hardened ./run.sh (localhost-only bind, no arg
 # pass-through — we deliberately do NOT forward args to it).
 #
-#   ./start.sh           # resolve volume id, then start the app
-#   ./start.sh --check    # preflight only (volume id, venv, deps, secrets), no launch
+#   ./start.sh                      # resolve volume id, then start the app
+#   ./start.sh --check              # preflight only (volume, venv, deps, secrets), no launch
+#   ./start.sh --profile <name>     # overlay ~/.config/podlink/profiles/<name>.conf
+#                                   # on the base conf (also: PODLINK_PROFILE env)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${HOME}/.config/podlink"
 CONF_FILE="${CONFIG_DIR}/podlink.conf"         # optional: exports PODLINK_IMAGE etc.
+PROFILE_DIR="${CONFIG_DIR}/profiles"           # optional per-stack overlays
 VOL_FILE="${CONFIG_DIR}/network_volume_id"     # the id is infra, not a secret, but kept here for tidiness
 CHECK_ONLY=0
-[[ "${1:-}" == "--check" ]] && CHECK_ONLY=1
+PROFILE="${PODLINK_PROFILE:-}"                 # --profile beats the env var
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check)   CHECK_ONLY=1; shift ;;
+    --profile) [[ $# -ge 2 ]] || { printf '\033[33m%s\033[0m\n' "--profile needs a name"; exit 2; }
+               PROFILE="$2"; shift 2 ;;
+    *)         printf '\033[33m%s\033[0m\n' "Unknown argument: $1 (supported: --check, --profile <name>)"; exit 2 ;;
+  esac
+done
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }
@@ -29,11 +40,32 @@ if [[ -f "${CONF_FILE}" ]]; then
   say "Loaded stack config from ${CONF_FILE}"
 fi
 
+# Profile overlay: a named conf sourced AFTER the base, so its exports win.
+# Lets one podlink switch between whole stacks (models, sizing, volume) per launch.
+if [[ -n "${PROFILE}" ]]; then
+  PROFILE_FILE="${PROFILE_DIR}/${PROFILE}.conf"
+  if [[ ! -f "${PROFILE_FILE}" ]]; then
+    warn "Profile '${PROFILE}' not found at ${PROFILE_FILE}"
+    [[ -d "${PROFILE_DIR}" ]] && say "Available: $(ls "${PROFILE_DIR}" 2>/dev/null | sed 's/\.conf$//' | paste -sd' ' -)"
+    exit 2
+  fi
+  # shellcheck disable=SC1090
+  source "${PROFILE_FILE}"
+  export PODLINK_PROFILE="${PROFILE}"    # surfaced in the console UI
+  say "Loaded profile '${PROFILE}' from ${PROFILE_FILE}"
+fi
+
 # --- 1. Resolve the Network Volume id --------------------------------------
 # Priority: an already-exported env var wins (explicit override); else a saved
 # file; else prompt. When a saved value exists we still OFFER a fresh paste.
+# Sentinel: PODLINK_NETWORK_VOLUME_ID=none means "deliberately no volume" — it
+# skips the saved-file/prompt fallback so a no-volume profile can't silently
+# inherit another stack's volume, and runs in Data-Volume mode (weights
+# re-download from HF on every POD UP; nothing persists a terminate).
 volume=""
-if [[ -n "${PODLINK_NETWORK_VOLUME_ID:-}" ]]; then
+if [[ "${PODLINK_NETWORK_VOLUME_ID:-}" =~ ^[Nn][Oo][Nn][Ee]$ ]]; then
+  say "Network volume: none (explicit) — Data-Volume mode, weights re-download each POD UP."
+elif [[ -n "${PODLINK_NETWORK_VOLUME_ID:-}" ]]; then
   volume="${PODLINK_NETWORK_VOLUME_ID}"
   say "Network volume id: using PODLINK_NETWORK_VOLUME_ID from the environment."
 elif [[ -f "${VOL_FILE}" ]]; then
@@ -108,8 +140,13 @@ if [[ "${CHECK_ONLY}" == "1" ]]; then
   done
   say ""
   say "Stack config:"
+  say "  profile: ${PODLINK_PROFILE:-<none — base conf only>}"
   if [[ -n "${PODLINK_IMAGE:-}" ]]; then ok "  ✓ PODLINK_IMAGE = ${PODLINK_IMAGE}"; else warn "  ✗ PODLINK_IMAGE not set (required — see README / ${CONF_FILE})"; fi
   say "  served model name: ${PODLINK_LLM_SERVED_NAME:-llm}"
+  say "  llm:      ${PODLINK_LLM_MODEL_ID:-<pod_up.py default>}"
+  say "  embedder: ${PODLINK_EMBED_MODEL_ID:-<pod_up.py default>}"
+  say "  reranker: ${PODLINK_RERANK_MODEL_ID:-<pod_up.py default>}"
+  say "  max model len: ${PODLINK_MAX_MODEL_LEN:-32768} · gpu share: ${PODLINK_GPU_MEMORY_UTILIZATION:-0.70}"
   if [[ -n "${PODLINK_REGISTRY_AUTH_ID:-}" ]]; then say "  registry auth: set (private image)"; else say "  registry auth: none (public image)"; fi
   say ""
   if [[ -n "${PODLINK_NETWORK_VOLUME_ID}" ]]; then
