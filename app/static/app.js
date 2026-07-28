@@ -293,7 +293,7 @@ downBtn.addEventListener("click", () => {           // when POD DOWN is clicked
   if (!safe) {
     const ok = confirm(
       "No RunPod Network Volume is confirmed configured.\n\n" +
-      "POD DOWN will TERMINATE the pod and may DESTROY the ~36 GB of downloaded " +
+      "POD DOWN will TERMINATE the pod and may DESTROY the downloaded " +
       "model weights — the next POD UP would re-download them.\n\nTerminate anyway?"
     );
     if (!ok) return;                                // aborted; leave the button live
