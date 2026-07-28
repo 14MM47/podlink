@@ -103,6 +103,31 @@ def check(name, cond):
 
 
 # --- tests ------------------------------------------------------------------
+def test_gql_escape_env_makes_json_values_safe():
+    # runpod 1.7.13 interpolates env values into GraphQL unescaped; compact-JSON
+    # values (VLLM_EXTRA_ARGS) must be pre-escaped or create_pod dies instantly.
+    raw = {"VLLM_EXTRA_ARGS": '--limit-mm-per-prompt {"image":1,"video":0}',
+           "PLAIN": "no-quotes", "BACKSLASH": "a\\b"}
+    esc = rd.pod_up._gql_escape_env(raw)
+    check("quotes escaped for GraphQL",
+          esc["VLLM_EXTRA_ARGS"] == '--limit-mm-per-prompt {\\"image\\":1,\\"video\\":0}')
+    check("plain values untouched", esc["PLAIN"] == "no-quotes")
+    check("backslashes escaped first", esc["BACKSLASH"] == "a\\\\b")
+    check("escaped values survive the SDK's f-string as valid GraphQL",
+          all('"' not in v.replace('\\"', "").replace("\\\\", "") for v in esc.values()))
+
+
+def test_create_pod_once_sends_escaped_env():
+    import os
+    os.environ["PODLINK_VLLM_EXTRA_ARGS"] = '--x {"a":1}'
+    try:
+        pod = rd.pod_up.create_pod_once("gpu-id", "bearer", "hf", "tmpl-id")
+        check("create_pod received escaped env",
+              pod["env"]["VLLM_EXTRA_ARGS"] == '--x {\\"a\\":1}')
+    finally:
+        del os.environ["PODLINK_VLLM_EXTRA_ARGS"]
+
+
 def test_resolve_gpu_id_matches_rtx_pro_6000():
     gid = rd.pod_up.resolve_gpu_id()
     check("resolve_gpu_id -> RTX Pro 6000 id",
@@ -392,6 +417,8 @@ def test_create_non_retryable_error_surfaces():
 
 if __name__ == "__main__":
     print("driver smoke tests:")
+    test_gql_escape_env_makes_json_values_safe()
+    test_create_pod_once_sends_escaped_env()
     test_resolve_gpu_id_matches_rtx_pro_6000()
     test_resolve_gpu_id_raises_when_absent()
     test_all_ready_true_when_all_200()

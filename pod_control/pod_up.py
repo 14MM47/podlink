@@ -273,6 +273,19 @@ def _pod_env(bearer: str, hf: str) -> dict:
     return env
 
 
+def _gql_escape_env(env: dict) -> dict:
+    """Escape env values for the SDK's unescaped GraphQL interpolation.
+
+    runpod 1.7.13 builds the create-pod mutation with
+    f'{{ key: "{k}", value: "{v}" }}' (api/mutations/pods.py:118) — no escaping.
+    A value containing '"' or '\\' (e.g. compact JSON in VLLM_EXTRA_ARGS)
+    corrupts the query and the API rejects the create instantly. Pre-escaping
+    here makes the mutation valid and the pod receives the intended string.
+    Drop this if the pinned SDK ever escapes properly (it would double-escape).
+    """
+    return {k: str(v).replace("\\", "\\\\").replace('"', '\\"') for k, v in env.items()}
+
+
 def create_pod_once(gpu_type_id: str, bearer: str, hf: str, template_id: str) -> dict:
     """ONE create attempt from the bundled image. Raises QueryError (retryable via
     is_retryable_create_error, or a real error) on failure; returns the pod on
@@ -291,7 +304,7 @@ def create_pod_once(gpu_type_id: str, bearer: str, hf: str, template_id: str) ->
         container_disk_in_gb=CONTAINER_DISK_GB,
         volume_mount_path=VOLUME_MOUNT,
         ports=EXPOSED_PORT,               # "8000/http,8080/http,8081/http"
-        env=_pod_env(bearer, hf),
+        env=_gql_escape_env(_pod_env(bearer, hf)),
         support_public_ip=False,          # all traffic via RunPod's HTTPS proxy
         start_ssh=START_SSH,              # SSH for first-boot debug (PODLINK_START_SSH=0 to disable)
     )
