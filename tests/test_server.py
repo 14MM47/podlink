@@ -106,6 +106,75 @@ def test_env_and_test_guards():
     _reset()
 
 
+def test_profile_parsing_and_switching():
+    import tempfile
+
+    from app import profiles as pconf
+
+    with tempfile.TemporaryDirectory() as td:
+        pdir = Path(td) / "profiles"
+        pdir.mkdir()
+        (pdir / "alt.conf").write_text(
+            "# a comment line\n"
+            "export PODLINK_LLM_MODEL_ID=test/alt-model   # inline comment\n"
+            'export PODLINK_VLLM_EXTRA_ARGS="--limit-mm-per-prompt {\\"image\\":1} --enforce-eager"\n'
+            "export NOT_PODLINK=1\n"
+            "rm -rf /tmp/whatever   # arbitrary shell — must be ignored, never executed\n"
+            "export PODLINK_NETWORK_VOLUME_ID=none\n")
+
+        # --- parser: quoting survives, comments stripped, foreign keys dropped ---
+        parsed = pconf.parse_conf(pdir / "alt.conf")
+        check("parser: plain value + inline comment", parsed["PODLINK_LLM_MODEL_ID"] == "test/alt-model")
+        check("parser: quoted extra-args intact",
+              parsed["PODLINK_VLLM_EXTRA_ARGS"] == '--limit-mm-per-prompt {"image":1} --enforce-eager')
+        check("parser: non-PODLINK key dropped", "NOT_PODLINK" not in parsed)
+        check("parser: shell line ignored", len(parsed) == 3)
+
+        # --- routes, against a temp config dir (no saved volume id, no base conf) ---
+        saved = (pconf.PROFILE_DIR, pconf.BASE_CONF, pconf.VOL_FILE, dict(pconf.BASE_ENV))
+        pconf.PROFILE_DIR = pdir
+        pconf.BASE_CONF = Path(td) / "podlink.conf"
+        pconf.VOL_FILE = Path(td) / "network_volume_id"
+        try:
+            _reset()
+            check("/profiles without token -> 403", client.get("/profiles").status_code == 403)
+            listing = client.get("/profiles", headers=H).json()
+            check("/profiles lists the conf", listing["profiles"] == ["alt"])
+            check("select without token -> 403", client.post("/profile/select").status_code == 403)
+            check("select bad name -> 400",
+                  client.post("/profile/select", headers=H, json={"profile": "../evil"}).status_code == 400)
+            check("select unknown profile -> 404",
+                  client.post("/profile/select", headers=H, json={"profile": "nope"}).status_code == 404)
+
+            S.state = State.RUNNING
+            S.pod_id = "abc123def"
+            check("select while pod up -> 409",
+                  client.post("/profile/select", headers=H, json={"profile": "alt"}).status_code == 409)
+            S.state = State.ERROR                    # lingering pod id (unverified terminate)
+            check("select in ERROR with pod id -> 409",
+                  client.post("/profile/select", headers=H, json={"profile": "alt"}).status_code == 409)
+
+            _reset()
+            r = client.post("/profile/select", headers=H, json={"profile": "alt"})
+            check("select -> 200", r.status_code == 200)
+            check("snapshot shows the profile", r.json()["active_profile"] == "alt")
+            check("pod_up re-baked the model id",
+                  server.runpod_driver.pod_up.LLM_MODEL_ID == "test/alt-model")
+            check("volume sentinel 'none' -> empty", server.runpod_driver.pod_up.NETWORK_VOLUME_ID == "")
+            check("snapshot llm follows the switch",
+                  client.get("/status").json()["llm_model_id"] == "test/alt-model")
+
+            r = client.post("/profile/select", headers=H, json={})
+            check("select base -> 200, profile cleared", r.json()["active_profile"] is None)
+            check("model id back to the baseline",
+                  server.runpod_driver.pod_up.LLM_MODEL_ID != "test/alt-model")
+        finally:
+            pconf.PROFILE_DIR, pconf.BASE_CONF, pconf.VOL_FILE = saved[0], saved[1], saved[2]
+            pconf.BASE_ENV = saved[3]
+            client.post("/profile/select", headers=H, json={})  # re-bake from the real baseline
+            _reset()
+
+
 if __name__ == "__main__":
     print("server tests:")
     test_config_and_status()
@@ -115,4 +184,5 @@ if __name__ == "__main__":
     test_down_guard()
     test_keepalive_clears_deadline()
     test_env_and_test_guards()
+    test_profile_parsing_and_switching()
     print("all server tests passed.")

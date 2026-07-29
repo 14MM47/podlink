@@ -445,6 +445,13 @@
       <div class="brand"><h1>podlink</h1><span class="sub">pod control</span></div>
 
       <div class="selector">
+        <select id="profileSelect" disabled
+                title="Stack profile — applies to the next POD UP (switchable only while no pod exists)">
+          <option value="">base — no profile</option>
+        </select>
+      </div>
+
+      <div class="selector">
         <select id="podSelect" disabled>
           <option value="">Auto — create/resume the podlink pod</option>
         </select>

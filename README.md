@@ -144,10 +144,15 @@ a dedicated volume, or the sentinel `none` for a deliberately volume-less stack
 (weights re-download each POD UP; the console's red no-volume banner is expected
 in that mode, and `PODLINK_VOLUME_GB` should be sized to hold the weights).
 `PODLINK_PROFILE=<name>` in the environment does the same as `--profile`; the
-active profile and LLM are shown in the console and in `--check`. Switching
-stacks = POD DOWN, relaunch with the other profile, POD UP. Models are pod env,
-not image content — profiles never need an image rebuild, and same-image
+active profile and LLM are shown in the console and in `--check`. Models are pod
+env, not image content — profiles never need an image rebuild, and same-image
 profiles reuse the cached RunPod template.
+
+Switching stacks does not need a relaunch: the console's **profile dropdown**
+(above the pod selector) switches the active profile for the next POD UP.
+Profile confs are parsed (only `export PODLINK_*` lines are honoured), never
+executed, and the switch is only allowed while no pod exists — take the pod
+DOWN first. `--profile` at launch simply sets the initial selection.
 
 ## Pod image (build once)
 

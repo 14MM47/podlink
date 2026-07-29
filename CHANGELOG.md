@@ -3,6 +3,15 @@
 All notable changes to podlink are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow SemVer.
 
+## [Unreleased]
+
+### Added
+- **Profile switching from the console**: a profile dropdown above the pod
+  selector (`GET /profiles`, `POST /profile/select`) switches the active stack
+  for the NEXT POD UP without relaunching start.sh. Confs are parsed (shlex,
+  `export PODLINK_*` lines only), never executed; switching is allowed only
+  while no pod exists, and pod_up's constants are re-baked via module reload.
+
 ## [0.2.0] — 2026-07-28
 
 ### Added

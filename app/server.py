@@ -21,6 +21,7 @@ from pathlib import Path             # locate the static/ directory
 from fastapi import Body, FastAPI, Header, HTTPException, Request   # web framework primitives
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # response types
 
+from . import profiles as profiles_conf  # profile discovery + runtime switching
 from . import runpod_driver          # start()/stop() entry points
 from .session import PodSession, State  # the shared state machine
 
@@ -175,6 +176,46 @@ def pods(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
     except Exception as e:                            # noqa: BLE001
         # Type only in detail — str(e) could embed the API key.
         raise HTTPException(status_code=502, detail=f"pod list failed: {type(e).__name__}")
+
+
+@app.get("/profiles")
+def profiles_list(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+    """The available stack profiles (names only — conf contents never leave the server)."""
+    _require_token(x_podlink_token)                  # gated: enumerates local config
+    return JSONResponse({
+        "profiles": profiles_conf.list_profiles(),
+        "active": os.environ.get("PODLINK_PROFILE") or None,
+    })
+
+
+@app.post("/profile/select")
+def profile_select(profile: str | None = Body(default=None, embed=True),
+                   x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+    """Switch the stack profile for the NEXT pod launch (None/"" = base conf only).
+
+    Only allowed while no pod exists: a switch swaps the process PODLINK_* env
+    and re-bakes pod_up's constants, which would desync the volume guard, the
+    served-name health probes, and cost attribution for a pod already up or on
+    its way up. STARTING/RUNNING/STOPPING therefore 409, as does ERROR with a
+    lingering pod id (e.g. an unverified terminate).
+    """
+    _require_token(x_podlink_token)                  # CSRF/token gate
+    profile = profile or None                        # normalise "" -> None (base)
+    if profile is not None:
+        if not profiles_conf.valid_name(profile):    # reject path fragments etc.
+            raise HTTPException(status_code=400, detail="invalid profile name")
+        if not (profiles_conf.PROFILE_DIR / f"{profile}.conf").is_file():
+            raise HTTPException(status_code=404, detail="unknown profile")
+    if SESSION.state not in (State.IDLE, State.ERROR) or SESSION.pod_id:
+        raise HTTPException(status_code=409,
+                            detail="profile switch only available while no pod exists")
+    try:
+        profiles_conf.apply(profile)                 # swap env + reload pod_up constants
+    except Exception as e:  # noqa: BLE001 — apply() already rolled back
+        # Type only — a conf-parse/reload error message could embed local paths.
+        raise HTTPException(status_code=400, detail=f"profile apply failed: {type(e).__name__}")
+    SESSION.add_event(f"profile switched to {profile or 'base (no profile)'}", "system")
+    return JSONResponse(_snapshot())                 # active_profile/model/volume now updated
 
 
 @app.post("/pod/up")

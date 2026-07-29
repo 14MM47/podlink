@@ -8,6 +8,7 @@ const phaseEl = document.getElementById("phase");  // the progress line
 const errorEl = document.getElementById("error");  // the error line
 const metaEl = document.getElementById("meta");    // pod id / proxy url line
 const podSelect = document.getElementById("podSelect");  // target-pod dropdown
+const profileSelect = document.getElementById("profileSelect");  // stack-profile dropdown
 const refreshBtn = document.getElementById("refresh");   // reload-pod-list button
 const volwarn = document.getElementById("volwarn");      // "no Network Volume" banner
 const costEl = document.getElementById("cost");          // uptime + running cost line
@@ -67,6 +68,25 @@ async function loadPods() {
       podSelect.appendChild(o);
     }
     podSelect.value = cur;                          // restore selection if still present
+  } catch {}                                        // network hiccup — keep prior list
+}
+
+// Fetch the available stack profiles and (re)populate the dropdown, marking the
+// active one. Names only — the server never exposes conf contents.
+async function loadProfiles() {
+  if (!token) await loadToken();                    // need the token to call /profiles
+  try {
+    const r = await fetch("/profiles", { headers: { "X-Podlink-Token": token } });
+    if (!r.ok) return;                              // leave the base-only list on failure
+    const { profiles, active } = await r.json();
+    profileSelect.innerHTML = '<option value="">base — no profile</option>';
+    for (const name of profiles) {                  // one option per conf in profiles/
+      const o = document.createElement("option");
+      o.value = name;
+      o.textContent = `profile: ${name}`;
+      profileSelect.appendChild(o);
+    }
+    profileSelect.value = active || "";             // reflect the server's active profile
   } catch {}                                        // network hiccup — keep prior list
 }
 
@@ -216,6 +236,7 @@ function render(s) {
   // rebuild only when they change.
   const volKey = `${s.active_profile || ""}|${s.llm_model_id || ""}|${s.volume_id || ""}`;
   if (volKey !== mVol) {
+    profileSelect.value = s.active_profile || "";   // keep the dropdown in sync with the server
     const profileLine = s.active_profile
       ? `Profile: <b>${escapeHtml(s.active_profile)}</b> · ${escapeHtml(s.llm_model_id || "")}<br>`
       : "";
@@ -253,8 +274,10 @@ function render(s) {
   downBtn.disabled = !s.down_enabled;
   podSelect.disabled = !s.up_enabled;
   refreshBtn.disabled = !s.up_enabled;
+  // Mirrors the server's /profile/select guard: switchable only with no pod at all.
+  profileSelect.disabled = !s.up_enabled || !!s.pod_id;
   if (s.state !== lastState) {
-    if (s.up_enabled) loadPods();                   // IDLE or ERROR -> statuses may have changed
+    if (s.up_enabled) { loadPods(); loadProfiles(); }  // IDLE or ERROR -> lists may have changed
     lastState = s.state;
   }
 }
@@ -274,7 +297,7 @@ async function send(path, body) {
   if (!token) await loadToken();                    // ensure we have a token first
   const headers = { "X-Podlink-Token": token };
   if (body) headers["Content-Type"] = "application/json";
-  await fetch(path, {
+  return await fetch(path, {                        // callers may check .ok; most ignore it
     method: "POST",
     headers,
     body: body ? JSON.stringify(body) : undefined,
@@ -302,6 +325,16 @@ downBtn.addEventListener("click", () => {           // when POD DOWN is clicked
   send("/pod/down", { confirm: true });            // explicit confirmation for the server-side guard
 });
 refreshBtn.addEventListener("click", loadPods);     // manual pod-list refresh
+profileSelect.addEventListener("change", async () => {  // switch the stack profile
+  const chosen = profileSelect.value || null;       // "" = base (no profile)
+  profileSelect.disabled = true;                    // optimistic; SSE re-enables
+  let r = null;
+  try { r = await send("/profile/select", { profile: chosen }); } catch {}
+  if (!r || !r.ok) {                                // rejected (409/400) or network error
+    profileSelect.value = (lastSnap && lastSnap.active_profile) || "";  // snap back
+    profileSelect.disabled = false;                 // no snapshot change will re-enable it
+  }
+});
 keepaliveBtn.addEventListener("click", () => {      // cancel the pending auto-terminate
   keepaliveBtn.disabled = true;                     // optimistic; SSE re-enables on next frame
   send("/pod/keepalive");
@@ -329,5 +362,5 @@ function connect() {
   };
 }
 
-// Get the token, load the pod list, then start the live status stream.
-loadToken().then(() => { loadPods(); connect(); });
+// Get the token, load the pod + profile lists, then start the live status stream.
+loadToken().then(() => { loadPods(); loadProfiles(); connect(); });
