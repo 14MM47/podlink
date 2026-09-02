@@ -182,6 +182,10 @@ class RunPodProvider:
     def ensure_access(self, instance_id: str) -> None:
         """No-op: the proxy URLs need nothing opened locally."""
 
+    def access_events(self) -> list[str]:
+        """No-op: there is no access process to report on."""
+        return []
+
     def release_access(self) -> None:
         """No-op: nothing was opened, so nothing leaks."""
 

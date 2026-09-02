@@ -167,6 +167,15 @@ class Provider(Protocol):
         can reach is not up.
         """
 
+    def access_events(self) -> list[str]:
+        """Messages from the access layer since the last call, for the event feed.
+
+        A cloud whose access path is a supervised process (a tunnel) reports
+        its transitions — up, dropped, restored, given up — here; the driver
+        drains this on every health pass. Clouds with nothing to report return
+        an empty list. Must be cheap and must not raise.
+        """
+
     def release_access(self) -> None:
         """Tear down whatever ensure_access opened. Idempotent; must never raise.
 

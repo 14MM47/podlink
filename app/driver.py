@@ -143,6 +143,7 @@ def start(session: PodSession) -> None:
             if not _wait_for_running(session, pod_id):    # poll until RUNNING (or cancel)
                 return
             provider.ensure_access(pod_id)                # open the local path, if any
+            _drain_access_events(session, provider)
             # An arbitrary instance may not serve /v1/models, so RUNNING is 'up'
             # here; skip the readiness probe and write_state (both assume the
             # podlink stack).
@@ -177,6 +178,7 @@ def start(session: PodSession) -> None:
         # created, so create_once() is the one place this must NOT live.
         session.update(phase="opening the access path")
         provider.ensure_access(pod_id)
+        _drain_access_events(session, provider)           # "tunnel: llm -> 127.0.0.1:18000 up"
 
         urls = provider.service_urls(pod_id)              # llm/embedder/reranker base URLs
         session.update(proxy_url=urls["llm"],             # primary URL
@@ -297,6 +299,17 @@ def _probe_service(url: str, headers: dict) -> bool:
         return False
 
 
+def _drain_access_events(session: PodSession, provider) -> None:
+    """Move the access layer's transitions (tunnel up / dropped / restored) into
+    the health feed, so a dropped tunnel is explained next to the tiles it
+    turns red — rather than looking like a crashed service."""
+    try:
+        for msg in provider.access_events():
+            session.add_event(msg, "health")
+    except Exception:  # noqa: BLE001 — reporting must never break a health pass
+        pass
+
+
 def _apply_health(session: PodSession, statuses: dict) -> None:
     """Write per-service statuses onto the session, logging each transition to the
     event feed (so the tiles and the streamed feed stay in sync)."""
@@ -311,6 +324,7 @@ def probe_health_once(session: PodSession, pod_id: str) -> None:
     """Probe all three services once and update the health tiles — used by the
     background poller while RUNNING (healthy | down)."""
     bearer = read_secret(_secrets.bearer_token)
+    _drain_access_events(session, active_provider())     # tunnel transitions first
     probes = _service_probes(pod_id, bearer)
     statuses = {name: ("healthy" if _probe_service(url, headers) else "down")
                 for name, (url, headers) in probes.items()}
@@ -422,6 +436,7 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
             if _probe_service(url, headers):             # this service is serving
                 ready.add(name)
         # Reflect per-service health onto the tiles (healthy vs still pending).
+        _drain_access_events(session, active_provider())
         _apply_health(session, {n: ("healthy" if n in ready else "pending") for n in probes})
         if len(ready) == len(probes):                    # all three healthy
             session.update(phase="all services healthy")

@@ -5,8 +5,8 @@ What is different from RunPod, and why it is shaped this way:
   * The compute unit is a Compute Engine instance identified by (zone, name);
     the id the driver carries is "zone/name".
   * There is no public proxy. The VM has NO external IP. Reaching its ports is
-    the provider's job (ensure_access): IAP tunnels to loopback by default
-    (Phase 4), or the internal address when the client shares the VPC.
+    the provider's job (ensure_access): supervised IAP tunnels to loopback by
+    default (tunnel.py), or the internal address when the client shares the VPC.
   * Persistence is a Hyperdisk attached with autoDelete=false; a ZONAL disk
     pins the VM to its zone, a REGIONAL (HA) one lets create rotate zones.
   * Secrets never enter instance metadata. They are synced to Secret Manager
@@ -28,6 +28,7 @@ from ... import stack as stack_contract
 from . import bootstrap
 from .api import AdcTokenSource, GcpApi, GcpApiError
 from .config import GcpConfig, from_env
+from .tunnel import TunnelManager
 
 # Instance ids the driver hands back: "<zone>/<name>", both RFC1035-ish.
 _INSTANCE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}/[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$")
@@ -49,10 +50,12 @@ class GcpProvider:
     name = "gcp"
     create_error_types = (GcpApiError,)
 
-    def __init__(self, api: GcpApi | None = None) -> None:
+    def __init__(self, api: GcpApi | None = None, tunnel_factory=None) -> None:
         self.cfg: GcpConfig = from_env()
         self._api = api                     # injected in tests; built by authenticate()
         self._internal_ip: str | None = None   # resolved by ensure_access in internal mode
+        self._tunnel_factory = tunnel_factory or TunnelManager   # injected in tests
+        self._tunnels: TunnelManager | None = None               # live IAP tunnels, iap mode
 
     # --- configuration -----------------------------------------------------
 
@@ -297,6 +300,13 @@ class GcpProvider:
     # --- access lifecycle ---------------------------------------------------
 
     def ensure_access(self, instance_id: str) -> None:
+        """Open the local path to the instance's ports. Idempotent.
+
+        internal: resolve and remember the VPC address (the client is on the
+        VPC; nothing to open). iap: start — or re-verify — three supervised
+        gcloud tunnels bound to loopback, one per service port. Called on both
+        the create and the adopt paths, right after RUNNING.
+        """
         if self.cfg.access == "internal":
             inst = self.get_instance(instance_id)
             nics = (inst or {}).get("networkInterfaces") or []
@@ -305,14 +315,24 @@ class GcpProvider:
                 raise RuntimeError("instance has no internal address yet")
             self._internal_ip = ip
             return
-        # Phase 4: the supervised IAP tunnel manager lands here. Until then a
-        # launch in iap mode fails loudly at this exact point rather than
-        # pretending the ports are reachable.
-        raise RuntimeError("PODLINK_GCP_ACCESS=iap: the IAP tunnel manager is not implemented yet "
-                           "(Phase 4) — use PODLINK_GCP_ACCESS=internal from a host on the VPC")
+        if self._tunnels is not None and self._tunnels.instance_id != instance_id:
+            self._tunnels.release()                      # tunnels to a different instance
+            self._tunnels = None
+        if self._tunnels is None:
+            zone, name = self._split(instance_id)
+            ports = {svc: (stack_contract.SERVICE_PORTS[svc], local)
+                     for svc, local in self.cfg.local_ports.items()}
+            self._tunnels = self._tunnel_factory(self.cfg.project, zone, name, ports)
+        self._tunnels.ensure()                           # proves each port is listening
+
+    def access_events(self) -> list[str]:
+        return self._tunnels.drain_events() if self._tunnels is not None else []
 
     def release_access(self) -> None:
-        self._internal_ip = None             # nothing to close until Phase 4's tunnels
+        self._internal_ip = None
+        if self._tunnels is not None:
+            tunnels, self._tunnels = self._tunnels, None
+            tunnels.release()                            # idempotent, never raises
 
     # --- endpoints + local state -------------------------------------------
 

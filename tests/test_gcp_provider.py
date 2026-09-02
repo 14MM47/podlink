@@ -354,12 +354,84 @@ def test_access_modes():
               p.service_urls("europe-west2-b/podlink") == {"llm": "http://127.0.0.1:18000",
                                                             "embedder": "http://127.0.0.1:18080",
                                                             "reranker": "http://127.0.0.1:18081"})
-        raised = ""
-        try:
-            p.ensure_access("europe-west2-b/podlink")
-        except RuntimeError as e:
-            raised = str(e)
-        check("iap: ensure_access fails loudly until Phase 4", "Phase 4" in raised)
+
+
+class FakeTunnels:
+    """Stands in for TunnelManager: records construction, ensure/release, and
+    hands back scripted events."""
+    made: list = []
+
+    def __init__(self, project, zone, instance, ports):
+        self.project, self.zone, self.instance, self.ports = project, zone, instance, ports
+        self.instance_id = f"{zone}/{instance}"
+        self.ensured = 0
+        self.released = 0
+        self.events = [f"tunnel: llm -> 127.0.0.1:{ports['llm'][1]} up"]
+        FakeTunnels.made.append(self)
+
+    def ensure(self):
+        self.ensured += 1
+
+    def release(self):
+        self.released += 1
+
+    def drain_events(self):
+        out, self.events = self.events, []
+        return out
+
+
+def test_iap_access_supervises_tunnels_through_the_factory():
+    FakeTunnels.made.clear()
+    with gcp() as (p, api):
+        p._tunnel_factory = FakeTunnels
+        p.ensure_access("europe-west2-b/podlink")
+        t = FakeTunnels.made[0]
+        check("tunnels built for the instance in its zone/project",
+              (t.project, t.zone, t.instance) == ("proj-1", "europe-west2-b", "podlink"))
+        check("service ports mapped remote -> local",
+              t.ports == {"llm": (8000, 18000), "embedder": (8080, 18080), "reranker": (8081, 18081)})
+        check("ensure() called", t.ensured == 1)
+        check("access events surface to the driver", p.access_events() == ["tunnel: llm -> 127.0.0.1:18000 up"])
+        check("drained once", p.access_events() == [])
+        p.ensure_access("europe-west2-b/podlink")
+        check("same instance: re-ensured, not rebuilt", len(FakeTunnels.made) == 1 and t.ensured == 2)
+        p.ensure_access("europe-west2-c/podlink")
+        check("different instance: old released, new built",
+              t.released == 1 and len(FakeTunnels.made) == 2 and FakeTunnels.made[1].zone == "europe-west2-c")
+        p.release_access()
+        check("release_access releases and forgets", FakeTunnels.made[1].released == 1 and p._tunnels is None)
+        check("release is safe with nothing open", p.release_access() is None and p.access_events() == [])
+
+
+def test_driver_drains_tunnel_events_on_both_start_paths():
+    # The adopt path never creates, so the tunnel events must be drained there too.
+    FakeTunnels.made.clear()
+    saved = rd.egress_logger.client
+    import contextlib as _cl
+
+    @_cl.contextmanager
+    def ok_client(timeout=15.0):
+        class _C:
+            def get(self, url, headers=None):
+                class R: status_code = 200
+                return R()
+        yield _C()
+    rd.egress_logger.client = ok_client
+    try:
+        with gcp() as (p, api):
+            p._tunnel_factory = FakeTunnels
+            api.instances[("europe-west2-b", "podlink")] = {"name": "podlink", "status": "RUNNING",
+                                                           "zone": "projects/proj-1/zones/europe-west2-b"}
+            s = PodSession(); s.try_begin_start(None)      # Auto -> adopts the running instance
+            rd.start(s)
+            check("adopt path reached RUNNING through the tunnels", s.snapshot()["state"] == "RUNNING")
+            check("tunnel 'up' event landed in the health feed",
+                  any(c == "health" and m.startswith("tunnel:") for _, c, m in s.events))
+            s.try_begin_stop(); rd.stop(s)
+            check("stop released the tunnels", FakeTunnels.made[0].released == 1)
+    finally:
+        rd.egress_logger.client = saved
+        prov_mod.STATE_PATH.unlink(missing_ok=True)
 
 
 def test_instance_id_shape_and_status_predicates():
@@ -569,6 +641,8 @@ if __name__ == "__main__":
     test_terminate_delete_then_verify()
     test_terminate_stop_action()
     test_access_modes()
+    test_iap_access_supervises_tunnels_through_the_factory()
+    test_driver_drains_tunnel_events_on_both_start_paths()
     test_instance_id_shape_and_status_predicates()
     test_bootstrap_script_has_no_secrets()
     test_preflight_reports_missing_credentials_and_config()

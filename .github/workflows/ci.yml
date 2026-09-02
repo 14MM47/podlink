@@ -27,5 +27,6 @@ jobs:
           python tests/test_siloing.py
           python tests/test_driver_smoke.py
           python tests/test_gcp_provider.py
+          python tests/test_gcp_tunnel.py
           python tests/test_session.py
           python tests/test_server.py
