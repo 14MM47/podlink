@@ -148,6 +148,13 @@ GCP provider (`PODLINK_PROVIDER=gcp`; the shared `PODLINK_*` stack settings abov
 | `PODLINK_GCP_KMS_KEY` | *(Google-managed)* | CMEK key resource name for both disks. |
 | `PODLINK_GCP_SECRET_PREFIX` | `podlink` | Secret Manager names `<prefix>-bearer`, `<prefix>-hf-token`, synced before each create. |
 | `PODLINK_GCP_COST_PER_HR` | *(blank meter)* | Hourly rate for the cost meter — GCP reports none on the instance. |
+| `PODLINK_GCP_ALLOWED_REGIONS` | `europe-west2` | Zones outside these regions are refused at config time — residency enforced in code until the project is under an org policy. |
+| `PODLINK_GCP_HARDENING` | `strict` | `strict` refuses to create a VM without CMEK, a dedicated service account and an in-region image, and fails preflight if logs are not regional. `relaxed` downgrades those to warnings — experiments on non-sensitive data only. |
+
+One-time project setup (regional log bucket, KMS key, VM identity, secrets, registry, firewall,
+data disk, optional budget): `deploy/gcp/setup.sh`. The project is expected to start without an
+organization and be migrated into an Assured Workloads folder later — `deploy/gcp/MIGRATION.md`
+is that checklist, and the hardening above is what keeps the migration an afternoon.
 
 ### Profiles — switching between whole stacks
 

@@ -69,6 +69,24 @@ class GcpConfig:
     cost_per_hr: float | None  # for the meter — GCP does not report a rate on the instance
     image: str                 # container image (the Artifact Registry mirror)
     stack: dict                # the image's env contract (app/stack.py)
+    # Residency + hardening posture. These exist because the project starts
+    # STANDALONE (no organization, so no org policies) and is migrated into an
+    # Assured Workloads folder later: until then, everything the platform would
+    # enforce has to be enforced HERE, or it is not enforced at all.
+    allowed_regions: tuple[str, ...]   # every resource must be in one of these
+    hardening: str             # strict (default): CMEK + dedicated SA + in-region image are REQUIRED
+                               # relaxed: the same checks downgrade to warnings (experiments only)
+
+    @property
+    def strict(self) -> bool:
+        return self.hardening == "strict"
+
+    @property
+    def image_in_region(self) -> bool:
+        """True when the container image is served from Artifact Registry in an
+        allowed region (host looks like <region>-docker.pkg.dev)."""
+        host = self.image.split("/", 1)[0] if "/" in self.image else ""
+        return host.endswith("-docker.pkg.dev") and host[: -len("-docker.pkg.dev")] in self.allowed_regions
 
     @property
     def secret_names(self) -> dict[str, str]:
@@ -100,6 +118,11 @@ def from_env() -> GcpConfig:
     region = zones[0].rsplit("-", 1)[0]                      # europe-west2-b -> europe-west2
     if any(z.rsplit("-", 1)[0] != region for z in zones):
         raise ValueError("PODLINK_GCP_ZONES must all be in one region (a regional disk spans one region)")
+    allowed = tuple(r.strip() for r in os.environ.get("PODLINK_GCP_ALLOWED_REGIONS", "europe-west2").split(",")
+                    if r.strip())
+    if region not in allowed:                                 # residency is enforced in code, not by policy
+        raise ValueError(f"PODLINK_GCP_ZONES are in {region}, outside PODLINK_GCP_ALLOWED_REGIONS "
+                         f"({', '.join(allowed)}) — UK residency is enforced here until the org migration")
     ports_raw = os.environ.get("PODLINK_GCP_LOCAL_PORTS", "18000,18080,18081").split(",")
     if len(ports_raw) != 3:
         raise ValueError("PODLINK_GCP_LOCAL_PORTS needs three ports: llm,embedder,reranker")
@@ -133,4 +156,6 @@ def from_env() -> GcpConfig:
         cost_per_hr=_float_or_none("PODLINK_GCP_COST_PER_HR"),
         image=(os.environ.get("PODLINK_GCP_IMAGE", "").strip() or stack["image"] or ""),
         stack=stack,
+        allowed_regions=allowed,
+        hardening=_choice("PODLINK_GCP_HARDENING", "strict", ("strict", "relaxed")),
     )

@@ -26,6 +26,7 @@ from ...vendored import egress_logger
 
 COMPUTE = "https://compute.googleapis.com/compute/v1"
 SECRETS = "https://secretmanager.googleapis.com/v1"
+LOGGING = "https://logging.googleapis.com/v2"
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 # Operation error codes that mean "no capacity right now" — a failed insert
@@ -165,6 +166,17 @@ class GcpApi:
             raise GcpApiError(first.get("message") or first.get("code") or "operation failed",
                               code=first.get("code"))
         return current
+
+    # --- logging (residency check only) -------------------------------------
+
+    def get_log_sink(self, name: str = "_Default") -> dict | None:
+        """The project's log sink — its `destination` says where logs land.
+
+        A standalone project's _Default bucket is GLOBAL; the preflight checks
+        the sink has been re-routed to a regional bucket (deploy/gcp/setup.sh
+        does that), because log entries cannot be moved after the fact.
+        """
+        return self._request("GET", f"{LOGGING}/projects/{self.project}/sinks/{name}", none_on_404=True)
 
     # --- secret manager ----------------------------------------------------
 

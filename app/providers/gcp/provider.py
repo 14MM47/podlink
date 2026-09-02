@@ -71,26 +71,46 @@ class GcpProvider:
         }
 
     def preflight(self) -> list[tuple[str, str]]:
-        """What would stop a launch on GCP, checked without spending anything."""
+        """What would stop a launch on GCP, checked without spending anything.
+
+        In `strict` hardening (the default) the residency and encryption checks
+        are hard failures, because a standalone project has no organization
+        policy to enforce them — this preflight and instance_body() ARE the
+        enforcement until the org migration. `relaxed` downgrades them to
+        warnings for experiments on non-sensitive data.
+        """
         c, rows = self.cfg, []
+        must = "fail" if c.strict else "warn"
+        rows.append(("info", f"hardening: {c.hardening}"
+                             + (" — CMEK, dedicated identity and in-region image are required" if c.strict
+                                else " — residency/encryption gaps are WARNINGS; not for client data")))
         rows.append(("ok" if c.project else "fail",
                      f"PODLINK_GCP_PROJECT = {c.project}" if c.project else "PODLINK_GCP_PROJECT not set"))
+        tokens = None
         try:
-            AdcTokenSource().token()
+            tokens = AdcTokenSource()
+            tokens.token()
             rows.append(("ok", "Application Default Credentials present"))
         except ImportError:
+            tokens = None
             rows.append(("fail", "google-auth not installed — pip install -r requirements-gcp.txt"))
         except Exception as e:  # noqa: BLE001 — the message is the finding
+            tokens = None
             rows.append(("fail", f"credentials: {e}"))
+        rows.append(("ok", f"residency: zones {', '.join(c.zones)} within allowed regions "
+                           f"{', '.join(c.allowed_regions)} (enforced by config)"))
         rows.append(("ok" if c.boot_image else "fail",
                      f"boot image: {c.boot_image}" if c.boot_image
                      else "PODLINK_GCP_BOOT_IMAGE not set (the golden image — see pod_image/gcp)"))
-        rows.append(("ok" if c.image else "fail",
-                     f"container image: {c.image}" if c.image else "PODLINK_GCP_IMAGE / PODLINK_IMAGE not set"))
-        if c.image and not c.image.split("/", 1)[0].endswith("pkg.dev"):
-            rows.append(("warn", "container image is not in Artifact Registry — the VM will pull cross-region "
-                                 "and needs registry credentials it does not have"))
-        rows.append(("info", f"zones: {', '.join(c.zones)} · {c.machine_type} · "
+        if not c.image:
+            rows.append(("fail", "PODLINK_GCP_IMAGE / PODLINK_IMAGE not set"))
+        elif c.image_in_region:
+            rows.append(("ok", f"container image in-region: {c.image}"))
+        else:
+            rows.append((must, f"container image is NOT in an in-region Artifact Registry ({c.image}) — "
+                               "the VM would pull cross-region without credentials; mirror it "
+                               "(deploy/gcp/setup.sh --mirror)"))
+        rows.append(("info", f"{c.machine_type} · "
                              f"{'confidential (SEV + GPU TEE)' if c.confidential else 'NOT confidential'} · "
                              f"{c.provisioning_model.lower()}"))
         if c.data_disk:
@@ -99,13 +119,31 @@ class GcpProvider:
         else:
             rows.append(("warn", f"persistence: none — scratch disk ({c.volume_gb} GB) destroyed on POD DOWN; "
                                  "weights and the container image re-download each launch"))
-        rows.append(("ok" if c.kms_key else "warn",
+        rows.append(("ok" if c.kms_key else must,
                      "disks: customer-managed key (CMEK)" if c.kms_key
-                     else "disks: Google-managed keys — set PODLINK_GCP_KMS_KEY for CMEK"))
-        rows.append(("ok" if c.service_account else "warn",
+                     else "disks would use Google-managed keys — set PODLINK_GCP_KMS_KEY (a disk's key cannot "
+                          "be changed later; CMEK from day one is what makes the org migration clean)"))
+        rows.append(("ok" if c.service_account else must,
                      f"VM identity: {c.service_account}" if c.service_account
-                     else "VM identity: the project's DEFAULT compute service account — over-privileged; "
-                          "set PODLINK_GCP_SERVICE_ACCOUNT"))
+                     else "VM identity would be the project's DEFAULT compute service account — over-privileged; "
+                          "set PODLINK_GCP_SERVICE_ACCOUNT (deploy/gcp/setup.sh creates one)"))
+        # Logs: a standalone project's _Default bucket is global. Entries cannot
+        # be moved later, so the sink must already point at a regional bucket.
+        api = self._api or (GcpApi(c.project, tokens) if (tokens and c.project) else None)
+        if api is None:
+            rows.append(("info", "logs: cannot check the _Default sink without credentials + project"))
+        else:
+            try:
+                sink = api.get_log_sink("_Default") or {}
+                dest = sink.get("destination", "")
+                if any(f"/locations/{r}/" in dest for r in c.allowed_regions):
+                    rows.append(("ok", f"logs: _Default routed to a regional bucket ({dest.rsplit('/', 1)[-1]})"))
+                else:
+                    rows.append((must, f"logs: _Default sink is {dest or 'the global default bucket'} — "
+                                       "run deploy/gcp/setup.sh to route it to a regional bucket; "
+                                       "entries written before that cannot be moved"))
+            except Exception as e:  # noqa: BLE001 — a permissions problem is itself the finding
+                rows.append(("warn", f"logs: could not read the _Default sink ({type(e).__name__})"))
         rows.append(("ok" if c.max_run_hours else "warn",
                      f"kill switch: VM self-deletes after {c.max_run_hours:g} h" if c.max_run_hours
                      else "kill switch OFF (PODLINK_GCP_MAX_RUN_HOURS=0)"))
@@ -324,6 +362,17 @@ class GcpProvider:
         """The instances.insert body. Every security property lives here, and
         tests/test_gcp_provider.py asserts each one — change with care."""
         cfg = self.cfg
+        if cfg.strict:
+            # No org policy backs these yet, so the refusal lives here. A relaxed
+            # profile may skip them — for experiments on non-sensitive data only.
+            missing = [what for ok, what in (
+                (cfg.kms_key, "PODLINK_GCP_KMS_KEY (CMEK on both disks)"),
+                (cfg.service_account, "PODLINK_GCP_SERVICE_ACCOUNT (dedicated VM identity)"),
+                (cfg.image_in_region, "an in-region Artifact Registry image (PODLINK_GCP_IMAGE)"),
+            ) if not ok]
+            if missing:
+                raise ValueError("strict hardening refuses to create the VM without: " + "; ".join(missing)
+                                 + " — set PODLINK_GCP_HARDENING=relaxed only for non-sensitive experiments")
         project = cfg.project
         disk_type = f"zones/{zone}/diskTypes/hyperdisk-balanced"    # the ONLY boot type G4 accepts
         boot = {

@@ -102,6 +102,12 @@ class FakeApi:
         self.calls.append(("secret_get", name))
         return self.secrets.get(name)
 
+    log_sink_destination = "logging.googleapis.com/projects/proj-1/locations/europe-west2/buckets/podlink-europe-west2"
+
+    def get_log_sink(self, name="_Default"):
+        self.calls.append(("log_sink", name))
+        return {"name": name, "destination": self.log_sink_destination}
+
     def secret_put(self, name, value, location):
         self.calls.append(("secret_put", name, location))
         self.secrets[name] = value
@@ -119,12 +125,14 @@ def gcp(**overrides):
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
-    api = FakeApi()
-    p = GcpProvider(api=api)
-    if p.cfg.project:                       # a missing-project case tests preflight, not auth
-        p.authenticate()
-    providers._ACTIVE, providers._ACTIVE_NAME = p, "gcp"
     try:
+        # Construction can raise (config validation is part of what is tested);
+        # the env must be restored either way, so it lives inside the try.
+        api = FakeApi()
+        p = GcpProvider(api=api)
+        if p.cfg.project:                   # a missing-project case tests preflight, not auth
+            p.authenticate()
+        providers._ACTIVE, providers._ACTIVE_NAME = p, "gcp"
         yield p, api
     finally:
         providers._ACTIVE, providers._ACTIVE_NAME = saved_active
@@ -392,11 +400,82 @@ def test_preflight_reports_missing_credentials_and_config():
         with gcp(PODLINK_GCP_KMS_KEY=None, PODLINK_GCP_SERVICE_ACCOUNT=None) as (p, api):
             rows = dict((m.split(":")[0], lvl) for lvl, m in p.preflight())
             check("missing ADC is a hard failure", rows.get("credentials") == "fail")
-            check("Google-managed keys is a warning", any(k.startswith("disks") and v == "warn" for k, v in rows.items()))
-            check("default compute SA is a warning", any(k.startswith("VM identity") and v == "warn" for k, v in rows.items()))
+            check("strict: Google-managed keys FAIL", any(k.startswith("disks") and v == "fail" for k, v in rows.items()))
+            check("strict: default compute SA FAILS", any(k.startswith("VM identity") and v == "fail" for k, v in rows.items()))
+        with gcp(PODLINK_GCP_KMS_KEY=None, PODLINK_GCP_SERVICE_ACCOUNT=None,
+                 PODLINK_GCP_HARDENING="relaxed") as (p, api):
+            rows = dict((m.split(":")[0], lvl) for lvl, m in p.preflight())
+            check("relaxed: the same gaps are warnings",
+                  any(k.startswith("disks") and v == "warn" for k, v in rows.items())
+                  and any(k.startswith("VM identity") and v == "warn" for k, v in rows.items()))
         with gcp(PODLINK_GCP_PROJECT=None) as (p, api):
             check("missing project is a hard failure",
                   any(lvl == "fail" and "PODLINK_GCP_PROJECT" in m for lvl, m in p.preflight()))
+    finally:
+        prov_mod.AdcTokenSource = saved
+
+
+def test_residency_is_enforced_in_config():
+    # No org policy exists on a standalone project, so the config refuses zones
+    # outside the allowed regions instead of quietly creating a VM in Iowa.
+    raised = ""
+    try:
+        with gcp(PODLINK_GCP_ZONES="us-central1-a"):
+            pass
+    except ValueError as e:
+        raised = str(e)
+    check("zones outside PODLINK_GCP_ALLOWED_REGIONS are refused", "outside" in raised and "us-central1" in raised)
+    with gcp(PODLINK_GCP_ZONES="europe-west4-a", PODLINK_GCP_ALLOWED_REGIONS="europe-west2,europe-west4") as (p, api):
+        check("an explicitly allowed second region is accepted", p.cfg.region == "europe-west4")
+    with gcp() as (p, api):
+        check("in-region Artifact Registry image recognised", p.cfg.image_in_region)
+    with gcp(PODLINK_GCP_IMAGE="ghcr.io/x/y:1") as (p, api):
+        check("ghcr image is not in-region", not p.cfg.image_in_region)
+    with gcp(PODLINK_GCP_IMAGE="us-central1-docker.pkg.dev/proj-1/r/y:1") as (p, api):
+        check("out-of-region Artifact Registry is not in-region either", not p.cfg.image_in_region)
+
+
+def test_strict_hardening_refuses_an_unhardened_create():
+    # instance_body() is the enforcement point: preflight can be skipped, this cannot.
+    for missing, override, expect in (
+        ("CMEK", {"PODLINK_GCP_KMS_KEY": None}, "KMS_KEY"),
+        ("dedicated SA", {"PODLINK_GCP_SERVICE_ACCOUNT": None}, "SERVICE_ACCOUNT"),
+        ("in-region image", {"PODLINK_GCP_IMAGE": "ghcr.io/x/y:1"}, "in-region"),
+    ):
+        with gcp(**override) as (p, api):
+            raised = ""
+            try:
+                p.instance_body("europe-west2-b")
+            except ValueError as e:
+                raised = str(e)
+            check(f"strict refuses to build without {missing}", expect in raised)
+    with gcp(PODLINK_GCP_KMS_KEY=None, PODLINK_GCP_SERVICE_ACCOUNT=None, PODLINK_GCP_IMAGE="ghcr.io/x/y:1",
+             PODLINK_GCP_HARDENING="relaxed") as (p, api):
+        body = p.instance_body("europe-west2-b")
+        check("relaxed builds the body (Google-managed keys, default SA)",
+              "diskEncryptionKey" not in json.dumps(body) and "serviceAccounts" not in body)
+        check("relaxed still has no external IP and is still confidential",
+              "accessConfigs" not in json.dumps(body) and "confidentialInstanceConfig" in body)
+
+
+def test_preflight_checks_the_log_sink_is_regional():
+    class Tok:
+        def token(self): return "tok"
+    saved = prov_mod.AdcTokenSource
+    prov_mod.AdcTokenSource = Tok
+    try:
+        with gcp() as (p, api):
+            rows = p.preflight()
+            logs = [(lvl, m) for lvl, m in rows if m.startswith("logs:")]
+            check("regional _Default sink is ok", logs and logs[0][0] == "ok")
+            api.log_sink_destination = "logging.googleapis.com/projects/proj-1/locations/global/buckets/_Default"
+            logs = [(lvl, m) for lvl, m in p.preflight() if m.startswith("logs:")]
+            check("global _Default sink FAILS under strict", logs and logs[0][0] == "fail")
+            check("hardening row names the posture", any("hardening: strict" in m for _, m in rows))
+        with gcp(PODLINK_GCP_HARDENING="relaxed") as (p, api):
+            api.log_sink_destination = "logging.googleapis.com/projects/proj-1/locations/global/buckets/_Default"
+            logs = [(lvl, m) for lvl, m in p.preflight() if m.startswith("logs:")]
+            check("global _Default sink is a warning under relaxed", logs and logs[0][0] == "warn")
     finally:
         prov_mod.AdcTokenSource = saved
 
@@ -493,6 +572,9 @@ if __name__ == "__main__":
     test_instance_id_shape_and_status_predicates()
     test_bootstrap_script_has_no_secrets()
     test_preflight_reports_missing_credentials_and_config()
+    test_residency_is_enforced_in_config()
+    test_strict_hardening_refuses_an_unhardened_create()
+    test_preflight_checks_the_log_sink_is_regional()
     test_registry_builds_gcp_provider()
     test_api_error_parsing_and_operation_wait()
     print("all gcp provider tests passed.")

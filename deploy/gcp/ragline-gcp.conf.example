@@ -1,0 +1,41 @@
+# Example profile for the GCP provider — copy to ~/.config/podlink/profiles/<name>.conf
+# and launch with `./start.sh --profile <name>` (or pick it in the console).
+#
+# The shared stack settings (models, sizing, PODLINK_IMAGE) come from the base
+# podlink.conf exactly as they do for RunPod; only the cloud changes here.
+# deploy/gcp/setup.sh prints a block with the real values for your project.
+
+export PODLINK_PROVIDER=gcp
+export PODLINK_GCP_PROJECT=ragline-uk-spike
+export PODLINK_GCP_ZONES=europe-west2-b,europe-west2-c
+
+# The golden boot image built in Phase 2 (Ubuntu 24.04 + driver 580 + container toolkit).
+export PODLINK_GCP_BOOT_IMAGE=projects/ragline-uk-spike/global/images/family/podlink-g4
+# The container image, mirrored in-region (setup.sh --mirror). Strict hardening
+# refuses a cross-region or credentialed pull.
+export PODLINK_GCP_IMAGE=europe-west2-docker.pkg.dev/ragline-uk-spike/podlink/ragline-pod:2026-07b
+
+# Persistence: the CMEK Hyperdisk holding Docker's data-root + the HF cache.
+# A zonal disk pins the VM to europe-west2-b; use scope=regional (Hyperdisk
+# Balanced HA, ~2x storage cost) to allow b<->c rotation on stockout.
+export PODLINK_GCP_DATA_DISK=podlink-data
+export PODLINK_GCP_DATA_DISK_SCOPE=zonal
+
+# Hardening — all required under strict (the default). setup.sh creates them.
+export PODLINK_GCP_KMS_KEY=projects/ragline-uk-spike/locations/europe-west2/keyRings/podlink/cryptoKeys/disks
+export PODLINK_GCP_SERVICE_ACCOUNT=podlink-vm@ragline-uk-spike.iam.gserviceaccount.com
+export PODLINK_GCP_HARDENING=strict
+
+# Confidential VM (AMD SEV + NVIDIA GPU TEE) and the platform-side kill switch.
+export PODLINK_GCP_CONFIDENTIAL=1
+export PODLINK_GCP_MAX_RUN_HOURS=8
+
+# Access: iap = loopback tunnels (Phase 4); internal = the VPC address.
+export PODLINK_GCP_ACCESS=iap
+
+# The meter: on-demand g4-standard-48 in London + the NVIDIA CC licence once priced.
+export PODLINK_GCP_COST_PER_HR=5.40
+
+# For the ingest / bulk lane, copy this file and change:
+#   export PODLINK_GCP_PROVISIONING=spot
+#   export PODLINK_GCP_COST_PER_HR=2.10
