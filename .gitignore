@@ -1,5 +1,5 @@
 # Runtime state written by the pod scripts (never commit — may reference infra)
-pod_state.json
+pod_state*.json
 template_state.json
 logs/
 

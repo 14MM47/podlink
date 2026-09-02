@@ -146,7 +146,7 @@ class RunPodProvider:
         template_id = pod_up.ensure_template()
         return {"gpu_id": gpu_id, "template_id": template_id}
 
-    def create_once(self, ctx: dict, secrets: dict) -> dict:
+    def create_once(self, ctx: dict, secrets: dict, attempt: int) -> dict:
         """ONE create attempt from the bundled image.
 
         The secrets travel as pod env (that is where the image's wrappers read

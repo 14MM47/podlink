@@ -382,6 +382,26 @@ def test_stop_closes_the_access_path():
         rec.restore()
 
 
+def test_stack_defaults_agree_with_pod_up():
+    # app/stack.py is the cloud-neutral copy of the image's env contract; the
+    # vendored pod_up.py keeps its own (minimal-edit policy). They must not drift.
+    from app import stack
+    import os as _os
+    for var in ("PODLINK_LLM_MODEL_ID", "PODLINK_EMBED_MODEL_ID", "PODLINK_RERANK_MODEL_ID",
+                "PODLINK_LLM_SERVED_NAME", "PODLINK_MAX_MODEL_LEN", "PODLINK_GPU_MEMORY_UTILIZATION"):
+        assert var not in _os.environ, f"{var} set in the test env — defaults not observable"
+    check("stack defaults == pod_up defaults", (
+        stack.DEFAULT_LLM_MODEL_ID == rp.pod_up.LLM_MODEL_ID
+        and stack.DEFAULT_EMBED_MODEL_ID == rp.pod_up.EMBED_MODEL_ID
+        and stack.DEFAULT_RERANK_MODEL_ID == rp.pod_up.RERANK_MODEL_ID
+        and stack.DEFAULT_LLM_SERVED_NAME == rp.pod_up.LLM_SERVED_NAME
+        and stack.DEFAULT_MAX_MODEL_LEN == rp.pod_up.MAX_MODEL_LEN
+        and stack.DEFAULT_GPU_MEMORY_UTILIZATION == rp.pod_up.GPU_MEMORY_UTILIZATION))
+    check("stack ports == pod_up ports", stack.SERVICE_PORTS == rp.pod_up.SERVICE_PORTS)
+    env = stack.container_env(stack.from_env(), "B", "H")
+    check("container env keys == pod_up's", set(env) == set(rp.pod_up._pod_env("B", "H")))
+
+
 def test_stop_terminates_and_lands_idle():
     # POD DOWN calls runpod.terminate_pod (not stop_pod), verifies the pod left
     # RUNNING, clears the state file, and settles to IDLE. Covers the refactor.
@@ -622,6 +642,7 @@ if __name__ == "__main__":
     test_create_aborts_on_cancel_before_create()
     test_provider_selection()
     test_provider_snapshot_fields_are_complete()
+    test_stack_defaults_agree_with_pod_up()
     test_is_running_and_is_up_are_not_the_same_predicate()
     test_wait_for_running_ignores_running_without_a_runtime()
     test_verify_terminated_keeps_polling_on_unknown_status()

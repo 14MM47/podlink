@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # never remove one to make the test pass.
 GENERIC_CORE = [
     "app/driver.py",
+    "app/stack.py",
     "app/session.py",
     "app/server.py",
     "app/profiles.py",

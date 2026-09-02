@@ -23,7 +23,7 @@ from types import ModuleType
 from .base import Provider
 
 DEFAULT_PROVIDER = "runpod"          # what a config that says nothing gets
-KNOWN_PROVIDERS = ("runpod",)        # extended as providers land
+KNOWN_PROVIDERS = ("runpod", "gcp")
 
 # The live provider instance and the name it was built for. Swapped wholesale by
 # reload_active(); two plain global assignments, so a concurrent snapshot read

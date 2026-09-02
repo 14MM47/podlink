@@ -1,0 +1,7 @@
+# GCP provider dependencies (installed on top of requirements.txt).
+#
+# Only google-auth: the provider talks REST to Compute Engine and Secret
+# Manager through podlink's audited egress client, so no google-cloud-* SDKs.
+# google-auth supplies Application Default Credentials (no key files).
+google-auth==2.57.0
+requests==2.32.5

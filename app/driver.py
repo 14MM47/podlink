@@ -246,7 +246,7 @@ def _create_with_retries(session: PodSession) -> dict | None:
             return None
         session.update(phase=provider.create_phase(ctx, attempt, retries))
         try:
-            return provider.create_once(ctx, secrets)    # one attempt
+            return provider.create_once(ctx, secrets, attempt)   # one attempt
         except provider.create_error_types as e:
             if not provider.is_retryable_create_error(e):  # real error — surface it
                 raise

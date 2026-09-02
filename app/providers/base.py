@@ -122,11 +122,13 @@ class Provider(Protocol):
         lookup is visible in the UI.
         """
 
-    def create_once(self, ctx: Any, secrets: dict) -> Any:
+    def create_once(self, ctx: Any, secrets: dict, attempt: int) -> Any:
         """ONE create attempt. Raises on failure; the driver owns the retry loop.
 
         `secrets` carries {"bearer": …, "hf": …} — the tokens the container
         needs. How they reach the instance is the provider's business.
+        `attempt` is 1-based so a provider can vary placement per attempt
+        (zone rotation on stockout) without keeping state in ctx.
         """
 
     def is_retryable_create_error(self, exc: Exception) -> bool:

@@ -127,6 +127,28 @@ export PODLINK_NETWORK_VOLUME_ID=<volume-id>         # terminate-safe weight per
 | `PODLINK_CREATE_RETRIES` / `PODLINK_CREATE_RETRY_DELAY` | `40` / `15` | Host-capacity retry attempts and delay. |
 | `PODLINK_START_SSH` | `1` (on) | Enable SSH on the pod for first-boot debug. |
 
+GCP provider (`PODLINK_PROVIDER=gcp`; the shared `PODLINK_*` stack settings above apply unchanged):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PODLINK_GCP_PROJECT` | *(required)* | Project id. |
+| `PODLINK_GCP_ZONES` | `europe-west2-b,europe-west2-c` | Zones to place in (one region). A zonal data disk pins to the first; a regional disk or volume-less launch rotates on stockout. |
+| `PODLINK_GCP_MACHINE_TYPE` | `g4-standard-48` | 1× RTX PRO 6000 96 GB. |
+| `PODLINK_GCP_BOOT_IMAGE` | *(required)* | The golden image (`projects/<p>/global/images/family/<f>`): Ubuntu 24.04 + driver + container toolkit + Docker. |
+| `PODLINK_GCP_IMAGE` | `PODLINK_IMAGE` | Container image — use the Artifact Registry mirror in the region. |
+| `PODLINK_GCP_DATA_DISK` / `_SCOPE` | *(empty)* / `zonal` | Hyperdisk Balanced name holding Docker's data-root + the HF cache; survives POD DOWN. Empty ⇒ scratch disk destroyed on POD DOWN. `regional` = Hyperdisk Balanced HA. |
+| `PODLINK_GCP_CONFIDENTIAL` | `1` | AMD SEV + NVIDIA GPU TEE. |
+| `PODLINK_GCP_PROVISIONING` | `standard` | `spot` for the preemptible lane. |
+| `PODLINK_GCP_MAX_RUN_HOURS` | `8` | Platform-side kill switch: the VM deletes itself after this. `0` = off. |
+| `PODLINK_GCP_DOWN_ACTION` | `delete` | `stop` keeps the boot disk (bills) for a faster restart. |
+| `PODLINK_GCP_ACCESS` | `iap` | `iap` = loopback tunnels (no external IP); `internal` = the VM's VPC address. |
+| `PODLINK_GCP_LOCAL_PORTS` | `18000,18080,18081` | Loopback ports the IAP tunnels bind (llm, embedder, reranker). |
+| `PODLINK_GCP_SERVICE_ACCOUNT` | *(default compute SA)* | The VM's identity — give it Secret Manager accessor on the two secrets and Artifact Registry reader, nothing else. |
+| `PODLINK_GCP_SUBNET` / `_NETWORK_TAG` | `default` / `podlink` | Subnet in the region; firewall target tag for the IAP range. |
+| `PODLINK_GCP_KMS_KEY` | *(Google-managed)* | CMEK key resource name for both disks. |
+| `PODLINK_GCP_SECRET_PREFIX` | `podlink` | Secret Manager names `<prefix>-bearer`, `<prefix>-hf-token`, synced before each create. |
+| `PODLINK_GCP_COST_PER_HR` | *(blank meter)* | Hourly rate for the cost meter — GCP reports none on the instance. |
+
 ### Profiles — switching between whole stacks
 
 One podlink can drive several model stacks (one at a time — it's one GPU). Put
