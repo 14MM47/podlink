@@ -1,12 +1,10 @@
-# Exact pins for supply-chain safety (runpod handles the API key — an
-# unexpected release must not slip in). Versions below fastapi/uvicorn/httpx/rich
-# are the ones podlink was built and tested against.
+# Core dependencies — the provider-neutral app only. Exact pins for
+# supply-chain safety; these are the versions podlink was built and tested
+# against. Each cloud's SDK lives in its own requirements-<provider>.txt
+# (start.sh installs the active provider's file; CI installs them all), so a
+# launch never pulls another cloud's SDK.
 #
-# NOTE: runpod is pinned to a mature 1.7.x but was not installed in the build
-# environment — validate it against your account on first run before relying on
-# it. Next hardening step: a hash-locked `--require-hashes` lockfile (pip-compile).
+# Next hardening step: a hash-locked `--require-hashes` lockfile (pip-compile).
 fastapi==0.135.1
 uvicorn[standard]==0.42.0
-runpod==1.7.13
 httpx==0.28.1
-rich==14.3.3

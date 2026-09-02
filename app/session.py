@@ -35,7 +35,7 @@ class PodSession:
     def __init__(self) -> None:                 # construct the single shared session
         self._lock = threading.Lock()           # guards every read/write below
         self.state: State = State.IDLE          # start with no pod
-        self.pod_id: str | None = None          # RunPod pod id once known
+        self.pod_id: str | None = None          # the instance id once known
         self.target_pod_id: str | None = None    # user-selected pod to adopt (None = Auto)
         self.proxy_url: str | None = None        # https proxy URL to the pod once known
         self.phase: str = "idle"                # human-readable progress line for the UI

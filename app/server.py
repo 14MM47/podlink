@@ -12,7 +12,6 @@ from __future__ import annotations  # postponed annotation evaluation
 import asyncio                       # sleep between SSE pushes
 import json                          # serialise snapshots for SSE frames
 import os                            # active-profile name from the launch env
-import re                            # validate the client-supplied pod id
 import secrets as pysecrets          # cryptographic token + constant-time compare
 import threading                     # run driver work off the request thread
 import time                          # auto-terminate watchdog clock
@@ -21,8 +20,9 @@ from pathlib import Path             # locate the static/ directory
 from fastapi import Body, FastAPI, Header, HTTPException, Request   # web framework primitives
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # response types
 
+from . import driver                 # start()/stop() entry points (provider-neutral)
 from . import profiles as profiles_conf  # profile discovery + runtime switching
-from . import runpod_driver          # start()/stop() entry points
+from . import providers              # the configured cloud
 from .session import PodSession, State  # the shared state machine
 
 app = FastAPI(title="podlink", docs_url=None, redoc_url=None)  # no public API docs pages
@@ -31,9 +31,6 @@ SESSION = PodSession()               # the single, process-wide pod session
 # Per-process token; regenerated every launch so a stale token can't act.
 TOKEN = pysecrets.token_urlsafe(24)  # unguessable per-run secret
 STATIC_DIR = Path(__file__).resolve().parent / "static"  # …/app/static
-# RunPod pod ids are short lowercase-alnum strings; validate before any SDK call
-# so a malformed/injected target can't reach runpod.get_pod.
-_POD_ID_RE = re.compile(r"^[a-z0-9]{6,40}$")
 
 
 @app.middleware("http")
@@ -77,7 +74,7 @@ def _health_watch() -> None:
         time.sleep(_HEALTH_INTERVAL_S)
         try:
             if SESSION.state == State.RUNNING and SESSION.pod_id:
-                runpod_driver.probe_health_once(SESSION, SESSION.pod_id)
+                driver.probe_health_once(SESSION, SESSION.pod_id)
         except Exception:  # noqa: BLE001 — a watchdog must never die on a transient error
             pass
 
@@ -99,51 +96,37 @@ def _auto_terminate_watch() -> None:
                 if SESSION.try_begin_stop():          # atomic: enter STOPPING + cancel
                     SESSION.add_event("idle auto-terminate — deadline reached", "system")
                     SESSION.update(phase="idle auto-terminate — deadline reached")
-                    _launch(runpod_driver.stop)       # terminate + verify in the background
+                    _launch(driver.stop)              # terminate + verify in the background
         except Exception:  # noqa: BLE001 — a watchdog must never die on a transient error
             pass
 
 
 def _client_env(pod_id: str) -> str:
-    """The RAG-client .env block for this pod: proxy URLs + model names, with the
-    bearer left as a PLACEHOLDER (never the real secret — it must not reach the
-    browser). Paste your pod_bearer_token where marked. EMBEDDING_DIMENSIONS is
-    left for 'Test stack' to detect, since it depends on what the embedder serves."""
-    pu = runpod_driver.pod_up
-    base = lambda port: f"https://{pod_id}-{port}.proxy.runpod.net"   # noqa: E731
-    # Fill EMBEDDING_DIMENSIONS from a stack-test detection if one has run.
-    tr = SESSION.test_result or {}
-    dim = tr.get("embedding_dim")
-    dim_line = (f"EMBEDDING_DIMENSIONS={dim}" if dim
-                else "# EMBEDDING_DIMENSIONS=  <- run 'Test stack' to detect the served dimension")
-    return "\n".join([
-        f"LLM_BASE_URL={base(8000)}/v1",
-        f"LLM_MODEL={pu.LLM_SERVED_NAME}",
-        "LLM_API_KEY=<your pod_bearer_token>",
-        f"EMBEDDING_BASE_URL={base(8080)}/v1",
-        f"EMBEDDING_MODEL={pu.EMBED_MODEL_ID}",
-        dim_line,
-        "EMBEDDING_API_KEY=<your pod_bearer_token>",
-        "RERANKER_PROVIDER=api",
-        f"RERANKER_BASE_URL={base(8081)}",
-        "RERANKER_API_KEY=<your pod_bearer_token>",
-        "KG_EXTRACTION_CONCURRENCY=10",
-    ])
+    """The RAG-client .env block for this pod, from the active provider.
+
+    The bearer is left as a PLACEHOLDER — it must never reach the browser.
+    EMBEDDING_DIMENSIONS comes from a stack-test detection when one has run,
+    since it depends on what the embedder actually serves.
+    """
+    dim = (SESSION.test_result or {}).get("embedding_dim")   # None until 'Test stack' runs
+    return providers.active().client_env(pod_id, dim)
 
 
 def _snapshot() -> dict:
-    """Session snapshot plus process-constant deploy flags the UI needs.
+    """Session snapshot plus the process-constant deploy flags the UI needs.
 
-    Adds `network_volume_configured` so the UI can warn that POD DOWN (a terminate)
-    will destroy the downloaded weights when no Network Volume is set. It's a
-    process constant, so emitting it on every SSE frame is cheap and the dedupe
-    in /events still works.
+    The provider adds its own fields — chiefly `persistence_configured`, which
+    tells the UI that POD DOWN (a terminate) will destroy the downloaded weights
+    when no persistent storage is set. These are process constants, so emitting
+    them on every SSE frame is cheap and the dedupe in /events still works.
     """
+    provider = providers.active()
     snap = SESSION.snapshot()                                 # base state + button flags
-    snap["network_volume_configured"] = runpod_driver.network_volume_configured()
-    snap["volume_id"] = runpod_driver.pod_up.NETWORK_VOLUME_ID or None  # for the volume panel
+    snap.update(provider.snapshot_fields())                   # provider/persistence/model
     snap["active_profile"] = os.environ.get("PODLINK_PROFILE") or None  # start.sh --profile
-    snap["llm_model_id"] = runpod_driver.pod_up.LLM_MODEL_ID   # which stack this launch serves
+    # Service endpoints for the UI's link row — cheap, pure string building, and
+    # no wider exposure than pod_id itself (this route is localhost-only).
+    snap["service_urls"] = provider.service_urls(SESSION.pod_id) if SESSION.pod_id else None
     return snap
 
 
@@ -170,9 +153,9 @@ def status() -> JSONResponse:
 
 @app.get("/pods")
 def pods(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
-    _require_token(x_podlink_token)                   # gated: triggers an authed RunPod call
+    _require_token(x_podlink_token)                   # gated: triggers an authed cloud call
     try:
-        return JSONResponse({"pods": runpod_driver.list_pods()})  # whitelisted fields only
+        return JSONResponse({"pods": driver.list_pods()})  # whitelisted fields only
     except Exception as e:                            # noqa: BLE001
         # Type only in detail — str(e) could embed the API key.
         raise HTTPException(status_code=502, detail=f"pod list failed: {type(e).__name__}")
@@ -223,12 +206,14 @@ def pod_up(target: str | None = Body(default=None, embed=True),
            x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
     _require_token(x_podlink_token)                   # CSRF/token gate
     target = target or None                           # normalise "" -> None (Auto)
-    if target is not None and not _POD_ID_RE.match(target):  # reject a malformed id
+    # Validate the client-supplied id against the provider's own id shape, before
+    # it can reach any SDK call.
+    if target is not None and not providers.active().valid_instance_id(target):
         raise HTTPException(status_code=400, detail="invalid pod id format")
     if not SESSION.try_begin_start(target):          # atomically enter STARTING (None = Auto)
         # Not in a state where Up is allowed (already starting/running/stopping).
         raise HTTPException(status_code=409, detail="pod up not available in current state")
-    _launch(runpod_driver.start)                     # provision in the background
+    _launch(driver.start)                            # provision in the background
     return JSONResponse(_snapshot())                 # echo the new state
 
 
@@ -236,20 +221,20 @@ def pod_up(target: str | None = Body(default=None, embed=True),
 def pod_down(confirm: bool = Body(default=False, embed=True),
              x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
     _require_token(x_podlink_token)                   # CSRF/token gate
-    # Server-side destructive-action guard. With no Network Volume, terminate
+    # Server-side destructive-action guard. With no persistent storage, terminate
     # DESTROYS the downloaded weights. The browser shows a confirm dialog, but
     # that JS is bypassable (curl, a script, a stale tab), so the server itself
-    # refuses to terminate unless the caller explicitly confirms. With a volume
+    # refuses to terminate unless the caller explicitly confirms. With storage
     # configured, terminate is non-destructive and no confirmation is required.
-    if not runpod_driver.network_volume_configured() and not confirm:
+    if not driver.persistence_configured() and not confirm:
         raise HTTPException(
             status_code=428,                          # Precondition Required
-            detail='no Network Volume configured — POD DOWN will destroy the '
+            detail='no persistent storage configured — POD DOWN will destroy the '
                    'downloaded model weights; resend with {"confirm": true} to proceed',
         )
     if not SESSION.try_begin_stop():                 # atomically enter STOPPING + cancel
         raise HTTPException(status_code=409, detail="pod down not available in current state")
-    _launch(runpod_driver.stop)                      # terminate + verify in the background
+    _launch(driver.stop)                             # terminate + verify in the background
     return JSONResponse(_snapshot())                 # echo the new state
 
 
@@ -279,7 +264,7 @@ def pod_test(x_podlink_token: str | None = Header(default=None)) -> JSONResponse
         raise HTTPException(status_code=409, detail="pod not running")
     if SESSION.test_running:
         raise HTTPException(status_code=409, detail="a stack test is already running")
-    _launch(runpod_driver.test_stack)                # fire the three probes off-thread
+    _launch(driver.test_stack)                       # fire the three probes off-thread
     return JSONResponse(_snapshot())
 
 

@@ -8,33 +8,32 @@ profiles WITHOUT a relaunch:
   * only `export PODLINK_*=value` lines are honoured; every other line
     (comments, other keys, arbitrary shell) is ignored;
   * switching rebuilds the process PODLINK_* env from a startup baseline plus
-    the chosen profile's exports, then importlib.reload()s the vendored pod_up
-    module so its import-time constants re-read the new environment.
+    the chosen profile's exports, then re-bakes the active provider so its
+    settings re-read the new environment. A profile that names a different
+    PODLINK_PROVIDER switches cloud outright.
 
 The caller (the /profile/select route) must only switch while no pod work is in
-flight — reloading pod_up under a live driver thread would let one launch read
-half-old, half-new constants.
+flight — re-baking the provider under a live driver thread would let one launch
+read half-old, half-new settings.
 """
 from __future__ import annotations
 
-import importlib
 import os
 import re
 import shlex
-import sys
 from pathlib import Path
+
+from . import providers
 
 # Same layout start.sh uses. Module-level (not function-local) so tests can
 # point them at a temp directory.
 CONFIG_DIR = Path.home() / ".config" / "podlink"
 BASE_CONF = CONFIG_DIR / "podlink.conf"
 PROFILE_DIR = CONFIG_DIR / "profiles"
-VOL_FILE = CONFIG_DIR / "network_volume_id"
 
 # Profile names come from the client — no path separators, no traversal.
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _KEY_RE = re.compile(r"^PODLINK_[A-Z0-9_]+$")
-_NONE_RE = re.compile(r"^none$", re.IGNORECASE)  # start.sh's explicit no-volume sentinel
 
 
 def valid_name(name: str) -> bool:
@@ -109,15 +108,9 @@ def effective_env(profile: str | None) -> dict[str, str]:
         env["PODLINK_PROFILE"] = profile  # surfaced in the console UI
     else:
         env.pop("PODLINK_PROFILE", None)
-    # Volume resolution, mirroring start.sh: explicit `none` => Data-Volume mode
-    # (empty), an explicit id is used as-is, unset falls back to the saved id
-    # file. There is no interactive prompt here — unset with no file is empty.
-    vol = env.get("PODLINK_NETWORK_VOLUME_ID")
-    if vol is None and VOL_FILE.is_file():
-        vol = VOL_FILE.read_text()
-    vol = (vol or "").strip()
-    env["PODLINK_NETWORK_VOLUME_ID"] = "" if _NONE_RE.match(vol) else vol
-    return env
+    # Cloud-specific fix-ups (e.g. resolving a saved storage id the way the
+    # launcher would) belong to the provider the env names, not here.
+    return providers.normalise_env(env)
 
 
 def _swap_env(env: dict[str, str]) -> None:
@@ -129,22 +122,22 @@ def _swap_env(env: dict[str, str]) -> None:
 
 
 def apply(profile: str | None) -> None:
-    """Switch the process env to `profile` and re-bake pod_up's constants.
+    """Switch the process env to `profile` and re-bake the active provider.
 
-    importlib.reload re-executes pod_up in its existing module object, so every
-    holder of a reference (runpod_driver.pod_up, the server's snapshot reads)
-    sees the new constants without re-importing. pod_up's module level is pure
-    constant assignment — no side effects — which is what makes this safe.
+    The provider re-reads every PODLINK_* setting from the environment, so each
+    holder of a reference sees the new configuration without re-importing. A
+    profile naming a different PODLINK_PROVIDER swaps the provider itself.
 
-    On a reload failure (e.g. a non-numeric PODLINK_VOLUME_GB in a conf) the
-    previous env is restored and pod_up reloaded again so process state stays
-    consistent, then the error propagates for the route to surface.
+    On a failure (e.g. a non-numeric PODLINK_VOLUME_GB in a conf, or an unknown
+    provider name) the previous env is restored and the provider re-baked again
+    so process state stays consistent, then the error propagates for the route
+    to surface.
     """
     before = _snapshot_podlink_env()
     _swap_env(effective_env(profile))
     try:
-        importlib.reload(sys.modules["pod_up"])
+        providers.reload_active()
     except Exception:
         _swap_env(before)
-        importlib.reload(sys.modules["pod_up"])  # re-bake the old constants
+        providers.reload_active()          # re-bake the previous configuration
         raise

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # import the `app
 
 from fastapi.testclient import TestClient   # noqa: E402
 from app import server                       # noqa: E402
+from app.providers import runpod as rp       # noqa: E402  the active provider (owns pod_up)
 from app.session import State                # noqa: E402
 
 client = TestClient(server.app)
@@ -37,9 +38,10 @@ def test_config_and_status():
     check("/config returns a token", isinstance(TOK, str) and len(TOK) > 10)
     snap = client.get("/status").json()
     check("/status has state + button flags", {"state", "up_enabled", "down_enabled"} <= set(snap))
-    check("/status carries the deploy flag", "network_volume_configured" in snap)
+    check("/status carries the deploy flag", "persistence_configured" in snap)
+    check("/status names the active provider", snap.get("provider") == "runpod")
     check("/status carries the llm model id",
-          snap.get("llm_model_id") == server.runpod_driver.pod_up.LLM_MODEL_ID)
+          snap.get("llm_model_id") == rp.pod_up.LLM_MODEL_ID)
 
 
 def test_status_active_profile():
@@ -72,15 +74,15 @@ def test_pod_up_validation():
 
 def test_down_guard():
     _reset()
-    server.runpod_driver.pod_up.NETWORK_VOLUME_ID = ""            # no volume
+    rp.pod_up.NETWORK_VOLUME_ID = ""            # no volume
     check("down, no volume, no confirm -> 428",
           client.post("/pod/down", headers=H, json={}).status_code == 428)
     check("down, no volume, confirm -> 409 (IDLE rejects)",
           client.post("/pod/down", headers=H, json={"confirm": True}).status_code == 409)
-    server.runpod_driver.pod_up.NETWORK_VOLUME_ID = "vol_x"       # volume set
+    rp.pod_up.NETWORK_VOLUME_ID = "vol_x"       # volume set
     check("down, volume set, no confirm -> 409 (guard skipped, IDLE rejects)",
           client.post("/pod/down", headers=H, json={}).status_code == 409)
-    server.runpod_driver.pod_up.NETWORK_VOLUME_ID = ""
+    rp.pod_up.NETWORK_VOLUME_ID = ""
 
 
 def test_keepalive_clears_deadline():
@@ -99,9 +101,12 @@ def test_env_and_test_guards():
     check("/pod/test not running -> 409", client.post("/pod/test", headers=H).status_code == 409)
     # With a pod up, the client-config block is generated correctly.
     S.pod_id = "abc123def"; S.state = State.RUNNING
+    snap = client.get("/status").json()
+    check("snapshot exposes the provider's service URLs",
+          snap["service_urls"]["llm"].endswith("abc123def-8000.proxy.runpod.net"))
     env = client.get("/pod/env", headers=H).json()["env"]
     check("env has the live pod URLs", "abc123def-8000.proxy.runpod.net" in env)
-    check("env uses the served name", f"LLM_MODEL={server.runpod_driver.pod_up.LLM_SERVED_NAME}" in env)
+    check("env uses the served name", f"LLM_MODEL={rp.pod_up.LLM_SERVED_NAME}" in env)
     check("bearer is a placeholder, not a secret", "<your pod_bearer_token>" in env)
     _reset()
 
@@ -131,10 +136,10 @@ def test_profile_parsing_and_switching():
         check("parser: shell line ignored", len(parsed) == 3)
 
         # --- routes, against a temp config dir (no saved volume id, no base conf) ---
-        saved = (pconf.PROFILE_DIR, pconf.BASE_CONF, pconf.VOL_FILE, dict(pconf.BASE_ENV))
+        saved = (pconf.PROFILE_DIR, pconf.BASE_CONF, rp.VOL_FILE, dict(pconf.BASE_ENV))
         pconf.PROFILE_DIR = pdir
         pconf.BASE_CONF = Path(td) / "podlink.conf"
-        pconf.VOL_FILE = Path(td) / "network_volume_id"
+        rp.VOL_FILE = Path(td) / "network_volume_id"     # the provider owns the saved-id file
         try:
             _reset()
             check("/profiles without token -> 403", client.get("/profiles").status_code == 403)
@@ -158,18 +163,18 @@ def test_profile_parsing_and_switching():
             r = client.post("/profile/select", headers=H, json={"profile": "alt"})
             check("select -> 200", r.status_code == 200)
             check("snapshot shows the profile", r.json()["active_profile"] == "alt")
-            check("pod_up re-baked the model id",
-                  server.runpod_driver.pod_up.LLM_MODEL_ID == "test/alt-model")
-            check("volume sentinel 'none' -> empty", server.runpod_driver.pod_up.NETWORK_VOLUME_ID == "")
+            check("provider re-baked the model id",
+                  rp.pod_up.LLM_MODEL_ID == "test/alt-model")
+            check("volume sentinel 'none' -> empty", rp.pod_up.NETWORK_VOLUME_ID == "")
             check("snapshot llm follows the switch",
                   client.get("/status").json()["llm_model_id"] == "test/alt-model")
 
             r = client.post("/profile/select", headers=H, json={})
             check("select base -> 200, profile cleared", r.json()["active_profile"] is None)
             check("model id back to the baseline",
-                  server.runpod_driver.pod_up.LLM_MODEL_ID != "test/alt-model")
+                  rp.pod_up.LLM_MODEL_ID != "test/alt-model")
         finally:
-            pconf.PROFILE_DIR, pconf.BASE_CONF, pconf.VOL_FILE = saved[0], saved[1], saved[2]
+            pconf.PROFILE_DIR, pconf.BASE_CONF, rp.VOL_FILE = saved[0], saved[1], saved[2]
             pconf.BASE_ENV = saved[3]
             client.post("/profile/select", headers=H, json={})  # re-bake from the real baseline
             _reset()

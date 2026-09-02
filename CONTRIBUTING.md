@@ -36,9 +36,19 @@ CI runs exactly these on every push and PR.
 - **No hardcoded account/stack values** — everything account- or deployment-specific
   is read from `PODLINK_*` env vars (see the README's Configuration section).
 - **Match the house style:** line-by-line comments, `ruff` clean, tests for new
-  behavior. The state machine lives in `app/session.py`; the RunPod orchestration in
-  `app/runpod_driver.py`; the vendored pod scripts in `pod_control/` (see its
-  `PROVENANCE.md` — treat that directory as a unit).
+  behavior. The state machine lives in `app/session.py`; the cloud-neutral
+  orchestration in `app/driver.py`; each cloud in `app/providers/` behind the
+  contract in `app/providers/base.py`; the vendored pod scripts in `pod_control/`
+  (see its `PROVENANCE.md` — treat that directory as a unit).
+- **Adding a cloud is a provider, not a fork.** Create `app/providers/<name>/`
+  exposing `PROVIDER` (a class implementing `app/providers/base.py`), optionally a
+  `normalise_env()` hook and a `launch.sh` for anything that needs a TTY before the
+  venv exists, add the name to `KNOWN_PROVIDERS`, and pin its SDK in
+  `requirements-<name>.txt` (never in `requirements.txt`). Nothing cloud-specific
+  belongs in the generic core — the driver, server, profiles, launcher or UI — and
+  `tests/test_siloing.py` fails CI on any cloud vocabulary found there. If the
+  driver seems to need to know which cloud it is on, the contract is missing
+  something: extend `base.py`, don't special-case.
 
 ## Pull requests
 

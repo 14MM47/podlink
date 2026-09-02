@@ -1,0 +1,7 @@
+# RunPod provider dependencies (installed on top of requirements.txt).
+#
+# runpod handles the API key — an unexpected release must not slip in, so it is
+# pinned to a mature 1.7.x. rich is used only by the vendored pod_control/ CLI
+# scripts this provider wraps.
+runpod==1.7.13
+rich==14.3.3

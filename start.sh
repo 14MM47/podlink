@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Single-command launcher for podlink.
 #
-# Resolves the RunPod Network Volume id (env -> saved file -> interactive prompt,
-# always offering you the chance to paste a new one), ensures the venv + deps are
-# ready, then hands off to the hardened ./run.sh (localhost-only bind, no arg
-# pass-through — we deliberately do NOT forward args to it).
+# Loads the stack config (+ optional profile), works out which provider this
+# launch drives, gives that provider its chance to resolve anything interactive
+# (its launch.sh — e.g. a saved storage id), ensures the venv + deps (core plus
+# that provider's own), then either runs the preflight (--check) or hands off
+# to the hardened ./run.sh (localhost-only bind, no arg pass-through — we
+# deliberately do NOT forward args to it).
 #
-#   ./start.sh                      # resolve volume id, then start the app
-#   ./start.sh --check              # preflight only (volume, venv, deps, secrets), no launch
+# This file is provider-neutral by design and tests/test_siloing.py keeps it
+# that way: anything cloud-specific belongs in app/providers/<name>/.
+#
+#   ./start.sh                      # resolve prerequisites, then start the app
+#   ./start.sh --check              # preflight only (config, venv, deps, secrets), no launch
 #   ./start.sh --profile <name>     # overlay ~/.config/podlink/profiles/<name>.conf
 #                                   # on the base conf (also: PODLINK_PROFILE env)
 set -euo pipefail
@@ -16,7 +21,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${HOME}/.config/podlink"
 CONF_FILE="${CONFIG_DIR}/podlink.conf"         # optional: exports PODLINK_IMAGE etc.
 PROFILE_DIR="${CONFIG_DIR}/profiles"           # optional per-stack overlays
-VOL_FILE="${CONFIG_DIR}/network_volume_id"     # the id is infra, not a secret, but kept here for tidiness
 CHECK_ONLY=0
 PROFILE="${PODLINK_PROFILE:-}"                 # --profile beats the env var
 while [[ $# -gt 0 ]]; do
@@ -32,7 +36,7 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }
 ok()   { printf '\033[32m%s\033[0m\n' "$*"; }
 
-# --- 0. Load the stack config (PODLINK_IMAGE, registry auth, served name, …) ---
+# --- 0. Load the stack config (PODLINK_IMAGE, provider, served name, …) ------
 # Account/stack-specific values live in a local, gitignored file, not in source.
 if [[ -f "${CONF_FILE}" ]]; then
   # shellcheck disable=SC1090
@@ -41,7 +45,7 @@ if [[ -f "${CONF_FILE}" ]]; then
 fi
 
 # Profile overlay: a named conf sourced AFTER the base, so its exports win.
-# Lets one podlink switch between whole stacks (models, sizing, volume) per launch.
+# Lets one podlink switch between whole stacks — and clouds — per launch.
 if [[ -n "${PROFILE}" ]]; then
   PROFILE_FILE="${PROFILE_DIR}/${PROFILE}.conf"
   if [[ ! -f "${PROFILE_FILE}" ]]; then
@@ -55,64 +59,31 @@ if [[ -n "${PROFILE}" ]]; then
   say "Loaded profile '${PROFILE}' from ${PROFILE_FILE}"
 fi
 
-# --- 1. Resolve the Network Volume id --------------------------------------
-# Priority: an already-exported env var wins (explicit override); else a saved
-# file; else prompt. When a saved value exists we still OFFER a fresh paste.
-# Sentinel: PODLINK_NETWORK_VOLUME_ID=none means "deliberately no volume" — it
-# skips the saved-file/prompt fallback so a no-volume profile can't silently
-# inherit another stack's volume, and runs in Data-Volume mode (weights
-# re-download from HF on every POD UP; nothing persists a terminate).
-volume=""
-if [[ "${PODLINK_NETWORK_VOLUME_ID:-}" =~ ^[Nn][Oo][Nn][Ee]$ ]]; then
-  say "Network volume: none (explicit) — Data-Volume mode, weights re-download each POD UP."
-elif [[ -n "${PODLINK_NETWORK_VOLUME_ID:-}" ]]; then
-  volume="${PODLINK_NETWORK_VOLUME_ID}"
-  say "Network volume id: using PODLINK_NETWORK_VOLUME_ID from the environment."
-elif [[ -f "${VOL_FILE}" ]]; then
-  saved="$(<"${VOL_FILE}")"; saved="${saved//[[:space:]]/}"
-  if [[ -t 0 ]]; then
-    read -rp "Network volume id [${saved}] (Enter to keep, or paste a new one): " entered || entered=""
-    entered="${entered//[[:space:]]/}"
-    if [[ -n "${entered}" && "${entered}" != "${saved}" ]]; then
-      volume="${entered}"
-      printf '%s' "${volume}" > "${VOL_FILE}"; chmod 600 "${VOL_FILE}"
-      ok "Updated saved id in ${VOL_FILE}."
-    else
-      volume="${saved}"
-    fi
-  else
-    volume="${saved}"          # non-interactive: fall back to the saved value
-  fi
-  say "Network volume id: ${volume:-<none>}"
-else
-  if [[ -t 0 ]]; then
-    read -rp "Paste your RunPod Network Volume id (blank = no-volume / Data-Volume mode): " entered || entered=""
-    volume="${entered//[[:space:]]/}"
-    if [[ -n "${volume}" ]]; then
-      read -rp "Save it to ${VOL_FILE} for next time? [Y/n] " ans || ans=""
-      if [[ ! "${ans}" =~ ^[Nn] ]]; then
-        mkdir -p "${CONFIG_DIR}"; chmod 700 "${CONFIG_DIR}"
-        printf '%s' "${volume}" > "${VOL_FILE}"; chmod 600 "${VOL_FILE}"
-        ok "Saved."
-      fi
-    fi
-  else
-    warn "No network volume id set and no TTY to prompt on."
-  fi
-fi
-
-# Soft format sanity — RunPod ids are lowercase alphanumeric. Warn, don't block,
-# since the exact format isn't contractual.
-if [[ -n "${volume}" && ! "${volume}" =~ ^[a-z0-9]{6,}$ ]]; then
-  warn "Note: '${volume}' doesn't look like a typical RunPod volume id — double-check it."
-fi
-if [[ -z "${volume}" ]]; then
-  warn "No Network Volume set — POD DOWN will DESTROY downloaded weights (Data-Volume fallback)."
-fi
-export PODLINK_NETWORK_VOLUME_ID="${volume}"
-
-# --- 2. Ensure venv + deps --------------------------------------------------
+# --- 1. Resolve the provider and let it do its interactive part --------------
+# The default lives in ONE place (app/providers/__init__.py); read it rather
+# than repeat it. The name feeds a path and an import below, so it is validated
+# to a plain identifier first — a conf is user-owned, but not a place for
+# surprises.
 cd "${HERE}"
+DEFAULT_PROVIDER="$(python3 -c 'from app.providers import DEFAULT_PROVIDER as d; print(d)')"
+PROVIDER="${PODLINK_PROVIDER:-${DEFAULT_PROVIDER}}"
+PROVIDER="${PROVIDER,,}"
+if [[ ! "${PROVIDER}" =~ ^[a-z0-9_]+$ || ! -d "app/providers/${PROVIDER}" ]]; then
+  warn "Unknown PODLINK_PROVIDER '${PROVIDER}' — no app/providers/${PROVIDER}/ package."
+  say "Available: $(ls -d app/providers/*/ | xargs -n1 basename | grep -v __pycache__ | paste -sd' ' -)"
+  exit 2
+fi
+export PODLINK_PROVIDER="${PROVIDER}"
+say "Provider: ${PROVIDER}"
+
+# A provider may need a TTY before the venv exists (a prompt for a saved id, a
+# login). It gets that here, with say/warn/ok and CONFIG_DIR in scope.
+if [[ -f "app/providers/${PROVIDER}/launch.sh" ]]; then
+  # shellcheck disable=SC1090
+  source "app/providers/${PROVIDER}/launch.sh"
+fi
+
+# --- 2. Ensure venv + deps (core, then the provider's own) -------------------
 if [[ ! -d .venv ]]; then
   say "Creating .venv …"
   python3 -m venv .venv
@@ -120,42 +91,28 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 # Install only when something is missing — keeps a warm start fast.
-if ! python -c "import uvicorn, fastapi, runpod, httpx, rich" 2>/dev/null; then
-  say "Installing dependencies …"
+if ! python -c "import uvicorn, fastapi, httpx" 2>/dev/null; then
+  say "Installing core dependencies …"
   pip install -q -r requirements.txt
 fi
-ok "Environment ready (venv + deps)."
+# Importing the provider package pulls in its SDK; a failure means it's not
+# installed yet. Each provider's SDK is pinned in its own requirements file so
+# a launch never installs another cloud's.
+if ! python -c "import app.providers.${PROVIDER}" 2>/dev/null; then
+  if [[ -f "requirements-${PROVIDER}.txt" ]]; then
+    say "Installing ${PROVIDER} provider dependencies …"
+    pip install -q -r "requirements-${PROVIDER}.txt"
+  fi
+  python -c "import app.providers.${PROVIDER}" || {
+    warn "The ${PROVIDER} provider failed to import — see the traceback above."; exit 2; }
+fi
+ok "Environment ready (venv + core + ${PROVIDER} deps)."
 
 # --- 3. Preflight report for --check ---------------------------------------
+# Lives in Python (app/preflight.py) so the active provider owns its own checks.
 if [[ "${CHECK_ONLY}" == "1" ]]; then
   say ""
-  say "Secrets in ${CONFIG_DIR}:"
-  for f in runpod_api_key hf_token pod_bearer_token; do
-    if [[ -f "${CONFIG_DIR}/${f}" ]]; then
-      mode="$(stat -c '%a' "${CONFIG_DIR}/${f}" 2>/dev/null || echo '?')"
-      if [[ "${mode}" == "600" ]]; then ok "  ✓ ${f} (0600)"; else warn "  ! ${f} (mode ${mode}, want 600)"; fi
-    else
-      warn "  ✗ ${f} MISSING"
-    fi
-  done
-  say ""
-  say "Stack config:"
-  say "  profile: ${PODLINK_PROFILE:-<none — base conf only>}"
-  if [[ -n "${PODLINK_IMAGE:-}" ]]; then ok "  ✓ PODLINK_IMAGE = ${PODLINK_IMAGE}"; else warn "  ✗ PODLINK_IMAGE not set (required — see README / ${CONF_FILE})"; fi
-  say "  served model name: ${PODLINK_LLM_SERVED_NAME:-llm}"
-  say "  llm:      ${PODLINK_LLM_MODEL_ID:-<pod_up.py default>}"
-  say "  embedder: ${PODLINK_EMBED_MODEL_ID:-<pod_up.py default>}"
-  say "  reranker: ${PODLINK_RERANK_MODEL_ID:-<pod_up.py default>}"
-  say "  max model len: ${PODLINK_MAX_MODEL_LEN:-32768} · gpu share: ${PODLINK_GPU_MEMORY_UTILIZATION:-0.70}"
-  if [[ -n "${PODLINK_REGISTRY_AUTH_ID:-}" ]]; then say "  registry auth: set (private image)"; else say "  registry auth: none (public image)"; fi
-  say ""
-  if [[ -n "${PODLINK_NETWORK_VOLUME_ID}" ]]; then
-    say "Volume mode: network volume ${PODLINK_NETWORK_VOLUME_ID}"
-  else
-    warn "Volume mode: Data-Volume fallback (no persistence)"
-  fi
-  ok "Preflight OK — run ./start.sh (no --check) to launch."
-  exit 0
+  exec python -m app.preflight
 fi
 
 # --- 4. Launch (hardened localhost bind lives in run.sh) --------------------

@@ -1,46 +1,36 @@
-"""Non-interactive orchestration over the vendored pod_control/ scripts.
+"""Provider-neutral orchestration of the pod lifecycle.
 
 The original pod_up.py / pod_down.py are CLI tools: they prompt with
-rich.Confirm and quit via sys.exit — both fatal to a webapp. We keep edits to
-the vendored copies minimal (see pod_control/PROVENANCE.md), so instead we
-import their reusable, non-interactive pieces (constants, find_existing,
-create_pod, derive_proxy_url, write_state) and re-implement the control loop
-here with:
+rich.Confirm and quit via sys.exit — both fatal to a webapp. So the control loop
+lives here instead, with:
 
-  * automatic GPU fallback (no prompt),
   * cooperative cancellation on every poll tick,
-  * immediate pod-id capture the instant a pod is created, and
+  * immediate instance-id capture the instant one is created,
+  * a create-retry loop that reports every attempt to the UI, and
   * a verified stop that confirms GPU billing has actually ended.
+
+Nothing in this module knows which cloud it is driving. Everything cloud-shaped
+— creating, finding, describing, reaching and destroying an instance — goes
+through the Provider contract in app/providers/base.py, so a second cloud is a
+new provider module rather than a fork of this loop.
 
 The two entry points, `start(session)` and `stop(session)`, each run in their
 own background thread.
 """
 from __future__ import annotations  # allow `dict | None` etc. annotations
 
-import json          # read pod_state.json as a last-resort id source
 import os            # read the auto-terminate window from the environment
-import sys           # to mutate sys.path for the vendored imports
 import time          # wall-clock deadlines and inter-poll sleeps
-from pathlib import Path  # build the pod_control directory path
 
-# Make the vendored pod_control modules importable with their original sibling
-# imports (`import _secrets`, `import egress_logger`) intact.
-POD_CONTROL_DIR = Path(__file__).resolve().parents[1] / "pod_control"  # …/podlink/pod_control
-if str(POD_CONTROL_DIR) not in sys.path:              # avoid duplicate entries on reload
-    sys.path.insert(0, str(POD_CONTROL_DIR))          # front of path so our copy wins
-
-import runpod            # noqa: E402  RunPod SDK (imported after sys.path tweak)
-from runpod.error import QueryError  # noqa: E402  raised by create_pod on the capacity lottery
-import _secrets          # noqa: E402  vendored secret reader (0600/ownership checked)
-import egress_logger     # noqa: E402  vendored audited httpx client
-import pod_up            # noqa: E402  vendored: constants + find_existing/create_pod/…
-
-from .session import PodSession, State, SERVICES  # our state machine types + service names
+from .providers import active as active_provider   # the configured cloud
+from .session import PodSession, State, SERVICES   # our state machine types + service names
+from .vendored import _secrets, egress_logger, read_secret  # local secrets + audited client
 
 # How long to wait, in seconds, for each phase before declaring failure.
-RUNNING_TIMEOUT_S = 900   # RunPod allocation + container boot
+RUNNING_TIMEOUT_S = 900   # instance allocation + container boot
 READY_TIMEOUT_S = 900     # vLLM model-weight load until /v1/models == 200
-STOP_VERIFY_TIMEOUT_S = 180  # max wait to confirm the pod left RUNNING
+STOP_VERIFY_TIMEOUT_S = 180  # max wait to confirm the instance left RUNNING
+STOP_VERIFY_POLL_S = 3    # pause between termination re-checks
 POLL_S = 10               # inter-poll sleep (interruptible by cancel)
 
 
@@ -59,8 +49,8 @@ def _auto_terminate_minutes() -> int:
 def _arm_billing(session: PodSession) -> None:
     """Start the cost clock and (if configured) the auto-terminate deadline.
 
-    Called the instant a pod id is captured — RunPod bills from pod creation, so
-    the meter and the idle timer both start there.
+    Called the instant an instance id is captured — billing runs from creation,
+    so the meter and the idle timer both start there.
     """
     now = time.time()
     fields = {"billing_started_at": now}
@@ -75,52 +65,34 @@ def _sleep_or_cancel(session: PodSession, seconds: float) -> bool:
     return session.cancel.wait(seconds)   # Event.wait returns True the moment it's set
 
 
-def _read_secret(getter) -> str:
-    """Read a secret and register it for verbatim redaction in the egress log.
+def _release_access(session: PodSession, provider) -> None:
+    """Close the provider's local access path, swallowing any failure.
 
-    The vendored getter calls sys.exit() (raising SystemExit — a BaseException)
-    when a secret is missing, mis-permissioned, or empty. SystemExit slips past
-    the `except Exception` handlers in start()/stop() and the /pods route, which
-    would silently kill the stop worker (session stuck STOPPING while the pod
-    keeps billing) or crash the server. Convert it to a normal RuntimeError so
-    those handlers catch it and surface a recoverable error.
+    Teardown must never be what fails a stop: the pod is already gone, and a
+    stuck tunnel process is a smaller problem than a session wedged in STOPPING
+    with the meter still running. The contract says release_access never raises;
+    this is the belt to that braces.
     """
     try:
-        value = getter()                    # vendored getter; sys.exit on missing/bad
-    except SystemExit as e:                  # missing / mis-permissioned / empty secret
-        raise RuntimeError("secret unavailable — check ~/.config/podlink") from e
-    egress_logger.register_secret(value)    # strip this exact value from any log line
-    return value
+        provider.release_access()
+    except Exception:  # noqa: BLE001 — a leaked local process is not worth failing on
+        session.add_event("could not close the provider access path", "system")
 
 
 def list_pods() -> list[dict]:
-    """Return a WHITELISTED list of the account's pods for the selector.
+    """The account's instances for the selector (whitelisted fields only)."""
+    provider = active_provider()
+    provider.authenticate()                              # authenticate the SDK
+    return provider.list_instances()
 
-    Only safe scalar fields are returned — never the raw pod dict, which can
-    embed `env` (VLLM_API_KEY / HF_TOKEN). Adding fields here is a security
-    decision: never surface `env`, ports, or anything credential-bearing.
+
+def persistence_configured() -> bool:
+    """True when storage survives POD DOWN, so terminate is non-destructive.
+
+    When False, POD DOWN DESTROYS the ~36 GB of downloaded weights, so the
+    server refuses without an explicit confirm and the web UI warns first.
     """
-    runpod.api_key = _read_secret(_secrets.runpod_api_key)   # authenticate the SDK
-    pods = []
-    for p in runpod.get_pods():                              # enumerate every pod
-        machine = p.get("machine") or {}                     # gpu type nests here
-        pods.append({
-            "id": p.get("id"),
-            "name": p.get("name"),
-            "status": p.get("desiredStatus"),
-            "gpu": machine.get("gpuTypeId") or p.get("gpuTypeId"),
-            "cost_per_hr": p.get("costPerHr"),
-        })
-    return pods
-
-
-def network_volume_configured() -> bool:
-    """True when a RunPod Network Volume is set (weights persist across terminate).
-
-    When False, POD DOWN's terminate DESTROYS the ~36 GB of downloaded weights, so
-    the web UI warns before terminating — mirroring the CLI pod_down.py prompt.
-    """
-    return bool(pod_up.NETWORK_VOLUME_ID)
+    return active_provider().persistence_configured()
 
 
 # ---------------------------------------------------------------------------
@@ -128,85 +100,96 @@ def network_volume_configured() -> bool:
 # ---------------------------------------------------------------------------
 
 def start(session: PodSession) -> None:
-    """Provision, resume, or adopt the pod, then wait until it's up.
+    """Provision, resume, or adopt the instance, then wait until it's up.
 
     Assumes the session is already in STARTING (set atomically by the request
-    handler). If a specific pod was selected (session.target_pod_id) it is
-    adopted directly; otherwise Auto creates/resumes the podlink pod. On cancel
-    it returns quietly and lets the stop worker own the state; on failure it
-    flips the session to ERROR.
+    handler). If a specific instance was selected (session.target_pod_id) it is
+    adopted directly; otherwise Auto creates/adopts the podlink instance. On
+    cancel it returns quietly and lets the stop worker own the state; on failure
+    it flips the session to ERROR.
     """
     try:
-        runpod.api_key = _read_secret(_secrets.runpod_api_key)        # authenticate the SDK
+        provider = active_provider()
+        provider.authenticate()                           # load cloud credentials
         target = session.target_pod_id                    # a specific pod to adopt, or None
 
         if target:                                        # ---- adopt the selected pod ----
-            pod = runpod.get_pod(target)                  # fetch the chosen pod
-            if not pod:                                   # it was deleted since listing
+            instance = provider.get_instance(target)      # fetch the chosen instance
+            if not instance:                              # it was deleted since listing
                 raise RuntimeError("selected pod no longer exists")
             pod_id = target                               # id already recorded by the session
             session.update(phase="adopting selected pod")
             _arm_billing(session)                         # start the cost meter + idle timer
-            if pod.get("desiredStatus") != "RUNNING":     # stopped -> resume it
+            if not provider.is_running(instance):         # stopped -> resume it
                 session.update(phase="resuming selected pod")
-                runpod.resume_pod(pod_id, gpu_count=pod.get("gpuCount") or 1)
+                provider.resume(instance)
             if not _wait_for_running(session, pod_id):    # poll until RUNNING (or cancel)
                 return
-            # An arbitrary pod may not serve /v1/models, so RUNNING is 'up' here;
-            # skip the readiness probe and write_state (both assume the vLLM pod).
+            provider.ensure_access(pod_id)                # open the local path, if any
+            # An arbitrary instance may not serve /v1/models, so RUNNING is 'up'
+            # here; skip the readiness probe and write_state (both assume the
+            # podlink stack).
             session.commit_running()                      # -> RUNNING (unless a stop won)
             return
 
-        # ---- Auto: adopt a RUNNING podlink pod, else create a fresh one ----
+        # ---- Auto: adopt a RUNNING podlink instance, else create a fresh one ----
         # The lifecycle is terminate/recreate (see stop()), so we never resume. A
-        # non-RUNNING pod named `podlink` here is a leftover — crashed, or still
-        # being reaped after a terminate. Resuming it would error (a terminating
-        # pod can't resume), and a quick DOWN->UP would then fail instead of just
-        # making a new pod. So we adopt ONLY a RUNNING pod and otherwise create
-        # fresh; RunPod reaps the dead one.
-        existing = pod_up.find_existing()                 # is a pod already named podlink?
-        if existing is not None and existing.get("desiredStatus") == "RUNNING":
-            pod_id = existing["id"]                       # adopt the live pod
+        # non-RUNNING instance with podlink's name here is a leftover — crashed, or
+        # still being reaped after a terminate. Resuming it would error (a
+        # terminating pod can't resume), and a quick DOWN->UP would then fail
+        # instead of just making a new one. So we adopt ONLY a running instance
+        # and otherwise create fresh; the cloud reaps the dead one.
+        existing = provider.find_existing()               # is one already named podlink?
+        if existing is not None and provider.is_running(existing):
+            pod_id = provider.instance_id(existing)       # adopt the live instance
             # Capture the id before anything can block — closes the billing race.
             session.update(pod_id=pod_id, phase="adopting running pod")
         else:                                             # none, or a dead/reaping leftover
-            pod = _create_with_fallback(session)          # resolve RTX Pro 6000 + create
-            if pod is None:                               # cancel arrived during create
+            instance = _create_with_retries(session)      # prepare + create (cancel-aware)
+            if instance is None:                          # cancel arrived during create
                 return                                    # let the stop worker take over
-            pod_id = pod["id"]                            # id of the freshly created pod
+            pod_id = provider.instance_id(instance)       # id of the freshly created instance
             session.update(pod_id=pod_id, phase="pod created")  # capture id immediately
         _arm_billing(session)                             # start the cost meter + idle timer
 
         if not _wait_for_running(session, pod_id):        # poll until RUNNING (or cancel)
             return                                        # cancelled mid-wait
 
-        llm_url = pod_up.derive_proxy_url(pod_id, pod_up.SERVICE_PORTS["llm"])  # primary URL
-        session.update(proxy_url=llm_url,
+        # Open the local access path before anything reads a URL. This runs on
+        # the adopt branch above as well as here — an adopted instance is never
+        # created, so create_once() is the one place this must NOT live.
+        session.update(phase="opening the access path")
+        provider.ensure_access(pod_id)
+
+        urls = provider.service_urls(pod_id)              # llm/embedder/reranker base URLs
+        session.update(proxy_url=urls["llm"],             # primary URL
                        phase="waiting for all three services to become healthy")
-        if not _wait_for_all_ready(session, pod_id):       # LLM + embedder + reranker (or cancel)
+        if not _wait_for_all_ready(session, pod_id):      # LLM + embedder + reranker (or cancel)
             return                                        # cancelled mid-wait
 
         # Persist state only once safely up, matching the scripts' contract.
-        pod = runpod.get_pod(pod_id)                      # refresh the pod record
-        gpu_type = (pod.get("machine", {}).get("gpuTypeId")   # SDK nests gpu type here…
-                    or pod.get("gpuTypeId") or "unknown")     # …or here, depending on version
-        pod_up.write_state({**pod, "id": pod_id}, gpu_type)   # write pod_state.json
+        provider.write_state(pod_id)
 
         if not session.commit_running():                 # flip to RUNNING unless a stop won
             return                                        # a stop overtook us at the finish line
     except Exception as e:  # noqa: BLE001 — surface any failure to the UI
-        # Type only — str(e) from the SDK/httpx can embed request context
-        # (URLs, headers, the RunPod API key). The phase field already names
-        # the failing step; full detail stays server-side / in the dashboard.
+        # A failed launch owns its own teardown: no stop worker is coming, so
+        # anything ensure_access opened would leak. (The cancel returns above
+        # deliberately do NOT release — a cancel means POD DOWN is already
+        # running, and stop() closes the path once the pod is actually gone.)
+        _release_access(session, active_provider())
+        # Type only — str(e) from an SDK/httpx can embed request context
+        # (URLs, headers, the API key). The phase field already names the
+        # failing step; full detail stays server-side / in the cloud console.
         session.add_event(f"error during start: {type(e).__name__}", "system")
         session.update(state=State.ERROR, phase="error during start",
-                       error=f"{type(e).__name__} — check the RunPod dashboard for details")
+                       error=f"{type(e).__name__} — check the provider console for details")
 
 
 def _create_retries() -> int:
     """How many create attempts before giving up. Env-tunable; default 40 (~10 min
     at the 15s delay). Because POD DOWN can cancel mid-loop, a generous default is
-    safe — it rides out a transient EU-RO capacity shortage instead of failing at 15."""
+    safe — it rides out a transient capacity shortage instead of failing at 15."""
     try:
         return max(1, int(os.environ.get("PODLINK_CREATE_RETRIES", "40")))
     except ValueError:
@@ -221,61 +204,56 @@ def _create_retry_delay() -> int:
         return 15
 
 
-def _create_with_fallback(session: PodSession) -> dict | None:
-    """Resolve the RTX Pro 6000 id and create the pod (no GPU fallback).
+def _create_with_retries(session: PodSession) -> dict | None:
+    """Create the instance, riding out the capacity lottery. None if cancelled.
 
-    The bundled image + models are sized for the 96 GB card, so a smaller GPU
-    would OOM rather than help — we target one card. The host-selection lottery is
-    retried HERE (not in the vendored create_pod) so every attempt is reported to
-    the UI event feed and each inter-attempt wait is cancel-aware — POD DOWN
-    interrupts the wait immediately.
+    The retry loop lives HERE rather than in a provider so every attempt is
+    reported to the UI event feed and each inter-attempt wait is cancel-aware —
+    POD DOWN interrupts the wait immediately. The provider decides only what one
+    attempt is, and which failures are worth retrying: a stockout is transient,
+    but a quota or permission error must surface at once rather than hide behind
+    ten minutes of retries.
     """
-    bearer = _read_secret(_secrets.bearer_token)         # -> pod env VLLM_API_KEY
-    hf = _read_secret(_secrets.hf_token)                 # -> weight-pull token (all 3 services)
+    provider = active_provider()
+    bearer = read_secret(_secrets.bearer_token)          # -> the stack's API key
+    hf = read_secret(_secrets.hf_token)                  # -> weight-pull token (all 3 services)
     if session.cancel.is_set():                          # Down pressed before we resolve
         return None
-    session.update(phase="resolving RTX Pro 6000 GPU id")  # live catalog lookup
-    gpu_id = pod_up.resolve_gpu_id()                     # exact RunPod gpu_type_id
-    if session.cancel.is_set():
+    ctx = provider.prepare_create(session)               # pre-create lookups (cancel-aware)
+    if ctx is None:                                      # cancelled during preparation
         return None
-    session.update(phase="ensuring pod template")        # registry-cred template (cached)
-    template_id = pod_up.ensure_template()
+    secrets = {"bearer": bearer, "hf": hf}
     retries, delay = _create_retries(), _create_retry_delay()
     for attempt in range(1, retries + 1):
         if session.cancel.is_set():                      # Down pressed between attempts
             return None
-        session.update(phase=f"creating pod on {gpu_id} — attempt {attempt}/{retries}")
+        session.update(phase=provider.create_phase(ctx, attempt, retries))
         try:
-            return pod_up.create_pod_once(gpu_id, bearer, hf, template_id)  # one attempt
-        except QueryError as e:
-            if not pod_up.is_retryable_create_error(e):  # real error (bad spec/auth) — surface it
+            return provider.create_once(ctx, secrets)    # one attempt
+        except provider.create_error_types as e:
+            if not provider.is_retryable_create_error(e):  # real error — surface it
                 raise
-            session.add_event(                           # visible in the UI feed
-                f"no host with capacity yet — attempt {attempt}/{retries}; retrying in {delay}s")
+            session.add_event(provider.capacity_note(attempt, retries, delay))  # UI feed
             if attempt < retries and _sleep_or_cancel(session, delay):  # cancel-aware wait
                 return None
-    raise RuntimeError(
-        f"no Secure host in the volume's region accepted the pod after {retries} "
-        f"attempts (~{retries * delay // 60} min). RTX PRO 6000 capacity is transient — "
-        f"press POD UP to keep trying, or try again later.")
+    raise RuntimeError(provider.create_exhausted_message(retries, delay))
 
 
 def _wait_for_running(session: PodSession, pod_id: str) -> bool:
-    """Poll until desiredStatus == RUNNING with a runtime, or cancel/timeout."""
+    """Poll until the instance is up with a live container, or cancel/timeout."""
+    provider = active_provider()
     deadline = time.time() + RUNNING_TIMEOUT_S            # absolute give-up time
     while time.time() < deadline:                        # loop until deadline
         if session.cancel.is_set():                      # Down pressed mid-provision
             return False                                 # bail; stop worker owns state
-        pod = runpod.get_pod(pod_id)                     # fetch current pod record
-        status = pod.get("desiredStatus") if pod else None   # e.g. "RUNNING"/"CREATED"
-        if pod and pod.get("costPerHr") is not None:     # capture the hourly rate for the meter
-            try:
-                session.update(cost_per_hr=float(pod["costPerHr"]))
-            except (TypeError, ValueError):
-                pass
+        instance = provider.get_instance(pod_id)         # fetch current record
+        status = provider.status_of(instance) if instance else None   # e.g. "RUNNING"
+        rate = provider.cost_per_hr(instance) if instance else None   # for the meter
+        if rate is not None:                             # capture the hourly rate
+            session.update(cost_per_hr=rate)
         session.update(phase=f"waiting for RUNNING… ({status})")  # progress text
-        if pod and status == "RUNNING" and pod.get("runtime"):    # container is actually up
-            return True                                  # ready to check vLLM next
+        if instance and provider.is_up(instance):        # container is actually up
+            return True                                  # ready to check the services next
         if _sleep_or_cancel(session, POLL_S):            # wait, but wake early on cancel
             return False                                 # cancelled during the sleep
     raise RuntimeError(f"pod {pod_id} did not reach RUNNING within {RUNNING_TIMEOUT_S}s")
@@ -283,9 +261,9 @@ def _wait_for_running(session: PodSession, pod_id: str) -> bool:
 
 def _service_probes(pod_id: str, bearer: str) -> dict:
     """Map each service to its (health-url, auth-headers). All three are gated by
-    the same bearer (their ports are on RunPod's public proxy)."""
+    the same bearer, since their ports are reachable over the provider's ingress."""
     auth = {"Authorization": f"Bearer {bearer}"}
-    urls = pod_up.service_urls(pod_id)                   # {llm,embedder,reranker: base URL}
+    urls = active_provider().service_urls(pod_id)        # {llm,embedder,reranker: base URL}
     return {
         "llm":      (f"{urls['llm']}/v1/models",   auth),
         "embedder": (f"{urls['embedder']}/health", auth),
@@ -315,7 +293,7 @@ def _apply_health(session: PodSession, statuses: dict) -> None:
 def probe_health_once(session: PodSession, pod_id: str) -> None:
     """Probe all three services once and update the health tiles — used by the
     background poller while RUNNING (healthy | down)."""
-    bearer = _read_secret(_secrets.bearer_token)
+    bearer = read_secret(_secrets.bearer_token)
     probes = _service_probes(pod_id, bearer)
     statuses = {name: ("healthy" if _probe_service(url, headers) else "down")
                 for name, (url, headers) in probes.items()}
@@ -350,9 +328,11 @@ def test_stack(session: PodSession) -> None:
         if not pod_id:
             session.update(test_running=False, test_result={"error": "no pod running"})
             return
-        bearer = _read_secret(_secrets.bearer_token)     # gates all three services
+        provider = active_provider()
+        stack = provider.stack_config()                  # served name + embed model id
+        bearer = read_secret(_secrets.bearer_token)      # gates all three services
         auth = {"Authorization": f"Bearer {bearer}"}
-        urls = pod_up.service_urls(pod_id)
+        urls = provider.service_urls(pod_id)
         session.update(test_running=True)
         session.add_event("stack test started", "system")
         services: dict = {}
@@ -360,7 +340,7 @@ def test_stack(session: PodSession) -> None:
         # 1) LLM — OpenAI chat completion (model must equal vLLM --served-model-name).
         ok, ms, status, data = _timed_post(
             f"{urls['llm']}/v1/chat/completions", auth,
-            {"model": pod_up.LLM_SERVED_NAME,
+            {"model": stack["llm_served_name"],
              "messages": [{"role": "user", "content": "ping"}],
              "max_tokens": 1, "temperature": 0})
         services["llm"] = {"ok": ok, "latency_ms": ms,
@@ -370,7 +350,7 @@ def test_stack(session: PodSession) -> None:
         # 2) Embedder — OpenAI embeddings; the vector length is the served dimension.
         ok, ms, status, data = _timed_post(
             f"{urls['embedder']}/v1/embeddings", auth,
-            {"model": pod_up.EMBED_MODEL_ID, "input": "hello world"})
+            {"model": stack["embed_model_id"], "input": "hello world"})
         dim = None
         try:
             dim = len(data["data"][0]["embedding"])
@@ -386,7 +366,7 @@ def test_stack(session: PodSession) -> None:
         ok, ms, status, data = _timed_post(
             f"{urls['reranker']}/rerank", auth,
             {"query": "what does podlink do",
-             "texts": ["podlink controls a RunPod GPU pod", "an unrelated sentence"]})
+             "texts": ["podlink controls a GPU pod", "an unrelated sentence"]})
         top = None
         try:
             top = round(max(x["score"] for x in data), 3)  # TEI returns [{index, score}, ...]
@@ -412,7 +392,7 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
     service is dropped from the poll set once healthy; the per-service tiles and
     the phase text report which are still coming up.
     """
-    bearer = _read_secret(_secrets.bearer_token)         # gates all three services
+    bearer = read_secret(_secrets.bearer_token)          # gates all three services
     probes = _service_probes(pod_id, bearer)             # service -> (url, headers)
     ready: set[str] = set()                              # services confirmed 200
     deadline = time.time() + READY_TIMEOUT_S             # absolute give-up time
@@ -444,18 +424,20 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def stop(session: PodSession) -> None:
-    """Terminate the pod (GPU + pod released; weights persist on the Network
-    Volume) and VERIFY it actually left RUNNING.
+    """Terminate the instance (GPU released) and VERIFY it actually left RUNNING.
 
-    Terminate, not stop: a stopped pod is host-pinned and can fail to resume when
-    that host has no free GPU. Works whether the pod is still provisioning or fully
-    RUNNING. Never trusts pod_state.json alone — resolves the pod id from live
-    memory or by name so a pod created before the state file existed is still caught.
+    Terminate, not stop: a stopped pod can be host-pinned and fail to resume when
+    that host has no free GPU. Works whether the instance is still provisioning or
+    fully RUNNING. Never trusts the on-disk state file alone — resolves the id from
+    live memory or by name, so an instance created before the file existed is still
+    caught.
     """
+    provider = None                                      # for the finally below
     try:
-        runpod.api_key = _read_secret(_secrets.runpod_api_key)       # authenticate the SDK
+        provider = active_provider()
+        provider.authenticate()                          # load cloud credentials
 
-        pod_id = _resolve_pod_id(session)                # find the pod however we can
+        pod_id = _resolve_pod_id(session, provider)      # find the instance however we can
         if pod_id is None:                               # genuinely nothing exists to terminate
             session.update(state=State.IDLE, phase="no pod found — nothing to terminate",
                            pod_id=None, proxy_url=None,   # settle back to IDLE
@@ -464,10 +446,10 @@ def stop(session: PodSession) -> None:
             return
 
         session.update(pod_id=pod_id, phase=f"terminating pod {pod_id}")  # progress text
-        runpod.terminate_pod(pod_id)                     # release the GPU (weights persist on the Network Volume)
+        provider.terminate(pod_id)                       # release the GPU
 
         if _verify_terminated(session, pod_id):          # confirm it left RUNNING / vanished
-            _clear_state_file()                          # drop pod_state.json so a stale id can't resurface
+            provider.clear_state()                       # drop the state file so a stale id can't resurface
             session.update(state=State.IDLE, phase="terminated — GPU released",
                            pod_id=None, proxy_url=None,   # safe: back to IDLE
                            billing_started_at=None, cost_per_hr=None, auto_terminate_at=None,  # stop the meter
@@ -477,72 +459,62 @@ def stop(session: PodSession) -> None:
         else:                                            # could NOT confirm — do not lie
             session.update(
                 state=State.ERROR,                       # loud error state, buttons stay live
-                phase="TERMINATE NOT VERIFIED — check RunPod dashboard immediately",
-                error="terminate_pod issued but pod did not leave RUNNING within "
+                phase="TERMINATE NOT VERIFIED — check the provider console immediately",
+                error="terminate issued but the pod did not leave RUNNING within "
                       f"{STOP_VERIFY_TIMEOUT_S}s; it may still be charging.",
             )
     except Exception as e:  # noqa: BLE001                # surface any terminate failure
         # Type only — never interpolate str(e); it may leak request context/secrets.
         session.add_event(f"error during terminate: {type(e).__name__}", "system")
         session.update(state=State.ERROR, phase="error during terminate",
-                       error=f"{type(e).__name__} — check the RunPod dashboard for details")
+                       error=f"{type(e).__name__} — check the provider console for details")
+    finally:
+        # Every path out of a stop closes the access path — the confirmed
+        # terminate, the nothing-to-terminate early return, and the error
+        # branches. The pod is gone or unreachable in all of them, so an open
+        # tunnel is pure leak.
+        if provider is not None:
+            _release_access(session, provider)
 
 
-def _resolve_pod_id(session: PodSession) -> str | None:
-    """Find the pod id, most-authoritative source first.
+def _resolve_pod_id(session: PodSession, provider) -> str | None:
+    """Find the instance id, most-authoritative source first.
 
-    1. In-memory id captured the instant create_pod returned.
-    2. Live lookup by name (catches a pod created just as Down was pressed —
+    1. In-memory id captured the instant create returned.
+    2. Live lookup by name (catches an instance created just as Down was pressed —
        retried because the create call may still be returning).
-    3. pod_state.json on disk (only exists after a fully successful start).
+    3. The on-disk state file (only exists after a fully successful start).
     """
     if session.pod_id:                                   # (1) fastest, most reliable
         return session.pod_id
     for _ in range(5):                                   # (2) retry to beat the create race
-        found = pod_up.find_existing()                   # enumerate pods, match by name
-        if found is not None:                            # a matching pod now exists
-            return found["id"]
+        found = provider.find_existing()                 # enumerate instances, match by name
+        if found is not None:                            # a matching instance now exists
+            return provider.instance_id(found)
         time.sleep(2)                                    # let an in-flight create surface
-    if pod_up.STATE_PATH.exists():                       # (3) disk fallback
-        try:
-            return json.loads(pod_up.STATE_PATH.read_text()).get("pod_id")  # read saved id
-        except Exception:  # noqa: BLE001                # corrupt/partial state file
-            return None
-    return None                                          # nothing found anywhere
-
-
-def _clear_state_file() -> None:
-    """Remove pod_state.json after a confirmed terminate.
-
-    The disk fallback in _resolve_pod_id reads this file; leaving it after the
-    pod is destroyed lets a later Down hand terminate_pod an already-dead id,
-    which flips the UI to a spurious ERROR. Best-effort — cleanup never fails Down.
-    """
-    try:
-        pod_up.STATE_PATH.unlink(missing_ok=True)        # gone-or-not, end up with no file
-    except Exception:  # noqa: BLE001 — cleanup is best-effort, never fatal to a stop
-        pass
+    return provider.state_file_instance_id()             # (3) disk fallback, or None
 
 
 def _verify_terminated(session: PodSession, pod_id: str) -> bool:
-    """Confirm the pod left RUNNING (or is gone) — proof the GPU has been released.
+    """Confirm the instance left RUNNING (or is gone) — proof the GPU is released.
 
-    terminate_pod already succeeded, so a subsequent get_pod may return None OR
-    raise (the pod is being deleted and is no longer retrievable). Both mean 'not
+    terminate already succeeded, so a subsequent lookup may return None OR raise
+    (the instance is being deleted and is no longer retrievable). Both mean 'not
     running', so we treat either as terminated rather than reporting a false
-    failure on the get_pod call.
+    failure on the lookup call.
     """
+    provider = active_provider()
     deadline = time.time() + STOP_VERIFY_TIMEOUT_S       # absolute give-up time
     while time.time() < deadline:                        # poll until confirmed or timeout
         try:
-            pod = runpod.get_pod(pod_id)                 # fetch current record
-        except Exception:  # noqa: BLE001                # pod already deleted / not retrievable
+            instance = provider.get_instance(pod_id)     # fetch current record
+        except Exception:  # noqa: BLE001                # already deleted / not retrievable
             return True                                  # terminate was accepted => gone
-        if pod is None:                                  # pod gone entirely
+        if instance is None:                             # instance gone entirely
             return True                                  # => definitely not billing GPU
-        status = pod.get("desiredStatus")                # e.g. "EXITED"/"STOPPED"
+        status = provider.status_of(instance)            # e.g. "EXITED"/"STOPPED"
         session.update(phase=f"verifying termination… ({status})")  # progress text
-        if status and status != "RUNNING":               # left RUNNING => GPU released
+        if status and not provider.is_running(instance):  # left RUNNING => GPU released
             return True
-        time.sleep(3)                                    # brief pause before re-checking
+        time.sleep(STOP_VERIFY_POLL_S)                   # brief pause before re-checking
     return False                                         # could not confirm within the window

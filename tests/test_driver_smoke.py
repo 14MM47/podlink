@@ -8,6 +8,10 @@ riskiest pieces of new logic without a real pod:
   * resolve_gpu_id() — RTX Pro 6000 catalog lookup
   * _wait_for_all_ready() — the LLM + embedder + reranker readiness gate
 
+The driver itself is provider-neutral, so these tests drive it through the
+RunPod provider (`rp`) — which is what `providers.active()` returns unless
+PODLINK_PROVIDER says otherwise.
+
 Run: python3 tests/test_driver_smoke.py   (plain asserts, no pytest needed)
 """
 from __future__ import annotations
@@ -55,8 +59,10 @@ fake_secrets.hf_token = lambda: "hf_dummy"
 fake_secrets.bearer_token = lambda: "bearer_dummy"
 sys.modules["_secrets"] = fake_secrets
 
-# Now safe to import the driver (it self-bootstraps pod_control onto sys.path).
-from app import runpod_driver as rd                 # noqa: E402
+# Now safe to import the driver (app.vendored bootstraps pod_control onto sys.path).
+from app import driver as rd                        # noqa: E402  provider-neutral orchestration
+from app import providers, vendored                 # noqa: E402  provider registry + secret reader
+from app.providers import runpod as rp              # noqa: E402  the RunPod provider (owns pod_up)
 from app.session import PodSession, State            # noqa: E402
 
 # Make the readiness loop fast for tests.
@@ -108,7 +114,7 @@ def test_gql_escape_env_makes_json_values_safe():
     # values (VLLM_EXTRA_ARGS) must be pre-escaped or create_pod dies instantly.
     raw = {"VLLM_EXTRA_ARGS": '--limit-mm-per-prompt {"image":1,"video":0}',
            "PLAIN": "no-quotes", "BACKSLASH": "a\\b"}
-    esc = rd.pod_up._gql_escape_env(raw)
+    esc = rp.pod_up._gql_escape_env(raw)
     check("quotes escaped for GraphQL",
           esc["VLLM_EXTRA_ARGS"] == '--limit-mm-per-prompt {\\"image\\":1,\\"video\\":0}')
     check("plain values untouched", esc["PLAIN"] == "no-quotes")
@@ -121,7 +127,7 @@ def test_create_pod_once_sends_escaped_env():
     import os
     os.environ["PODLINK_VLLM_EXTRA_ARGS"] = '--x {"a":1}'
     try:
-        pod = rd.pod_up.create_pod_once("gpu-id", "bearer", "hf", "tmpl-id")
+        pod = rp.pod_up.create_pod_once("gpu-id", "bearer", "hf", "tmpl-id")
         check("create_pod received escaped env",
               pod["env"]["VLLM_EXTRA_ARGS"] == '--x {\\"a\\":1}')
     finally:
@@ -129,7 +135,7 @@ def test_create_pod_once_sends_escaped_env():
 
 
 def test_resolve_gpu_id_matches_rtx_pro_6000():
-    gid = rd.pod_up.resolve_gpu_id()
+    gid = rp.pod_up.resolve_gpu_id()
     check("resolve_gpu_id -> RTX Pro 6000 id",
           gid == "NVIDIA RTX PRO 6000 Blackwell WE")
 
@@ -140,7 +146,7 @@ def test_resolve_gpu_id_raises_when_absent():
     try:
         raised = False
         try:
-            rd.pod_up.resolve_gpu_id()
+            rp.pod_up.resolve_gpu_id()
         except RuntimeError:
             raised = True
         check("resolve_gpu_id raises when no match", raised)
@@ -183,8 +189,197 @@ def test_create_aborts_on_cancel_before_create():
     s = PodSession()
     s.try_begin_start(None)
     s.cancel.set()
-    check("_create_with_fallback returns None when cancelled",
-          rd._create_with_fallback(s) is None)
+    check("_create_with_retries returns None when cancelled",
+          rd._create_with_retries(s) is None)
+
+
+def test_provider_selection():
+    # The driver resolves its cloud from PODLINK_PROVIDER; the default is RunPod,
+    # and an unknown name fails loudly at selection rather than mid-launch.
+    import os as _os
+    check("default provider is runpod", providers.active().name == "runpod")
+    saved = _os.environ.get("PODLINK_PROVIDER")
+    _os.environ["PODLINK_PROVIDER"] = "nope"
+    try:
+        raised = False
+        try:
+            providers.active()
+        except ValueError:
+            raised = True
+        check("unknown PODLINK_PROVIDER raises", raised)
+    finally:
+        if saved is None:
+            _os.environ.pop("PODLINK_PROVIDER", None)
+        else:
+            _os.environ["PODLINK_PROVIDER"] = saved
+    check("provider restored after the bad name", providers.active().name == "runpod")
+
+
+def test_provider_snapshot_fields_are_complete():
+    # The UI renders these generically, so a provider that omits one silently
+    # breaks the persistence banner or the POD DOWN guard.
+    fields = providers.active().snapshot_fields()
+    required = {"provider", "persistence_configured", "persistence_id",
+                "persistence_label", "llm_model_id"}
+    check("snapshot_fields carries every UI key", required <= set(fields))
+    check("persistence_configured is a bool", isinstance(fields["persistence_configured"], bool))
+
+
+class _AccessRecorder:
+    """Record ensure_access / release_access calls on the live provider.
+
+    Instance attributes shadow the class methods, so restore() deletes them and
+    lets the real (no-op) RunPod implementations take over again.
+    """
+
+    def __init__(self):
+        self.provider = providers.active()
+        self.opened = []
+        self.released = 0
+        self.provider.ensure_access = lambda instance_id: self.opened.append(instance_id)
+        self.provider.release_access = lambda: setattr(self, "released", self.released + 1)
+
+    def restore(self):
+        for attr in ("ensure_access", "release_access"):
+            try:
+                delattr(self.provider, attr)
+            except AttributeError:
+                pass
+
+
+def _healthy_pod_fixture(scratch):
+    """Fakes for a pod that is RUNNING with all three services answering 200."""
+    install_fake_client(lambda url: 200)
+    rp.pod_up.STATE_PATH = scratch          # never touch the real pod_state.json
+
+
+def test_is_running_and_is_up_are_not_the_same_predicate():
+    # These drive different decisions: is_running gates resume/adopt, is_up gates
+    # the readiness wait. Collapsing them would make podlink call a pod 'up' the
+    # instant RunPod says RUNNING — before the container actually exists.
+    p = providers.active()
+    booting = {"id": "podX", "desiredStatus": "RUNNING"}                    # no runtime yet
+    serving = {"id": "podX", "desiredStatus": "RUNNING", "runtime": {"uptimeInSeconds": 5}}
+    exited = {"id": "podX", "desiredStatus": "EXITED"}
+    check("is_running True while still booting", p.is_running(booting) is True)
+    check("is_up False until a runtime exists", p.is_up(booting) is False)
+    check("is_up True once a runtime exists", p.is_up(serving) is True)
+    check("is_running False when EXITED", p.is_running(exited) is False)
+
+
+def test_wait_for_running_ignores_running_without_a_runtime():
+    # The driver must keep waiting on RUNNING-without-runtime, not treat it as up.
+    saved = (fake_runpod.get_pod, rd.RUNNING_TIMEOUT_S)
+    fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "RUNNING"}
+    rd.RUNNING_TIMEOUT_S = 0.3
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        timed_out = False
+        try:
+            rd._wait_for_running(s, "podX")
+        except RuntimeError:
+            timed_out = True
+        check("_wait_for_running keeps waiting without a runtime", timed_out)
+    finally:
+        fake_runpod.get_pod, rd.RUNNING_TIMEOUT_S = saved
+
+
+def test_verify_terminated_keeps_polling_on_unknown_status():
+    # An absent/empty status is NOT proof the GPU was released — it must keep
+    # polling and ultimately report failure rather than claim a clean terminate.
+    saved = (fake_runpod.get_pod, rd.STOP_VERIFY_TIMEOUT_S, rd.STOP_VERIFY_POLL_S)
+    fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": None}
+    rd.STOP_VERIFY_TIMEOUT_S, rd.STOP_VERIFY_POLL_S = 0.2, 0.01
+    try:
+        check("_verify_terminated False when the status is unknown",
+              rd._verify_terminated(PodSession(), "podX") is False)
+    finally:
+        fake_runpod.get_pod, rd.STOP_VERIFY_TIMEOUT_S, rd.STOP_VERIFY_POLL_S = saved
+
+
+def test_start_opens_access_on_the_adopt_path():
+    # An ADOPTED instance is never created, so an access path opened inside
+    # create_once() would never exist for it. This is the regression guard.
+    rec = _AccessRecorder()
+    saved = (rp.pod_up.find_existing, rp.pod_up.STATE_PATH)
+    scratch = Path("/tmp/podlink_access_adopt.json")
+    rp.pod_up.find_existing = lambda: {"id": "adopted1", "desiredStatus": "RUNNING",
+                                       "runtime": {"uptimeInSeconds": 9}}
+    _healthy_pod_fixture(scratch)
+    try:
+        s = PodSession()
+        s.try_begin_start(None)                      # Auto — no explicit target
+        rd.start(s)
+        check("adopt path opened the access path", rec.opened == ["adopted1"])
+        check("adopt path reached RUNNING", s.snapshot()["state"] == "RUNNING")
+    finally:
+        rp.pod_up.find_existing, rp.pod_up.STATE_PATH = saved
+        scratch.unlink(missing_ok=True)
+        rec.restore()
+
+
+def test_start_opens_access_on_the_create_path():
+    rec = _AccessRecorder()
+    saved = (rp.pod_up.find_existing, rp.pod_up.create_pod_once, rp.pod_up.ensure_template,
+             rp.pod_up.resolve_gpu_id, rp.pod_up.STATE_PATH)
+    scratch = Path("/tmp/podlink_access_create.json")
+    rp.pod_up.find_existing = lambda: None           # nothing to adopt -> create
+    rp.pod_up.resolve_gpu_id = lambda: "gpuX"
+    rp.pod_up.ensure_template = lambda: "tmpl1"
+    rp.pod_up.create_pod_once = lambda *a, **k: {"id": "created1"}
+    _healthy_pod_fixture(scratch)
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        rd.start(s)
+        check("create path opened the access path", rec.opened == ["created1"])
+    finally:
+        (rp.pod_up.find_existing, rp.pod_up.create_pod_once, rp.pod_up.ensure_template,
+         rp.pod_up.resolve_gpu_id, rp.pod_up.STATE_PATH) = saved
+        scratch.unlink(missing_ok=True)
+        rec.restore()
+
+
+def test_failed_start_closes_the_access_path():
+    # No stop worker follows a failed start, so start() owns the teardown —
+    # otherwise a tunnel process outlives the launch that opened it.
+    rec = _AccessRecorder()
+    saved = (rp.pod_up.find_existing, rd.READY_TIMEOUT_S)
+    rp.pod_up.find_existing = lambda: {"id": "doomed1", "desiredStatus": "RUNNING",
+                                       "runtime": {"uptimeInSeconds": 1}}
+    install_fake_client(lambda url: 503)             # services never come up
+    rd.READY_TIMEOUT_S = 0.2
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        rd.start(s)
+        check("failed start opened then closed the access path",
+              rec.opened == ["doomed1"] and rec.released == 1)
+        check("failed start lands in ERROR", s.snapshot()["state"] == "ERROR")
+    finally:
+        rp.pod_up.find_existing, rd.READY_TIMEOUT_S = saved
+        rec.restore()
+
+
+def test_stop_closes_the_access_path():
+    rec = _AccessRecorder()
+    saved = (fake_runpod.get_pod, rp.pod_up.STATE_PATH)
+    scratch = Path("/tmp/podlink_access_stop.json")
+    fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "EXITED"}
+    rp.pod_up.STATE_PATH = scratch
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        s.pod_id = "podX"
+        s.try_begin_stop()
+        rd.stop(s)
+        check("stop closed the access path", rec.released == 1)
+        check("stop still landed IDLE", s.snapshot()["state"] == "IDLE")
+    finally:
+        fake_runpod.get_pod, rp.pod_up.STATE_PATH = saved
+        scratch.unlink(missing_ok=True)
+        rec.restore()
 
 
 def test_stop_terminates_and_lands_idle():
@@ -193,12 +388,12 @@ def test_stop_terminates_and_lands_idle():
     terminated = {}
     saved_term = fake_runpod.terminate_pod
     saved_get = fake_runpod.get_pod
-    saved_state = rd.pod_up.STATE_PATH
+    saved_state = rp.pod_up.STATE_PATH
     scratch = Path("/tmp/podlink_smoke_state.json")     # never touch the real pod_state.json
     scratch.write_text('{"pod_id": "podX"}')            # something for _clear_state_file to remove
     fake_runpod.terminate_pod = lambda pod_id: terminated.__setitem__("id", pod_id)
     fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "EXITED"}  # verify passes at once
-    rd.pod_up.STATE_PATH = scratch
+    rp.pod_up.STATE_PATH = scratch
     try:
         s = PodSession()
         s.try_begin_start(None)      # -> STARTING
@@ -212,7 +407,7 @@ def test_stop_terminates_and_lands_idle():
     finally:
         fake_runpod.terminate_pod = saved_term
         fake_runpod.get_pod = saved_get
-        rd.pod_up.STATE_PATH = saved_state
+        rp.pod_up.STATE_PATH = saved_state
         scratch.unlink(missing_ok=True)
 
 
@@ -225,12 +420,12 @@ def test_read_secret_converts_systemexit():
         raise SystemExit("Missing secret: ~/.config/podlink/runpod_api_key")
     outcome = "no-raise"
     try:
-        rd._read_secret(missing)
+        vendored.read_secret(missing)
     except RuntimeError:
         outcome = "RuntimeError"
     except SystemExit:
         outcome = "SystemExit"
-    check("_read_secret converts SystemExit -> RuntimeError", outcome == "RuntimeError")
+    check("read_secret converts SystemExit -> RuntimeError", outcome == "RuntimeError")
 
 
 def test_verify_terminated_true_when_get_pod_raises():
@@ -342,21 +537,21 @@ def test_create_retries_then_succeeds_and_logs():
         if calls["n"] < 3:
             raise QE("There are no longer any instances available with the requested specifications")
         return {"id": "pod-ok"}
-    saved = (rd.pod_up.create_pod_once, rd.pod_up.ensure_template,
-             rd.pod_up.resolve_gpu_id, rd._sleep_or_cancel)
-    rd.pod_up.create_pod_once = flaky
-    rd.pod_up.ensure_template = lambda: "tmpl1"
-    rd.pod_up.resolve_gpu_id = lambda: "gpuX"
+    saved = (rp.pod_up.create_pod_once, rp.pod_up.ensure_template,
+             rp.pod_up.resolve_gpu_id, rd._sleep_or_cancel)
+    rp.pod_up.create_pod_once = flaky
+    rp.pod_up.ensure_template = lambda: "tmpl1"
+    rp.pod_up.resolve_gpu_id = lambda: "gpuX"
     rd._sleep_or_cancel = lambda session, secs: False   # instant, not cancelled
     try:
         s = PodSession(); s.try_begin_start(None)
-        pod = rd._create_with_fallback(s)
+        pod = rd._create_with_retries(s)
         check("retries then succeeds on the 3rd attempt", pod == {"id": "pod-ok"} and calls["n"] == 3)
         check("retry attempts logged to the event feed",
               any("no host with capacity" in m for _, _c, m in s.events))
     finally:
-        (rd.pod_up.create_pod_once, rd.pod_up.ensure_template,
-         rd.pod_up.resolve_gpu_id, rd._sleep_or_cancel) = saved
+        (rp.pod_up.create_pod_once, rp.pod_up.ensure_template,
+         rp.pod_up.resolve_gpu_id, rd._sleep_or_cancel) = saved
 
 
 def test_stack_probes_all_three_and_detects_dim():
@@ -399,20 +594,20 @@ def test_stack_flags_service_failure():
 def test_create_non_retryable_error_surfaces():
     # A non-capacity QueryError (bad spec/auth) must NOT be retried — it surfaces.
     from runpod.error import QueryError as QE
-    saved = (rd.pod_up.create_pod_once, rd.pod_up.ensure_template, rd.pod_up.resolve_gpu_id)
-    rd.pod_up.create_pod_once = lambda *a, **k: (_ for _ in ()).throw(QE("invalid gpu spec"))
-    rd.pod_up.ensure_template = lambda: "t"
-    rd.pod_up.resolve_gpu_id = lambda: "g"
+    saved = (rp.pod_up.create_pod_once, rp.pod_up.ensure_template, rp.pod_up.resolve_gpu_id)
+    rp.pod_up.create_pod_once = lambda *a, **k: (_ for _ in ()).throw(QE("invalid gpu spec"))
+    rp.pod_up.ensure_template = lambda: "t"
+    rp.pod_up.resolve_gpu_id = lambda: "g"
     try:
         s = PodSession(); s.try_begin_start(None)
         raised = False
         try:
-            rd._create_with_fallback(s)
+            rd._create_with_retries(s)
         except QE:
             raised = True
         check("non-retryable create error surfaces (not retried)", raised)
     finally:
-        (rd.pod_up.create_pod_once, rd.pod_up.ensure_template, rd.pod_up.resolve_gpu_id) = saved
+        (rp.pod_up.create_pod_once, rp.pod_up.ensure_template, rp.pod_up.resolve_gpu_id) = saved
 
 
 if __name__ == "__main__":
@@ -425,6 +620,15 @@ if __name__ == "__main__":
     test_all_ready_waits_for_stragglers_then_times_out()
     test_all_ready_cancels_promptly()
     test_create_aborts_on_cancel_before_create()
+    test_provider_selection()
+    test_provider_snapshot_fields_are_complete()
+    test_is_running_and_is_up_are_not_the_same_predicate()
+    test_wait_for_running_ignores_running_without_a_runtime()
+    test_verify_terminated_keeps_polling_on_unknown_status()
+    test_start_opens_access_on_the_adopt_path()
+    test_start_opens_access_on_the_create_path()
+    test_failed_start_closes_the_access_path()
+    test_stop_closes_the_access_path()
     test_stop_terminates_and_lands_idle()
     test_read_secret_converts_systemexit()
     test_verify_terminated_true_when_get_pod_raises()

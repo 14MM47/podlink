@@ -10,7 +10,7 @@ const metaEl = document.getElementById("meta");    // pod id / proxy url line
 const podSelect = document.getElementById("podSelect");  // target-pod dropdown
 const profileSelect = document.getElementById("profileSelect");  // stack-profile dropdown
 const refreshBtn = document.getElementById("refresh");   // reload-pod-list button
-const volwarn = document.getElementById("volwarn");      // "no Network Volume" banner
+const volwarn = document.getElementById("volwarn");      // "no persistent storage" banner
 const costEl = document.getElementById("cost");          // uptime + running cost line
 const autotermEl = document.getElementById("autoterm");  // auto-terminate countdown row
 const autotermText = document.getElementById("autotermText");  // its text span
@@ -26,7 +26,7 @@ const feedEls = {                                        // event feed split by 
   health: document.getElementById("feed-health"),        // per-service transitions
   system: document.getElementById("feed-system"),        // errors / auto-terminate
 };
-const volinfoEl = document.getElementById("volinfo");    // network-volume info line
+const volinfoEl = document.getElementById("volinfo");    // persistent-storage info line
 const actionsEl = document.getElementById("actions");    // per-pod action buttons
 const copyenvBtn = document.getElementById("copyenv");   // copy the client config
 const copiedEl = document.getElementById("copied");      // "copied ✓" flash
@@ -182,8 +182,8 @@ function escapeHtml(s) {
 function render(s) {
   lastSnap = s;                                     // remember it for the POD DOWN guard
 
-  // "no Network Volume" banner — only toggle on change.
-  const warn = s.network_volume_configured === false;
+  // "no persistent storage" banner — only toggle on change.
+  const warn = s.persistence_configured === false;
   if (warn !== mWarn) { volwarn.classList.toggle("show", warn); mWarn = warn; }
 
   // Badge / phase / error — tiny text, but gated to avoid churn (and animation restarts).
@@ -197,12 +197,14 @@ function render(s) {
     if (s.pod_id) {
       const pid = escapeHtml(s.pod_id);
       let m = `<div><span class="k">pod</span> <span class="pid">${pid}</span></div>`;
-      if (s.proxy_url) {
-        const base = (port) => `https://${pid}-${port}.proxy.runpod.net`;
+      // Endpoints come from the server (the provider builds them) — a proxy URL
+      // on one cloud is a tunnelled loopback port on another.
+      if (s.proxy_url && s.service_urls) {
+        const u = s.service_urls;
         m += `<div class="urls">` +
-             `<span><b>llm</b> ${base(8000)}/v1</span>` +
-             `<span><b>embed</b> ${base(8080)}/v1</span>` +
-             `<span><b>rerank</b> ${base(8081)}</span></div>`;
+             `<span><b>llm</b> ${escapeHtml(u.llm)}/v1</span>` +
+             `<span><b>embed</b> ${escapeHtml(u.embedder)}/v1</span>` +
+             `<span><b>rerank</b> ${escapeHtml(u.reranker)}</span></div>`;
       }
       metaEl.innerHTML = m;
     } else {
@@ -232,17 +234,18 @@ function render(s) {
     keepaliveBtn.style.display = "none";
   }
 
-  // Deploy-info lines (profile / model / volume are process constants) —
+  // Deploy-info lines (profile / model / storage are process constants) —
   // rebuild only when they change.
-  const volKey = `${s.active_profile || ""}|${s.llm_model_id || ""}|${s.volume_id || ""}`;
+  const volKey = `${s.active_profile || ""}|${s.llm_model_id || ""}|${s.persistence_id || ""}`;
   if (volKey !== mVol) {
     profileSelect.value = s.active_profile || "";   // keep the dropdown in sync with the server
     const profileLine = s.active_profile
       ? `Profile: <b>${escapeHtml(s.active_profile)}</b> · ${escapeHtml(s.llm_model_id || "")}<br>`
       : "";
-    const volLine = s.volume_id
-      ? `Network Volume: <b>${escapeHtml(s.volume_id)}</b> · persistence <span class="on">ON</span>`
-      : 'Network Volume: <span class="muted">none — Data-Volume mode (weights not persisted)</span>';
+    const store = escapeHtml(s.persistence_label || "Persistent storage");
+    const volLine = s.persistence_id
+      ? `${store}: <b>${escapeHtml(s.persistence_id)}</b> · persistence <span class="on">ON</span>`
+      : `${store}: <span class="muted">${escapeHtml(s.persistence_off_hint || "none")}</span>`;
     volinfoEl.innerHTML = profileLine + volLine;
     mVol = volKey;
   }
@@ -310,12 +313,13 @@ upBtn.addEventListener("click", () => {             // when POD UP is clicked
 });
 downBtn.addEventListener("click", () => {           // when POD DOWN is clicked
   // Destructive-action guard, fail CLOSED: only skip the warning when we
-  // positively know a Network Volume is set. Unknown (no snapshot yet, or the
+  // positively know persistent storage is set. Unknown (no snapshot yet, or the
   // field absent) is treated as unsafe so an early click can't slip through.
-  const safe = lastSnap && lastSnap.network_volume_configured === true;
+  const safe = lastSnap && lastSnap.persistence_configured === true;
   if (!safe) {
+    const store = (lastSnap && lastSnap.persistence_label) || "Persistent storage";
     const ok = confirm(
-      "No RunPod Network Volume is confirmed configured.\n\n" +
+      `No ${store} is confirmed configured.\n\n` +
       "POD DOWN will TERMINATE the pod and may DESTROY the downloaded " +
       "model weights — the next POD UP would re-download them.\n\nTerminate anyway?"
     );

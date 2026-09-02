@@ -111,6 +111,7 @@ export PODLINK_NETWORK_VOLUME_ID=<volume-id>         # terminate-safe weight per
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `PODLINK_PROVIDER` | `runpod` | Which cloud this launch drives — one of the packages under `app/providers/`. Set it in a profile to switch clouds per launch. |
 | `PODLINK_IMAGE` | *(required)* | The pushed image tag podlink deploys. |
 | `PODLINK_REGISTRY_AUTH_ID` | *(empty)* | RunPod Container-Registry-Auth id for a **private** image; empty ⇒ public. |
 | `PODLINK_LLM_MODEL_ID` / `PODLINK_EMBED_MODEL_ID` / `PODLINK_RERANK_MODEL_ID` | balanced 96 GB defaults | HF repos the image serves. |
@@ -208,14 +209,23 @@ your vector collection and re-ingest.
 
 ```
 podlink/
-├─ start.sh        # launcher (sources config, resolves volume id, then run.sh)
+├─ start.sh        # launcher (sources config, provider prerequisites, deps, then run.sh)
+├─ requirements.txt          # provider-neutral core deps
+├─ requirements-runpod.txt   # the RunPod provider's SDK (one file per provider)
 ├─ run.sh          # hardened uvicorn launch (localhost bind, no arg pass-through)
 ├─ pod_control/    # vendored pod-control scripts (see PROVENANCE.md)
 ├─ pod_image/      # bundled 3-service image: Dockerfile + supervisor + wrappers
-├─ tests/          # smoke / session / server tests (no live SDK or GPU needed)
+├─ tests/          # siloing / smoke / session / server tests (no live SDK or GPU needed)
 └─ app/
    ├─ session.py         # thread-safe pod state machine + snapshot
-   ├─ runpod_driver.py   # non-interactive start/terminate + health/test over pod_control
+   ├─ driver.py          # provider-neutral start/terminate + health/test orchestration
+   ├─ preflight.py       # `start.sh --check`: neutral checks + the provider's own
+   ├─ providers/         # one PACKAGE per cloud behind a shared contract
+   │  ├─ base.py         # the Provider protocol app/driver.py codes against
+   │  ├─ __init__.py     # registry: PODLINK_PROVIDER -> package, env normalisation hook
+   │  └─ runpod/         # provider.py (the class), launch.sh (pre-venv prompt), __init__.py (hooks)
+   ├─ vendored.py        # imports pod_control's cloud-neutral bits (_secrets, egress_logger)
+   ├─ profiles.py        # stack profiles: parse confs, swap env, re-bake the provider
    ├─ server.py          # FastAPI routes + SSE + watchdogs
    └─ static/            # the console UI (index.html + app.js)
 ```
