@@ -192,8 +192,30 @@ def profile_select(profile: str | None = Body(default=None, embed=True),
     if SESSION.state not in (State.IDLE, State.ERROR) or SESSION.pod_id:
         raise HTTPException(status_code=409,
                             detail="profile switch only available while no pod exists")
+    # Cross-cloud guard. The session check above only knows about pods THIS
+    # process started; a pod created before a restart is invisible to it. When
+    # the new profile names a different cloud, ask the OUTGOING cloud whether a
+    # podlink instance is still running there — switching away would leave it
+    # billing on a provider the UI has stopped watching. Same-cloud switches
+    # skip this: POD UP adopts a running instance by name anyway.
+    outgoing = providers.active()
+    incoming = providers.normalise_name(profiles_conf.effective_env(profile).get("PODLINK_PROVIDER"))
+    if incoming != outgoing.name:
+        try:
+            live = driver.running_instance_id()
+        except Exception as e:  # noqa: BLE001 — cannot verify => do not switch
+            raise HTTPException(
+                status_code=409,
+                detail=f"could not verify {outgoing.name} has no running pod "
+                       f"({type(e).__name__}) — fix its credentials, or relaunch "
+                       f"with --profile to switch at start")
+        if live:
+            raise HTTPException(
+                status_code=409,
+                detail=f"a podlink pod ({live}) is still RUNNING on {outgoing.name} — "
+                       f"POD DOWN it first, or switching would leave it billing unwatched")
     try:
-        profiles_conf.apply(profile)                 # swap env + reload pod_up constants
+        profiles_conf.apply(profile)                 # swap env + re-bake the provider
     except Exception as e:  # noqa: BLE001 — apply() already rolled back
         # Type only — a conf-parse/reload error message could embed local paths.
         raise HTTPException(status_code=400, detail=f"profile apply failed: {type(e).__name__}")

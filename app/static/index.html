@@ -172,6 +172,15 @@
     .brand .sub { font-size: .62rem; color: var(--cyan-dim); letter-spacing: .3em; text-transform: uppercase; }
 
     .selector { display: flex; align-items: center; gap: .5rem; }
+    /* Provider badge: which cloud the next POD UP hits. Reads the same as the
+       other status chips — small caps, cyan when known, grey placeholder before
+       the first snapshot. */
+    .provider-badge {
+      flex: none; font-size: .62rem; letter-spacing: .14em; text-transform: uppercase;
+      padding: .28rem .5rem; border: 1px solid var(--line-soft); border-radius: 4px;
+      color: var(--cyan); background: var(--glass-lo); white-space: nowrap;
+    }
+    .provider-badge.muted { color: var(--ink-mute); }
     .selector select {
       flex: 1 1 auto; min-width: 0;
       background: rgba(9,15,20,.55);
@@ -449,6 +458,8 @@
                 title="Stack profile — applies to the next POD UP (switchable only while no pod exists)">
           <option value="">base — no profile</option>
         </select>
+        <span id="providerBadge" class="provider-badge muted"
+              title="Which cloud the next POD UP will use — set by the profile's PODLINK_PROVIDER">—</span>
       </div>
 
       <div class="selector">

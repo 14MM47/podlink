@@ -86,6 +86,23 @@ def list_pods() -> list[dict]:
     return provider.list_instances()
 
 
+def running_instance_id() -> str | None:
+    """The id of a RUNNING podlink instance on the active cloud, or None.
+
+    A live-account check, not a session one: it asks the cloud, so it catches
+    an instance this server process never knew about (created before a
+    restart, or by the CLI). Used to refuse a cloud switch that would leave a
+    billing instance behind on a provider the UI has stopped watching. Raises
+    if the cloud cannot be asked — the caller decides what that means.
+    """
+    provider = active_provider()
+    provider.authenticate()
+    existing = provider.find_existing()
+    if existing is not None and provider.is_running(existing):
+        return provider.instance_id(existing)
+    return None
+
+
 def persistence_configured() -> bool:
     """True when storage survives POD DOWN, so terminate is non-destructive.
 

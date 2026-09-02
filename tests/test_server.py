@@ -180,6 +180,86 @@ def test_profile_parsing_and_switching():
             _reset()
 
 
+def test_cross_cloud_switch_guard():
+    """Switching to a DIFFERENT cloud asks the outgoing one for a running pod first.
+
+    Registers a throwaway provider package so the registry can actually switch,
+    then drives /profile/select through the three outcomes: outgoing cloud busy
+    -> 409; outgoing cloud unverifiable -> 409; outgoing cloud idle -> switch.
+    """
+    import sys
+    import tempfile
+    import types
+
+    from app import driver, profiles as pconf, providers
+
+    class FakeProvider:                      # the minimum the switch + snapshot touch
+        name = "fakecloud"
+        def reload_config(self): pass
+        def authenticate(self): pass
+        def find_existing(self): return None
+        def is_running(self, inst): return False
+        def instance_id(self, inst): return inst["id"]
+        def persistence_configured(self): return True
+        def service_urls(self, i): return {"llm": "", "embedder": "", "reranker": ""}
+        def stack_config(self): return {"llm_served_name": "x", "embed_model_id": "y"}
+        def snapshot_fields(self):
+            return {"provider": self.name, "persistence_configured": True, "persistence_id": "d1",
+                    "persistence_label": "Disk", "persistence_off_hint": "", "llm_model_id": "m"}
+
+    fake_pkg = types.ModuleType("app.providers.fakecloud")
+    fake_pkg.PROVIDER = FakeProvider
+    sys.modules["app.providers.fakecloud"] = fake_pkg
+    saved_known = providers.KNOWN_PROVIDERS
+    providers.KNOWN_PROVIDERS = saved_known + ("fakecloud",)
+
+    live = rp.PROVIDER.authenticate, rp.PROVIDER.find_existing   # class-level, restored below
+    with tempfile.TemporaryDirectory() as td:
+        pdir = Path(td) / "profiles"; pdir.mkdir()
+        (pdir / "other.conf").write_text("export PODLINK_PROVIDER=fakecloud\n")
+        saved = (pconf.PROFILE_DIR, pconf.BASE_CONF, rp.VOL_FILE, dict(pconf.BASE_ENV))
+        pconf.PROFILE_DIR, pconf.BASE_CONF, rp.VOL_FILE = pdir, Path(td) / "podlink.conf", Path(td) / "vol"
+        try:
+            _reset()
+            check("starts on runpod", providers.active().name == "runpod")
+
+            # 1) outgoing cloud has a RUNNING podlink pod -> refuse.
+            rp.PROVIDER.authenticate = lambda self: None
+            rp.PROVIDER.find_existing = lambda self: {"id": "ghost1", "desiredStatus": "RUNNING"}
+            r = client.post("/profile/select", headers=H, json={"profile": "other"})
+            check("switch refused while the outgoing cloud has a running pod", r.status_code == 409)
+            check("refusal names the pod", "ghost1" in r.json()["detail"])
+            check("still on runpod after refusal", providers.active().name == "runpod")
+
+            # 2) outgoing cloud cannot be asked -> refuse (fail closed).
+            def boom(self): raise RuntimeError("secret unavailable")
+            rp.PROVIDER.authenticate = boom
+            r = client.post("/profile/select", headers=H, json={"profile": "other"})
+            check("switch refused when the outgoing cloud is unverifiable", r.status_code == 409)
+            check("refusal says it could not verify", "could not verify" in r.json()["detail"])
+
+            # 3) outgoing cloud idle -> switch goes through, badge data follows.
+            rp.PROVIDER.authenticate = lambda self: None
+            rp.PROVIDER.find_existing = lambda self: None
+            r = client.post("/profile/select", headers=H, json={"profile": "other"})
+            check("switch allowed when the outgoing cloud is idle", r.status_code == 200)
+            check("snapshot names the new provider", r.json()["provider"] == "fakecloud")
+            check("driver now drives the new provider", driver.running_instance_id() is None)
+
+            # Same-cloud switch (fakecloud -> fakecloud via base? no: base is runpod) —
+            # switching BACK asks fakecloud, which is idle, so it succeeds.
+            r = client.post("/profile/select", headers=H, json={})
+            check("switch back to base -> runpod", r.status_code == 200 and r.json()["provider"] == "runpod")
+        finally:
+            rp.PROVIDER.authenticate, rp.PROVIDER.find_existing = live
+            pconf.PROFILE_DIR, pconf.BASE_CONF, rp.VOL_FILE = saved[0], saved[1], saved[2]
+            pconf.BASE_ENV = saved[3]
+            providers.KNOWN_PROVIDERS = saved_known
+            sys.modules.pop("app.providers.fakecloud", None)
+            client.post("/profile/select", headers=H, json={})   # re-bake from the real baseline
+            _reset()
+
+
 if __name__ == "__main__":
     print("server tests:")
     test_config_and_status()
@@ -190,4 +270,5 @@ if __name__ == "__main__":
     test_keepalive_clears_deadline()
     test_env_and_test_guards()
     test_profile_parsing_and_switching()
+    test_cross_cloud_switch_guard()
     print("all server tests passed.")

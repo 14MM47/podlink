@@ -32,13 +32,14 @@ _ACTIVE: Provider | None = None
 _ACTIVE_NAME: str | None = None
 
 
-def _normalise_name(raw: str | None) -> str:
+def normalise_name(raw: str | None) -> str:
+    """A provider name as the registry spells it (default when empty)."""
     return (raw or DEFAULT_PROVIDER).strip().lower()
 
 
 def provider_name() -> str:
     """The configured provider name, normalised."""
-    return _normalise_name(os.environ.get("PODLINK_PROVIDER"))
+    return normalise_name(os.environ.get("PODLINK_PROVIDER"))
 
 
 def _module(name: str) -> ModuleType:
@@ -86,9 +87,9 @@ def normalise_env(env: dict[str, str]) -> dict[str, str]:
     so it dispatches on the package-level hook rather than the instance. A
     provider with nothing to normalise simply omits the hook.
     """
-    hook = getattr(_module(_normalise_name(env.get("PODLINK_PROVIDER"))), "normalise_env", None)
+    hook = getattr(_module(normalise_name(env.get("PODLINK_PROVIDER"))), "normalise_env", None)
     return hook(env) if hook else env
 
 
-__all__ = ["Provider", "active", "reload_active", "provider_name", "normalise_env",
+__all__ = ["Provider", "active", "reload_active", "provider_name", "normalise_name", "normalise_env",
            "DEFAULT_PROVIDER", "KNOWN_PROVIDERS"]

@@ -27,6 +27,7 @@ const feedEls = {                                        // event feed split by 
   system: document.getElementById("feed-system"),        // errors / auto-terminate
 };
 const volinfoEl = document.getElementById("volinfo");    // persistent-storage info line
+const providerBadge = document.getElementById("providerBadge");  // which cloud the next POD UP hits
 const actionsEl = document.getElementById("actions");    // per-pod action buttons
 const copyenvBtn = document.getElementById("copyenv");   // copy the client config
 const copiedEl = document.getElementById("copied");      // "copied ✓" flash
@@ -236,9 +237,11 @@ function render(s) {
 
   // Deploy-info lines (profile / model / storage are process constants) —
   // rebuild only when they change.
-  const volKey = `${s.active_profile || ""}|${s.llm_model_id || ""}|${s.persistence_id || ""}`;
+  const volKey = `${s.provider || ""}|${s.active_profile || ""}|${s.llm_model_id || ""}|${s.persistence_id || ""}`;
   if (volKey !== mVol) {
     profileSelect.value = s.active_profile || "";   // keep the dropdown in sync with the server
+    providerBadge.textContent = s.provider || "—";  // the cloud this profile selects
+    providerBadge.classList.toggle("muted", !s.provider);
     const profileLine = s.active_profile
       ? `Profile: <b>${escapeHtml(s.active_profile)}</b> · ${escapeHtml(s.llm_model_id || "")}<br>`
       : "";
