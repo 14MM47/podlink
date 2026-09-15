@@ -11,6 +11,20 @@ All notable changes to podlink are documented here. The format loosely follows
   for the NEXT POD UP without relaunching start.sh. Confs are parsed (shlex,
   `export PODLINK_*` lines only), never executed; switching is allowed only
   while no pod exists, and pod_up's constants are re-baked via module reload.
+- `PODLINK_ADOPT_ON_START` (default on): a console start adopts a RUNNING pod with
+  our name, so a restarted console shows the real state.
+
+### Fixed
+- A start no longer abandons a billing pod. The readiness wait (pod RUNNING but a
+  service not yet answering) used to raise after a fixed 15 min, which is shorter
+  than a volume-less 122B boot; the console then showed ERROR / "no pod running"
+  while RunPod kept billing. It now warns in the feed every `PODLINK_READY_WARN_S`
+  and keeps waiting, gives up only at `PODLINK_READY_TIMEOUT_S` (default 60 min,
+  `0` = never), and raises promptly if RunPod reports the pod left RUNNING.
+- ERROR with a known pod keeps the health watch probing, keeps the cost meter live,
+  and recovers to RUNNING automatically once all three services answer.
+- The error line says the pod may still be running and how to recover (POD UP
+  re-adopts, POD DOWN stops).
 
 ## [0.2.0] — 2026-07-28
 

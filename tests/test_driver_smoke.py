@@ -170,6 +170,101 @@ def test_all_ready_waits_for_stragglers_then_times_out():
           "pending" in raised_msg and "llm" in raised_msg)
 
 
+def test_all_ready_warns_and_keeps_waiting_past_the_soft_deadline():
+    # Soft deadline passes while the LLM is still loading: the feed gets a reminder,
+    # the wait continues, and it still succeeds once the service answers.
+    calls = {"n": 0}
+    def status_for(url):
+        if "/v1/models" in url:
+            calls["n"] += 1
+            return 200 if calls["n"] > 6 else 503
+        return 200
+    install_fake_client(status_for)
+    saved_warn, saved_hard = rd.READY_WARN_S, rd.READY_TIMEOUT_S
+    rd.READY_WARN_S, rd.READY_TIMEOUT_S = 0.05, 30
+    s = PodSession()
+    s.try_begin_start(None)
+    try:
+        ok = rd._wait_for_all_ready(s, "pod1")
+    finally:
+        rd.READY_WARN_S, rd.READY_TIMEOUT_S = saved_warn, saved_hard
+    msgs = [m for (_, cat, m) in s.events if cat == "system"]
+    check("_wait_for_all_ready keeps waiting past the soft deadline and succeeds", ok is True)
+    check("soft deadline posts a 'still pending' reminder that names the pod as billing",
+          any("still pending" in m and "billing" in m for m in msgs))
+
+
+def test_all_ready_raises_when_the_pod_itself_leaves_running():
+    install_fake_client(lambda url: 503)
+    saved_get = fake_runpod.get_pod
+    fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "EXITED"}
+    s = PodSession()
+    s.try_begin_start(None)
+    msg = ""
+    try:
+        rd._wait_for_all_ready(s, "pod1")
+    except RuntimeError as e:
+        msg = str(e)
+    finally:
+        fake_runpod.get_pod = saved_get
+    check("_wait_for_all_ready raises promptly when RunPod says the pod left RUNNING",
+          "left RUNNING" in msg)
+
+
+def test_recover_if_healthy_flips_error_to_running():
+    saved_state = rd.pod_up.STATE_PATH
+    scratch = Path("/tmp/podlink_smoke_recover_state.json")
+    rd.pod_up.STATE_PATH = scratch
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        s.update(pod_id="podLost", state=State.ERROR, error="RuntimeError — gave up")
+        install_fake_client(lambda url: 503)
+        check("not healthy yet: stays ERROR",
+              rd.recover_if_healthy(s, "podLost") is False and s.state == State.ERROR)
+        install_fake_client(lambda url: 200)
+        check("all healthy: recovers to RUNNING",
+              rd.recover_if_healthy(s, "podLost") is True and s.state == State.RUNNING)
+        snap = s.snapshot()
+        check("recovery clears the error and sets the proxy url",
+              snap["error"] is None and snap["proxy_url"] and "podLost" in snap["proxy_url"])
+        check("recovery is logged to the feed",
+              any("recovered" in m for (_, c, m) in s.events if c == "system"))
+    finally:
+        rd.pod_up.STATE_PATH = saved_state
+        scratch.unlink(missing_ok=True)
+
+
+def test_adopt_running_on_startup_adopts_our_running_pod():
+    import os
+    saved_pods, saved_state = fake_runpod.get_pods, rd.pod_up.STATE_PATH
+    scratch = Path("/tmp/podlink_smoke_adopt_state.json")
+    rd.pod_up.STATE_PATH = scratch
+    install_fake_client(lambda url: 200)
+    try:
+        fake_runpod.get_pods = lambda: [{"id": "podLive", "name": rd.pod_up.POD_NAME,
+                                         "desiredStatus": "RUNNING", "runtime": {"x": 1}}]
+        s = PodSession()
+        rd.adopt_running_on_startup(s)
+        check("console start adopts the RUNNING pod by name",
+              s.state == State.RUNNING and s.pod_id == "podLive")
+        fake_runpod.get_pods = lambda: []
+        s2 = PodSession()
+        rd.adopt_running_on_startup(s2)
+        check("no live pod: stays IDLE and creates nothing", s2.state == State.IDLE)
+        os.environ["PODLINK_ADOPT_ON_START"] = "0"
+        fake_runpod.get_pods = lambda: [{"id": "podLive", "name": rd.pod_up.POD_NAME,
+                                         "desiredStatus": "RUNNING", "runtime": {"x": 1}}]
+        s3 = PodSession()
+        rd.adopt_running_on_startup(s3)
+        check("PODLINK_ADOPT_ON_START=0 disables adoption", s3.state == State.IDLE)
+    finally:
+        os.environ.pop("PODLINK_ADOPT_ON_START", None)
+        fake_runpod.get_pods = saved_pods
+        rd.pod_up.STATE_PATH = saved_state
+        scratch.unlink(missing_ok=True)
+
+
 def test_all_ready_cancels_promptly():
     install_fake_client(lambda url: 503)             # nothing healthy
     s = PodSession()
@@ -423,6 +518,10 @@ if __name__ == "__main__":
     test_resolve_gpu_id_raises_when_absent()
     test_all_ready_true_when_all_200()
     test_all_ready_waits_for_stragglers_then_times_out()
+    test_all_ready_warns_and_keeps_waiting_past_the_soft_deadline()
+    test_all_ready_raises_when_the_pod_itself_leaves_running()
+    test_recover_if_healthy_flips_error_to_running()
+    test_adopt_running_on_startup_adopts_our_running_pod()
     test_all_ready_cancels_promptly()
     test_create_aborts_on_cancel_before_create()
     test_stop_terminates_and_lands_idle()

@@ -39,7 +39,22 @@ from .session import PodSession, State, SERVICES  # our state machine types + se
 
 # How long to wait, in seconds, for each phase before declaring failure.
 RUNNING_TIMEOUT_S = 900   # RunPod allocation + container boot
-READY_TIMEOUT_S = 900     # vLLM model-weight load until /v1/models == 200
+
+
+def _env_seconds(name: str, default: int) -> int:
+    """Read a non-negative seconds value from the environment (bad/negative -> default)."""
+    try:
+        return max(0, int(os.environ.get(name, str(default)) or default))
+    except ValueError:
+        return default
+
+
+# Readiness is a soft wait: a pod that is RUNNING is billing whether or not vLLM is
+# listening yet, so giving up early only hides the pod from the console. After
+# READY_WARN_S the feed says so every READY_WARN_S and the wait continues; only the
+# hard READY_TIMEOUT_S (0 = never) raises. A 122B volume-less boot takes ~16 min.
+READY_WARN_S = _env_seconds("PODLINK_READY_WARN_S", 900)
+READY_TIMEOUT_S = _env_seconds("PODLINK_READY_TIMEOUT_S", 3600)
 STOP_VERIFY_TIMEOUT_S = 180  # max wait to confirm the pod left RUNNING
 POLL_S = 10               # inter-poll sleep (interruptible by cancel)
 
@@ -199,8 +214,12 @@ def start(session: PodSession) -> None:
         # (URLs, headers, the RunPod API key). The phase field already names
         # the failing step; full detail stays server-side / in the dashboard.
         session.add_event(f"error during start: {type(e).__name__}", "system")
+        hint = (" — the pod may still be RUNNING and billing: the health watch keeps probing "
+                "and recovers automatically; POD UP re-adopts it, POD DOWN stops it"
+                if session.pod_id else "")
         session.update(state=State.ERROR, phase="error during start",
-                       error=f"{type(e).__name__} — check the RunPod dashboard for details")
+                       error=f"{type(e).__name__} — check the RunPod dashboard for details"
+                             f"{hint}")
 
 
 def _create_retries() -> int:
@@ -415,8 +434,10 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
     bearer = _read_secret(_secrets.bearer_token)         # gates all three services
     probes = _service_probes(pod_id, bearer)             # service -> (url, headers)
     ready: set[str] = set()                              # services confirmed 200
-    deadline = time.time() + READY_TIMEOUT_S             # absolute give-up time
-    while time.time() < deadline:                        # loop until deadline
+    started = time.time()
+    next_warn = started + READY_WARN_S if READY_WARN_S else None   # soft: warn, keep waiting
+    deadline = started + READY_TIMEOUT_S if READY_TIMEOUT_S else None  # hard: 0 = never
+    while deadline is None or time.time() < deadline:   # loop until the hard deadline
         if session.cancel.is_set():                      # Down pressed while weights load
             return False                                 # bail to the stop worker
         for name, (url, headers) in probes.items():      # probe each not-yet-ready service
@@ -430,13 +451,83 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
             session.update(phase="all services healthy")
             return True                                  # start is complete
         pending = [n for n in probes if n not in ready]  # what's still loading
-        session.update(phase=f"waiting for services… "
+        minutes = int((time.time() - started) // 60)
+        session.update(phase=f"waiting for services… {minutes} min "
                              f"(ready: {sorted(ready) or ['none']}; pending: {pending})")
+        if next_warn is not None and time.time() >= next_warn:   # soft deadline passed
+            session.add_event(f"services still pending after {minutes} min: {pending} — the pod "
+                              "is RUNNING and billing; still waiting (POD DOWN to stop)",
+                              "system")
+            next_warn += READY_WARN_S                     # repeat the reminder
+        if not _pod_still_running(pod_id):               # the pod itself went away
+            raise RuntimeError(f"pod left RUNNING while services were pending: {pending}")
         if _sleep_or_cancel(session, POLL_S):            # wait, waking early on cancel
             return False                                 # cancelled during the sleep
-    pending = [n for n in probes if n not in ready]      # timed out — name the stragglers
+    pending = [n for n in probes if n not in ready]      # hard timeout — name the stragglers
     raise RuntimeError(f"pod RUNNING but services not all healthy within "
                        f"{READY_TIMEOUT_S}s (pending: {pending})")
+
+
+def _pod_still_running(pod_id: str) -> bool:
+    """True unless RunPod positively reports the pod is no longer RUNNING. A failed
+    lookup counts as still running: never abandon a pod on a transient API error."""
+    try:
+        pod = runpod.get_pod(pod_id)
+    except Exception:  # noqa: BLE001
+        return True
+    if not pod:
+        return False
+    return pod.get("desiredStatus") in (None, "RUNNING")
+
+
+def recover_if_healthy(session: PodSession, pod_id: str) -> bool:
+    """Health-watch hook for the ERROR state: the pod is still ours and still billing, so
+    keep probing; the moment all three services answer, flip to RUNNING.
+
+    Returns True when the session recovered. A stop that has begun wins.
+    """
+    probe_health_once(session, pod_id)                   # tiles reflect reality even in ERROR
+    if session.state != State.ERROR:                     # someone else moved us on
+        return False
+    if any(st != "healthy" for st in session.services.values()):
+        return False
+    llm_url = pod_up.derive_proxy_url(pod_id, pod_up.SERVICE_PORTS["llm"])
+    if not session.commit_running():                     # STOPPING/cancel arrived first
+        return False
+    session.update(error=None, proxy_url=llm_url,
+                   phase="running — recovered: all services healthy")
+    session.add_event("recovered — all three services healthy; state is RUNNING", "system")
+    try:                                                 # best effort, matches start()
+        pod = runpod.get_pod(pod_id) or {}
+        gpu_type = (pod.get("machine", {}).get("gpuTypeId") or pod.get("gpuTypeId") or "unknown")
+        pod_up.write_state({**pod, "id": pod_id}, gpu_type)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def adopt_running_on_startup(session: PodSession) -> None:
+    """Console start: if a RUNNING pod with our name already exists (a previous console
+    lost it, or was restarted), adopt it so the panel shows the truth instead of IDLE.
+
+    Nothing is created here; if there is no live pod this is a no-op. Runs the normal
+    start() path, whose Auto branch adopts a RUNNING pod by name.
+    """
+    if os.environ.get("PODLINK_ADOPT_ON_START", "1") == "0":
+        return
+    try:
+        runpod.api_key = _read_secret(_secrets.runpod_api_key)
+        existing = pod_up.find_existing()
+    except Exception as e:  # noqa: BLE001 — never block console start on a lookup failure
+        session.add_event(f"startup pod lookup failed: {type(e).__name__}", "system")
+        return
+    if existing is None or existing.get("desiredStatus") != "RUNNING":
+        return
+    if not session.try_begin_start(None):                # only from IDLE/ERROR
+        return
+    session.add_event(f"adopting running pod {existing['id']} found at console start",
+                      "system")
+    start(session)
 
 
 # ---------------------------------------------------------------------------

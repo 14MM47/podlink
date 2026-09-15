@@ -5,9 +5,11 @@ Run: python3 tests/test_server.py
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
+os.environ["PODLINK_ADOPT_ON_START"] = "0"     # no live RunPod lookup when the app imports
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # import the `app` package
 
 from fastapi.testclient import TestClient   # noqa: E402
@@ -31,6 +33,21 @@ def _reset():
     S.pod_id = None
     S.test_result = None
     S.update(auto_terminate_at=None)
+
+
+def test_error_with_known_pod_keeps_cost_meter_live():
+    _reset()
+    S.state = State.ERROR
+    S.pod_id = "podErr"
+    S.update(billing_started_at=1.0, cost_per_hr=2.0)
+    snap = client.get("/status").json()
+    check("ERROR + pod id: uptime still reported", snap["uptime_s"] is not None)
+    check("ERROR + pod id: both buttons live", snap["up_enabled"] and snap["down_enabled"])
+    _reset()
+    S.state = State.ERROR
+    snap = client.get("/status").json()
+    check("ERROR without a pod: no meter", snap["uptime_s"] is None)
+    _reset()
 
 
 def test_config_and_status():
@@ -177,6 +194,7 @@ def test_profile_parsing_and_switching():
 
 if __name__ == "__main__":
     print("server tests:")
+    test_error_with_known_pod_keeps_cost_meter_live()
     test_config_and_status()
     test_status_active_profile()
     test_token_gate()

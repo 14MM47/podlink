@@ -78,6 +78,10 @@ def _health_watch() -> None:
         try:
             if SESSION.state == State.RUNNING and SESSION.pod_id:
                 runpod_driver.probe_health_once(SESSION, SESSION.pod_id)
+            elif SESSION.state == State.ERROR and SESSION.pod_id:
+                # A start that gave up left a pod behind: keep the tiles honest and
+                # flip back to RUNNING once every service answers.
+                runpod_driver.recover_if_healthy(SESSION, SESSION.pod_id)
         except Exception:  # noqa: BLE001 — a watchdog must never die on a transient error
             pass
 
@@ -287,6 +291,9 @@ def pod_test(x_podlink_token: str | None = Header(default=None)) -> JSONResponse
 # the continuous service-health poller.
 threading.Thread(target=_auto_terminate_watch, daemon=True).start()
 threading.Thread(target=_health_watch, daemon=True).start()
+# Adopt a RUNNING pod we already own (console restarted, or a start that gave up),
+# so the panel opens on the truth. PODLINK_ADOPT_ON_START=0 disables.
+_launch(runpod_driver.adopt_running_on_startup)
 
 
 @app.get("/events")
