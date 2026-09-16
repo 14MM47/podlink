@@ -56,6 +56,8 @@ podlink's `create_pod` passes these as env — you don't set them here:
 | `LLM_SERVED_NAME` | vLLM `--served-model-name` (a client's model field must match; default `llm`) |
 | `LLM_QUANT` | vLLM `--quantization` (e.g. `awq_marlin`); leave empty for an FP8 checkpoint |
 | `MAX_MODEL_LEN`, `GPU_MEMORY_UTILIZATION` | vLLM sizing (defaults 32768 / 0.70) |
+| `EMBED_MAX_BATCH_TOKENS` | TEI embedder `--max-batch-tokens` (default 4096; keeps warm-up inside the memory vLLM leaves) |
+| `VLLM_WAIT_FOR_TEI_S` | how long `start-vllm.sh` waits for both TEI `/health` endpoints before starting vLLM (default 1200, `0` = don't wait) |
 | `VLLM_API_KEY` | vLLM bearer (read natively by vLLM; never on argv) |
 | `TEI_API_KEY` | gates both TEI services; the wrappers `export API_KEY=$TEI_API_KEY` so TEI reads it from env (not argv). Same value as the vLLM bearer. |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | weight-pull token, seen by all three services |

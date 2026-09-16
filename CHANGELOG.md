@@ -23,6 +23,9 @@ All notable changes to podlink are documented here. The format loosely follows
   embedder could never allocate. `startretries=50` on all three programs so a few
   early failures no longer leave a service FATAL (one tile pending forever while the
   pod bills). Rebuild and push the image for this to take effect.
+- Embedder warm-up no longer OOMs beside a loaded vLLM: `start-embedder.sh` passes
+  `--max-batch-tokens` (`EMBED_MAX_BATCH_TOKENS`, default 4096; TEI's default 16384
+  warm-up batch needed more activation memory than the ~2 GB left after the weights).
 - `supervisorctl` works inside the pod (`unix_http_server` / `rpcinterface` /
   `supervisorctl` sections were missing, so `status`, `tail` and `restart <service>`
   failed with ".ini file does not include supervisorctl section"). A service that
