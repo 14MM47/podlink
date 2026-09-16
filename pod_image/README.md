@@ -12,7 +12,7 @@ One Docker image that runs **three co-resident services** on a single RTX Pro 60
 `supervisord` supervises all three, starting the two TEI services first; `start-vllm.sh`
 waits for both `/health` endpoints (up to `VLLM_WAIT_FOR_TEI_S`, default 1200 s, `0` to
 skip) before vLLM profiles its KV cache, so the embedder owns its VRAM before vLLM
-sizes itself. Model weights are **not** baked in — they
+sizes itself. From the RunPod web terminal, `supervisorctl -c /etc/podlink/supervisord.conf status|tail -200 <service> stderr|restart <service>` inspects and restarts a service in place. Model weights are **not** baked in — they
 download on first boot into `$HF_HOME=/workspace/hf` (the persistent volume), so
 the download is a one-time cost and later resumes are fast.
 

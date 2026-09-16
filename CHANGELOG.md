@@ -23,6 +23,10 @@ All notable changes to podlink are documented here. The format loosely follows
   embedder could never allocate. `startretries=50` on all three programs so a few
   early failures no longer leave a service FATAL (one tile pending forever while the
   pod bills). Rebuild and push the image for this to take effect.
+- `supervisorctl` works inside the pod (`unix_http_server` / `rpcinterface` /
+  `supervisorctl` sections were missing, so `status`, `tail` and `restart <service>`
+  failed with ".ini file does not include supervisorctl section"). A service that
+  failed to start can now be restarted in place from the web terminal.
 - The readiness feed names the likely cause when the LLM answers but a TEI service
   never listens (failed start, check the container log, POD DOWN/UP).
 - A start no longer abandons a billing pod. The readiness wait (pod RUNNING but a
