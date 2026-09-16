@@ -424,6 +424,20 @@ def test_stack(session: PodSession) -> None:
         session.update(test_running=False, test_result={"error": type(e).__name__})
 
 
+def stuck_service_hint(ready: set[str], pending: list[str]) -> str | None:
+    """When the LLM answers but a TEI service never listens, the service has almost
+    certainly failed to start (CUDA allocation while vLLM loaded, or a weight download
+    error) and supervisor may have given up on it. Say so, and where to look."""
+    if "llm" in ready and pending and all(p in ("embedder", "reranker") for p in pending):
+        names = " and ".join(pending)
+        return (f"{names} still not listening while the LLM is up: this is usually a failed "
+                "start (VRAM taken by vLLM, or a weight download error), not a slow load — "
+                "check the container log in the RunPod dashboard for text-embeddings-router; "
+                "POD DOWN then POD UP restarts the stack (pod images built after 2026-09-16 "
+                "start the TEI services before vLLM)")
+    return None
+
+
 def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
     """Poll all three services until each returns 200 (or cancel/timeout).
 
@@ -458,6 +472,9 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
             session.add_event(f"services still pending after {minutes} min: {pending} — the pod "
                               "is RUNNING and billing; still waiting (POD DOWN to stop)",
                               "system")
+            hint = stuck_service_hint(ready, pending)        # a likely cause, if one stands out
+            if hint:
+                session.add_event(hint, "system")
             next_warn += READY_WARN_S                     # repeat the reminder
         if not _pod_still_running(pod_id):               # the pod itself went away
             raise RuntimeError(f"pod left RUNNING while services were pending: {pending}")

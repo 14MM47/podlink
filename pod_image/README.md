@@ -9,7 +9,10 @@ One Docker image that runs **three co-resident services** on a single RTX Pro 60
 | 8080 | TEI embedder | `GET /health` → 200 |
 | 8081 | TEI reranker | `GET /health` → 200 |
 
-`supervisord` supervises all three. Model weights are **not** baked in — they
+`supervisord` supervises all three, starting the two TEI services first; `start-vllm.sh`
+waits for both `/health` endpoints (up to `VLLM_WAIT_FOR_TEI_S`, default 1200 s, `0` to
+skip) before vLLM profiles its KV cache, so the embedder owns its VRAM before vLLM
+sizes itself. Model weights are **not** baked in — they
 download on first boot into `$HF_HOME=/workspace/hf` (the persistent volume), so
 the download is a one-time cost and later resumes are fast.
 

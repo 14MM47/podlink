@@ -15,6 +15,16 @@ All notable changes to podlink are documented here. The format loosely follows
   our name, so a restarted console shows the real state.
 
 ### Fixed
+- **Pod image start order** (`pod_image/`): the two TEI services now start before
+  vLLM, and `start-vllm.sh` waits for both `/health` endpoints (bounded by
+  `VLLM_WAIT_FOR_TEI_S`, default 20 min) before vLLM profiles its KV cache. This
+  removes the first-start OOM seen when the embedder was still allocating as vLLM
+  measured free memory, and the opposite race where vLLM took the GPU first and the
+  embedder could never allocate. `startretries=50` on all three programs so a few
+  early failures no longer leave a service FATAL (one tile pending forever while the
+  pod bills). Rebuild and push the image for this to take effect.
+- The readiness feed names the likely cause when the LLM answers but a TEI service
+  never listens (failed start, check the container log, POD DOWN/UP).
 - A start no longer abandons a billing pod. The readiness wait (pod RUNNING but a
   service not yet answering) used to raise after a fixed 15 min, which is shorter
   than a volume-less 122B boot; the console then showed ERROR / "no pod running"

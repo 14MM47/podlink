@@ -194,6 +194,28 @@ def test_all_ready_warns_and_keeps_waiting_past_the_soft_deadline():
           any("still pending" in m and "billing" in m for m in msgs))
 
 
+def test_soft_deadline_names_a_stuck_tei_service_when_the_llm_is_up():
+    # The LLM answers but the embedder never listens: the reminder is followed by a hint
+    # that this is a failed start, not a slow load, and where to look.
+    install_fake_client(lambda url: 503 if "8080" in url else 200)
+    saved_warn, saved_hard = rd.READY_WARN_S, rd.READY_TIMEOUT_S
+    rd.READY_WARN_S, rd.READY_TIMEOUT_S = 0.05, 0.4
+    s = PodSession()
+    s.try_begin_start(None)
+    try:
+        try:
+            rd._wait_for_all_ready(s, "pod1")
+        except RuntimeError:
+            pass
+    finally:
+        rd.READY_WARN_S, rd.READY_TIMEOUT_S = saved_warn, saved_hard
+    msgs = [m for (_, cat, m) in s.events if cat == "system"]
+    check("stuck embedder while llm is up posts the failed-start hint",
+          any("embedder" in m and "failed start" in m and "container log" in m for m in msgs))
+    check("no hint when the LLM itself is the straggler",
+          rd.stuck_service_hint({"embedder", "reranker"}, ["llm"]) is None)
+
+
 def test_all_ready_raises_when_the_pod_itself_leaves_running():
     install_fake_client(lambda url: 503)
     saved_get = fake_runpod.get_pod
