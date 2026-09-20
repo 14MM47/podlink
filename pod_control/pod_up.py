@@ -134,6 +134,22 @@ START_SSH = os.environ.get("PODLINK_START_SSH", "1").strip().lower() not in ("0"
 GPU_MATCH = os.environ.get("PODLINK_GPU_MATCH", "").strip() or "RTX PRO 6000"
 GPU_MIN_VRAM_GB = int(os.environ.get("PODLINK_GPU_MIN_VRAM_GB", "90"))
 
+# --- lifecycle: what POD DOWN does and how POD UP gets the pod back ------------
+#   terminate (default) — POD DOWN releases the pod entirely; POD UP creates a fresh one
+#       on any host. Needs the Network Volume for the weights to survive. Reliable, but
+#       every POD UP re-pulls the image (minutes).
+#   stop — POD DOWN stops the pod; the container (image, compile caches) stays on its host
+#       for a small disk charge, so POD UP resumes in well under a minute with no pull.
+#       The catch: resume only succeeds if that host still has a free GPU. POD UP retries
+#       the resume RESUME_RETRIES times, RESUME_RETRY_DELAY s apart, and only if every
+#       attempt fails does it terminate the stuck pod and fall back to a fresh create
+#       (the weights are still on the Network Volume, so nothing is lost).
+LIFECYCLE = (os.environ.get("PODLINK_LIFECYCLE", "").strip().lower() or "terminate")
+if LIFECYCLE not in ("terminate", "stop"):
+    raise ValueError(f"PODLINK_LIFECYCLE must be 'terminate' or 'stop', not {LIFECYCLE!r}")
+RESUME_RETRIES = int(os.environ.get("PODLINK_RESUME_RETRIES", "40"))
+RESUME_RETRY_DELAY = int(os.environ.get("PODLINK_RESUME_RETRY_DELAY", "15"))
+
 STATE_PATH = Path(__file__).resolve().parents[1] / "pod_state.json"
 TEMPLATE_STATE_PATH = Path(__file__).resolve().parents[1] / "template_state.json"
 

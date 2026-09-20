@@ -148,6 +148,7 @@ if [[ "${CHECK_ONLY}" == "1" ]]; then
   say "  reranker: ${PODLINK_RERANK_MODEL_ID:-<pod_up.py default>}"
   say "  max model len: ${PODLINK_MAX_MODEL_LEN:-32768} · gpu share: ${PODLINK_GPU_MEMORY_UTILIZATION:-0.70}"
   say "  gpu: ${PODLINK_GPU_MATCH:-RTX PRO 6000} (>= ${PODLINK_GPU_MIN_VRAM_GB:-90} GB) · container disk: ${PODLINK_CONTAINER_DISK_GB:-55} GB"
+  say "  lifecycle: ${PODLINK_LIFECYCLE:-terminate} (POD DOWN $( [[ "${PODLINK_LIFECYCLE:-terminate}" == stop ]] && echo 'stops; POD UP resumes in place, retried' || echo 'terminates; POD UP creates fresh' ))"
   # Validate the service spec with the same parser the app uses, so a profile typo
   # fails here instead of deploying a pod whose tiles never go green.
   if svc="$(python - <<'PY'

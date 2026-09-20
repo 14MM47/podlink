@@ -572,6 +572,84 @@ def test_create_retries_then_succeeds_and_logs():
          rd.pod_up.resolve_gpu_id, rd._sleep_or_cancel) = saved
 
 
+def test_stop_lifecycle_stops_and_keeps_state():
+    import os
+    calls = {}
+    saved = (fake_runpod.stop_pod, fake_runpod.terminate_pod, fake_runpod.get_pod, rd.pod_up.STATE_PATH)
+    scratch = Path("/tmp/podlink_smoke_stop_state.json"); scratch.write_text('{"pod_id": "podS"}')
+    fake_runpod.stop_pod = lambda pod_id: calls.__setitem__("stop", pod_id)
+    fake_runpod.terminate_pod = lambda pod_id: calls.__setitem__("terminate", pod_id)
+    fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "EXITED"}
+    rd.pod_up.STATE_PATH = scratch
+    os.environ["PODLINK_LIFECYCLE"] = "stop"
+    try:
+        _reload_pod_up(); rd.pod_up.STATE_PATH = scratch
+        s = PodSession(); s.try_begin_start(None); s.pod_id = "podS"; s.try_begin_stop()
+        rd.stop(s)
+        check("stop lifecycle calls stop_pod, not terminate_pod",
+              calls.get("stop") == "podS" and "terminate" not in calls)
+        check("stop lifecycle lands IDLE with the 'kept on host' phrase",
+              s.state == State.IDLE and "kept on host" in s.phase)
+        check("stop lifecycle keeps pod_state.json for the resume", scratch.exists())
+    finally:
+        del os.environ["PODLINK_LIFECYCLE"]
+        (fake_runpod.stop_pod, fake_runpod.terminate_pod, fake_runpod.get_pod, _p) = saved
+        _reload_pod_up(); rd.pod_up.STATE_PATH = saved[3]
+        scratch.unlink(missing_ok=True)
+
+
+def test_stop_lifecycle_resumes_with_retries_then_falls_back():
+    import os
+    os.environ["PODLINK_LIFECYCLE"] = "stop"
+    saved = (fake_runpod.resume_pod, fake_runpod.get_pod, fake_runpod.get_pods, fake_runpod.terminate_pod,
+             rd._sleep_or_cancel, rd._create_with_fallback, rd._wait_for_running, rd._wait_for_all_ready,
+             rd.pod_up.write_state)
+    rd._sleep_or_cancel = lambda session, secs: False
+    rd._wait_for_running = lambda session, pod_id: True
+    rd._wait_for_all_ready = lambda session, pod_id: True
+    rd.pod_up.write_state = lambda pod, gpu: None
+    try:
+        _reload_pod_up()
+        # (a) host frees a GPU on the 3rd attempt -> resumed in place, no create
+        n = {"resume": 0, "create": 0}
+        def resume(pod_id, **kw):
+            n["resume"] += 1
+            if n["resume"] < 3:
+                raise RuntimeError("not enough free GPUs on the host machine to start this pod")
+        fake_runpod.resume_pod = resume
+        fake_runpod.get_pods = lambda: [{"id": "podS", "name": rd.pod_up.POD_NAME, "desiredStatus": "EXITED"}]
+        fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "RUNNING" if n["resume"] >= 3 else "EXITED",
+                                              "runtime": {"x": 1}, "machine": {"gpuTypeId": "g"}}
+        rd._create_with_fallback = lambda session: n.__setitem__("create", n["create"] + 1) or {"id": "podNew"}
+        s = PodSession(); s.try_begin_start(None)
+        rd.start(s)
+        check("resume retried until the host freed a GPU", n["resume"] == 3 and n["create"] == 0)
+        check("start lands RUNNING on the resumed pod", s.state == State.RUNNING and s.pod_id == "podS")
+        check("retry attempts logged", any("no free GPU yet" in m for _, _c, m in s.events))
+        # (b) every attempt fails -> terminate the stuck pod, create fresh
+        os.environ["PODLINK_RESUME_RETRIES"] = "2"
+        n = {"resume": 0, "create": 0, "term": None}
+        def always_fail(pod_id, **kw):
+            n["resume"] += 1
+            raise RuntimeError("not enough free GPUs on the host machine")
+        fake_runpod.resume_pod = always_fail
+        fake_runpod.terminate_pod = lambda pod_id: n.__setitem__("term", pod_id)
+        fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "EXITED", "runtime": {"x": 1},
+                                              "machine": {"gpuTypeId": "g"}}
+        rd._create_with_fallback = lambda session: n.__setitem__("create", n["create"] + 1) or {"id": "podNew"}
+        s = PodSession(); s.try_begin_start(None)
+        rd.start(s)
+        check("resume exhausted after the configured attempts", n["resume"] == 2)
+        check("stuck pod terminated, then a fresh create", n["term"] == "podS" and n["create"] == 1)
+        check("session moved to the new pod", s.pod_id == "podNew" and s.state == State.RUNNING)
+    finally:
+        del os.environ["PODLINK_LIFECYCLE"]; os.environ.pop("PODLINK_RESUME_RETRIES", None)
+        (fake_runpod.resume_pod, fake_runpod.get_pod, fake_runpod.get_pods, fake_runpod.terminate_pod,
+         rd._sleep_or_cancel, rd._create_with_fallback, rd._wait_for_running, rd._wait_for_all_ready,
+         rd.pod_up.write_state) = saved
+        _reload_pod_up()
+
+
 def test_stack_probes_all_three_and_detects_dim():
     # test_stack POSTs a real completion/embedding/rerank; success records pass +
     # latency and detects the embedding dimension from the vector length.
@@ -646,6 +724,8 @@ if __name__ == "__main__":
     test_all_ready_cancels_promptly()
     test_create_aborts_on_cancel_before_create()
     test_stop_terminates_and_lands_idle()
+    test_stop_lifecycle_stops_and_keeps_state()
+    test_stop_lifecycle_resumes_with_retries_then_falls_back()
     test_read_secret_converts_systemexit()
     test_verify_terminated_true_when_get_pod_raises()
     test_cost_meter_derives_from_billing_and_rate()

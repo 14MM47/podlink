@@ -17,6 +17,11 @@ All notable changes to podlink are documented here. The format loosely follows
 - `PODLINK_CONTAINER_DISK_GB` (default `55`) for larger extended images.
 - `PODLINK_POD_ENV_<KEY>=v` generic pod-env passthrough (lands as `<KEY>=v`); the
   secrets and stock model keys podlink sets cannot be overridden this way.
+- `PODLINK_LIFECYCLE=stop`: opt a profile into stop/resume. POD DOWN stops the pod
+  (container kept on host, no image pull next time); POD UP resumes it with
+  `PODLINK_RESUME_RETRIES` × `PODLINK_RESUME_RETRY_DELAY` s retries and, only if every
+  attempt fails, terminates the stuck pod and creates a fresh one. Default stays
+  `terminate`.
 - `profiles/chat.conf`: a committed example profile — an eight-service voice
   harness pod (fast + think + helper vLLMs, TEI ×2, ASR, TTS, gateway) on an H200.
 - **Profile switching from the console**: a profile dropdown above the pod

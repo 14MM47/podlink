@@ -43,6 +43,9 @@ all motion respects `prefers-reduced-motion`):
 
 ## Terminate, not stop — and the Network Volume
 
+(`PODLINK_LIFECYCLE=stop` opts a profile back into stop/resume, with retries and an
+automatic terminate-and-recreate fallback — see [Configuration](#configuration).)
+
 POD DOWN **terminates** the pod rather than stopping it. A *stopped* pod is pinned to
 its original host and can fail to resume when that host has no free GPU
 (*"not enough free GPUs on the host machine"*); terminate always releases the GPU
@@ -126,6 +129,7 @@ export PODLINK_NETWORK_VOLUME_ID=<volume-id>         # terminate-safe weight per
 | `PODLINK_READY_WARN_S` / `PODLINK_READY_TIMEOUT_S` | `900` / `3600` | Readiness wait after the pod is RUNNING: warn in the feed every `WARN` seconds and keep waiting (the pod is billing either way); give up only after `TIMEOUT` seconds (`0` = never). Big volume-less boots can take 15–20 min. |
 | `PODLINK_ADOPT_ON_START` | `1` (on) | On console start, adopt a RUNNING pod with our name (e.g. after a console restart or a lost start) instead of showing IDLE. |
 | `PODLINK_CREATE_RETRIES` / `PODLINK_CREATE_RETRY_DELAY` | `40` / `15` | Host-capacity retry attempts and delay. |
+| `PODLINK_LIFECYCLE` | `terminate` | `stop` keeps the container on its host between sessions (no image pull on POD UP; small disk charge). POD UP resumes it, retrying `PODLINK_RESUME_RETRIES` × `PODLINK_RESUME_RETRY_DELAY` s (`40` / `15`) while the host has no free GPU, then terminates and recreates (weights survive on the Network Volume). |
 | `PODLINK_GPU_MATCH` / `PODLINK_GPU_MIN_VRAM_GB` | `RTX PRO 6000` / `90` | Which card to resolve from the RunPod catalog (substring match, MIG slices skipped) and the VRAM floor. A profile targeting another card (e.g. `H200` / `140`) must also size its image and vLLM fractions for it. |
 | `PODLINK_CONTAINER_DISK_GB` | `55` | Container disk for the image + compile cache; raise it for an extended image. |
 | `PODLINK_SERVICES` | the stock three | `name:port:/health-path,…` — the services the image runs (see [Multi-service pods](#multi-service-pods)). |

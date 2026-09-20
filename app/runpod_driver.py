@@ -184,6 +184,27 @@ def start(session: PodSession) -> None:
             pod_id = existing["id"]                       # adopt the live pod
             # Capture the id before anything can block — closes the billing race.
             session.update(pod_id=pod_id, phase="adopting running pod")
+        elif existing is not None and pod_up.LIFECYCLE == "stop":
+            # stop lifecycle: the pod was stopped, not terminated — resume it in place
+            # (no image pull). Retried, because the host may have no free GPU right now.
+            pod_id = existing["id"]
+            session.update(pod_id=pod_id, phase="resuming stopped pod")
+            resumed = _resume_with_retries(session, pod_id)
+            if resumed is None:                           # cancel arrived mid-retry
+                return
+            if not resumed:                               # host never freed a GPU: recreate
+                session.add_event("resume exhausted — terminating the stuck pod and creating "
+                                  "a fresh one (weights persist on the Network Volume)", "system")
+                session.update(phase="terminating stuck pod before recreate")
+                runpod.terminate_pod(pod_id)
+                if not _wait_until_gone(session, pod_id):
+                    return
+                session.update(pod_id=None)
+                pod = _create_with_fallback(session)
+                if pod is None:
+                    return
+                pod_id = pod["id"]
+                session.update(pod_id=pod_id, phase="pod created")
         else:                                             # none, or a dead/reaping leftover
             pod = _create_with_fallback(session)          # resolve the configured GPU + create
             if pod is None:                               # cancel arrived during create
@@ -277,6 +298,63 @@ def _create_with_fallback(session: PodSession) -> dict | None:
         f"no Secure host in the volume's region accepted the pod after {retries} "
         f"attempts (~{retries * delay // 60} min). RTX PRO 6000 capacity is transient — "
         f"press POD UP to keep trying, or try again later.")
+
+
+def _resume_retries() -> int:
+    try:
+        return max(1, int(os.environ.get("PODLINK_RESUME_RETRIES", str(pod_up.RESUME_RETRIES))))
+    except ValueError:
+        return 40
+
+
+def _resume_retry_delay() -> int:
+    try:
+        return max(5, int(os.environ.get("PODLINK_RESUME_RETRY_DELAY", str(pod_up.RESUME_RETRY_DELAY))))
+    except ValueError:
+        return 15
+
+
+def _resume_with_retries(session: PodSession, pod_id: str) -> bool | None:
+    """stop lifecycle: resume a stopped pod on its original host, retrying while that
+    host has no free GPU. True = RUNNING; False = every attempt failed (caller falls back
+    to terminate + create); None = cancelled by POD DOWN. Each attempt and wait is
+    reported to the feed and cancel-aware, like the create lottery."""
+    retries, delay = _resume_retries(), _resume_retry_delay()
+    for attempt in range(1, retries + 1):
+        if session.cancel.is_set():
+            return None
+        session.update(phase=f"resuming pod {pod_id} — attempt {attempt}/{retries}")
+        try:
+            runpod.resume_pod(pod_id, gpu_count=1)
+            pod = runpod.get_pod(pod_id) or {}
+            if pod.get("desiredStatus") == "RUNNING":
+                session.add_event(f"resumed on the original host (attempt {attempt}) — no image pull",
+                                  "lifecycle")
+                return True
+        except Exception as e:  # noqa: BLE001 — "not enough free GPUs on the host" and kin
+            session.add_event(f"host has no free GPU yet ({type(e).__name__}) — attempt "
+                              f"{attempt}/{retries}; retrying in {delay}s")
+        if attempt < retries and _sleep_or_cancel(session, delay):
+            return None
+    return False
+
+
+def _wait_until_gone(session: PodSession, pod_id: str) -> bool:
+    """After a terminate, wait until RunPod no longer reports the pod (or it left RUNNING),
+    so a fresh create with the same name does not collide. Cancel-aware."""
+    deadline = time.time() + STOP_VERIFY_TIMEOUT_S
+    while time.time() < deadline:
+        if session.cancel.is_set():
+            return False
+        try:
+            pod = runpod.get_pod(pod_id)
+        except Exception:  # noqa: BLE001
+            return True
+        if not pod or pod.get("desiredStatus") != "RUNNING":
+            return True
+        if _sleep_or_cancel(session, 3):
+            return False
+    raise RuntimeError(f"pod {pod_id} did not leave RUNNING after terminate")
 
 
 def _wait_for_running(session: PodSession, pod_id: str) -> bool:
@@ -585,12 +663,21 @@ def stop(session: PodSession) -> None:
                            services=_default_services())
             return
 
-        session.update(pod_id=pod_id, phase=f"terminating pod {pod_id}")  # progress text
-        runpod.terminate_pod(pod_id)                     # release the GPU (weights persist on the Network Volume)
+        if pod_up.LIFECYCLE == "stop":
+            # stop lifecycle: keep the container on its host (small disk charge, no GPU
+            # charge); POD UP resumes it without an image pull. pod_state.json is kept.
+            session.update(pod_id=pod_id, phase=f"stopping pod {pod_id}")
+            runpod.stop_pod(pod_id)
+            verified, done_phase = _verify_terminated(session, pod_id), "stopped — GPU released, container kept on host"
+        else:
+            session.update(pod_id=pod_id, phase=f"terminating pod {pod_id}")  # progress text
+            runpod.terminate_pod(pod_id)                 # release the GPU (weights persist on the Network Volume)
+            verified, done_phase = _verify_terminated(session, pod_id), "terminated — GPU released"
+            if verified:
+                _clear_state_file()                      # drop pod_state.json so a stale id can't resurface
 
-        if _verify_terminated(session, pod_id):          # confirm it left RUNNING / vanished
-            _clear_state_file()                          # drop pod_state.json so a stale id can't resurface
-            session.update(state=State.IDLE, phase="terminated — GPU released",
+        if verified:                                     # confirmed it left RUNNING / vanished
+            session.update(state=State.IDLE, phase=done_phase,
                            pod_id=None, proxy_url=None,   # safe: back to IDLE
                            billing_started_at=None, cost_per_hr=None, auto_terminate_at=None,  # stop the meter
                            services=_default_services(),  # clear the health tiles
