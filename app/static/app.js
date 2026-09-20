@@ -16,11 +16,6 @@ const autotermEl = document.getElementById("autoterm");  // auto-terminate count
 const autotermText = document.getElementById("autotermText");  // its text span
 const keepaliveBtn = document.getElementById("keepalive");     // cancel auto-terminate
 const tilesEl = document.getElementById("tiles");        // per-service health tiles row
-const tileEls = {                                        // service -> tile element
-  llm: document.getElementById("tile-llm"),
-  embedder: document.getElementById("tile-embedder"),
-  reranker: document.getElementById("tile-reranker"),
-};
 const feedEls = {                                        // event feed split by source/function
   lifecycle: document.getElementById("feed-lifecycle"),  // provisioning + timeline
   health: document.getElementById("feed-health"),        // per-service transitions
@@ -103,13 +98,29 @@ function fmtClock(epochSec) {
 }
 
 // Render the per-service health tiles. Always visible; grey (unknown) until a pod
-// exists, per the "indicators present from startup" rule.
+// exists, per the "indicators present from startup" rule. The tile set is whatever
+// the snapshot's `services` map holds (PODLINK_SERVICES of the active profile), so
+// tiles are created/removed here rather than hard-coded in the markup.
 function renderTiles(services) {
-  for (const [name, el] of Object.entries(tileEls)) {
-    const st = (services && services[name]) || "unknown";
+  services = services || {};
+  const names = Object.keys(services);
+  const have = new Map([...tilesEl.querySelectorAll(".tile")].map((el) => [el.dataset.svc, el]));
+  for (const el of have.values()) {                 // drop tiles for services no longer configured
+    if (!names.includes(el.dataset.svc)) el.remove();
+  }
+  for (const name of names) {
+    let el = have.get(name);
+    if (!el) {                                      // new service -> build its tile
+      el = document.createElement("div");
+      el.className = "tile";
+      el.dataset.svc = name;
+      el.innerHTML = '<span class="dot"></span><span class="lbl"></span><span class="st"></span>';
+      el.querySelector(".lbl").textContent = name === "llm" ? "LLM" : name;
+    }
+    tilesEl.appendChild(el);                        // (re)append keeps spec order
+    const st = services[name] || "unknown";
     el.dataset.status = st;
-    const stEl = el.querySelector(".st");
-    if (stEl) stEl.textContent = st === "unknown" ? "" : st;   // show the word, blank when unknown
+    el.querySelector(".st").textContent = st === "unknown" ? "" : st;   // show the word, blank when unknown
   }
 }
 
@@ -155,7 +166,7 @@ function renderTest(s) {
            `<span class="ms">${r.latency_ms ?? "?"}ms</span>` +
            `<span class="note">· ${escapeHtml(r.detail || "")}</span></div>`;
   };
-  let html = ["llm", "embedder", "reranker"].map(row).join("");
+  let html = Object.keys(svc).map(row).join("");
   if (tr.embedding_dim) {
     html += `<div class="tr-row muted"><span class="ck"> </span><span class="svc"></span>` +
             `<span class="note">embedding dimension: ${tr.embedding_dim}</span></div>`;
@@ -191,18 +202,22 @@ function render(s) {
   const ph = s.phase || ""; if (ph !== mPhase) { phaseEl.textContent = ph; mPhase = ph; }
   const er = s.error || ""; if (er !== mError) { errorEl.textContent = er; mError = er; }
 
-  // Pod id + service URLs — rebuild only when the pod changes.
-  const metaKey = `${s.pod_id || ""}|${s.proxy_url || ""}`;
+  // Pod id + service URLs — rebuild only when the pod or the service set changes.
+  const spec = s.services_spec || {};
+  const metaKey = `${s.pod_id || ""}|${s.proxy_url || ""}|${Object.keys(spec).join(",")}`;
   if (metaKey !== mMeta) {
     if (s.pod_id) {
       const pid = escapeHtml(s.pod_id);
       let m = `<div><span class="k">pod</span> <span class="pid">${pid}</span></div>`;
       if (s.proxy_url) {
         const base = (port) => `https://${pid}-${port}.proxy.runpod.net`;
-        m += `<div class="urls">` +
-             `<span><b>llm</b> ${base(8000)}/v1</span>` +
-             `<span><b>embed</b> ${base(8080)}/v1</span>` +
-             `<span><b>rerank</b> ${base(8081)}</span></div>`;
+        // One line per configured service; OpenAI-style services (health under /v1)
+        // show their /v1 base, the rest their root.
+        const label = { llm: "llm", embedder: "embed", reranker: "rerank" };
+        m += `<div class="urls">` + Object.entries(spec).map(([name, d]) => {
+          const v1 = (d.health || "").startsWith("/v1") ? "/v1" : "";
+          return `<span><b>${escapeHtml(label[name] || name)}</b> ${base(d.port)}${v1}</span>`;
+        }).join("") + `</div>`;
       }
       metaEl.innerHTML = m;
     } else {

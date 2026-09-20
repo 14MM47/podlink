@@ -134,6 +134,102 @@ def test_resolve_gpu_id_matches_rtx_pro_6000():
           gid == "NVIDIA RTX PRO 6000 Blackwell WE")
 
 
+def _reload_pod_up():
+    import importlib
+    importlib.reload(rd.pod_up)
+
+
+def test_resolve_gpu_id_env_override_selects_another_card():
+    import os
+    saved_gpus = fake_runpod._gpus
+    fake_runpod._gpus = saved_gpus + [
+        {"id": "NVIDIA H100 80GB HBM3", "displayName": "H100 SXM", "memoryInGb": 80},
+        {"id": "NVIDIA H200", "displayName": "H200 SXM", "memoryInGb": 141},
+    ]
+    os.environ["PODLINK_GPU_MATCH"] = "H200"
+    os.environ["PODLINK_GPU_MIN_VRAM_GB"] = "140"
+    try:
+        _reload_pod_up()
+        check("env override re-bakes GPU_MATCH", rd.pod_up.GPU_MATCH == "H200")
+        check("resolve_gpu_id -> H200 id", rd.pod_up.resolve_gpu_id() == "NVIDIA H200")
+        # explicit args still win over the env-baked defaults
+        check("explicit match/min-vram args honoured",
+              rd.pod_up.resolve_gpu_id("H100", 80) == "NVIDIA H100 80GB HBM3")
+        raised = False
+        try:
+            rd.pod_up.resolve_gpu_id("H100", 90)          # 80 GB card below the floor
+        except RuntimeError:
+            raised = True
+        check("min-vram floor rejects a smaller card", raised)
+    finally:
+        del os.environ["PODLINK_GPU_MATCH"]
+        del os.environ["PODLINK_GPU_MIN_VRAM_GB"]
+        fake_runpod._gpus = saved_gpus
+        _reload_pod_up()
+    check("defaults restored -> RTX Pro 6000 again",
+          rd.pod_up.resolve_gpu_id() == "NVIDIA RTX PRO 6000 Blackwell WE")
+
+
+def test_services_spec_parsing():
+    import pod_services
+    d = pod_services.parse_services("")
+    check("empty spec -> stock three in order", list(d) == ["llm", "embedder", "reranker"])
+    check("stock health paths", d["llm"] == (8000, "/v1/models") and d["embedder"] == (8080, "/health"))
+    d = pod_services.parse_services("llm:8000:/v1/models, think:8001:/v1/models ,asr:8090:/health")
+    check("custom spec parsed with whitespace tolerance",
+          list(d) == ["llm", "think", "asr"] and d["asr"] == (8090, "/health"))
+    for bad in ("llm:8000", "Llm:8000:/x", "a:8000:/x,b:8000:/y", "a:8000:/x,a:8001:/y",
+                "a:notaport:/x", "a:8000:nohealth", "a:70000:/x"):
+        raised = False
+        try:
+            pod_services.parse_services(bad)
+        except ValueError:
+            raised = True
+        check(f"malformed spec rejected: {bad!r}", raised)
+
+
+def test_services_spec_drives_ports_probes_and_env():
+    import os
+    os.environ["PODLINK_SERVICES"] = ("llm:8000:/v1/models,think:8001:/v1/models,"
+                                      "embedder:8080:/health,asr:8090:/health")
+    os.environ["PODLINK_POD_ENV_THINK_MODEL_ID"] = "org/think-70b-awq"
+    os.environ["PODLINK_POD_ENV_HF_TOKEN"] = "must-not-override"
+    try:
+        _reload_pod_up()
+        check("SERVICE_PORTS follows the spec",
+              rd.pod_up.SERVICE_PORTS == {"llm": 8000, "think": 8001, "embedder": 8080, "asr": 8090})
+        check("EXPOSED_PORT lists every port as /http",
+              rd.pod_up.EXPOSED_PORT == "8000/http,8001/http,8080/http,8090/http")
+        probes = rd._service_probes("podX", "b")
+        check("probes cover every configured service with its health path",
+              set(probes) == {"llm", "think", "embedder", "asr"}
+              and probes["think"][0] == "https://podX-8001.proxy.runpod.net/v1/models"
+              and probes["asr"][0] == "https://podX-8090.proxy.runpod.net/health")
+        env = rd.pod_up._pod_env("bearer", "hf")
+        check("PODLINK_POD_ENV_* passes through to the pod env",
+              env.get("THINK_MODEL_ID") == "org/think-70b-awq")
+        check("passthrough cannot override a secret podlink sets", env["HF_TOKEN"] == "hf")
+        # readiness gate now needs all four, and names the extra straggler
+        install_fake_client(lambda url: 503 if "8090" in url else 200)
+        s = PodSession()
+        s.try_begin_start(None)
+        check("session tiles follow the spec", set(s.services) == {"llm", "think", "embedder", "asr"})
+        raised_msg = ""
+        try:
+            rd._wait_for_all_ready(s, "podX")
+        except RuntimeError as e:
+            raised_msg = str(e)
+        check("readiness times out naming the extra service", "asr" in raised_msg)
+        check("hint names a non-TEI straggler too",
+              "asr" in (rd.stuck_service_hint({"llm", "think", "embedder"}, ["asr"]) or ""))
+    finally:
+        del os.environ["PODLINK_SERVICES"]
+        del os.environ["PODLINK_POD_ENV_THINK_MODEL_ID"]
+        del os.environ["PODLINK_POD_ENV_HF_TOKEN"]
+        _reload_pod_up()
+    check("stock spec restored", list(rd.pod_up.SERVICE_PORTS) == ["llm", "embedder", "reranker"])
+
+
 def test_resolve_gpu_id_raises_when_absent():
     saved = fake_runpod._gpus
     fake_runpod._gpus = [{"id": "A100", "displayName": "A100 80GB"}]
@@ -537,6 +633,9 @@ if __name__ == "__main__":
     test_gql_escape_env_makes_json_values_safe()
     test_create_pod_once_sends_escaped_env()
     test_resolve_gpu_id_matches_rtx_pro_6000()
+    test_resolve_gpu_id_env_override_selects_another_card()
+    test_services_spec_parsing()
+    test_services_spec_drives_ports_probes_and_env()
     test_resolve_gpu_id_raises_when_absent()
     test_all_ready_true_when_all_200()
     test_all_ready_waits_for_stragglers_then_times_out()

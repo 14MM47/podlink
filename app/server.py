@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # r
 
 from . import profiles as profiles_conf  # profile discovery + runtime switching
 from . import runpod_driver          # start()/stop() entry points
+from . import session as session_mod    # fresh tile set after a profile switch
 from .session import PodSession, State  # the shared state machine
 
 app = FastAPI(title="podlink", docs_url=None, redoc_url=None)  # no public API docs pages
@@ -120,19 +121,29 @@ def _client_env(pod_id: str) -> str:
     dim = tr.get("embedding_dim")
     dim_line = (f"EMBEDDING_DIMENSIONS={dim}" if dim
                 else "# EMBEDDING_DIMENSIONS=  <- run 'Test stack' to detect the served dimension")
-    return "\n".join([
-        f"LLM_BASE_URL={base(8000)}/v1",
-        f"LLM_MODEL={pu.LLM_SERVED_NAME}",
-        "LLM_API_KEY=<your pod_bearer_token>",
-        f"EMBEDDING_BASE_URL={base(8080)}/v1",
-        f"EMBEDDING_MODEL={pu.EMBED_MODEL_ID}",
-        dim_line,
-        "EMBEDDING_API_KEY=<your pod_bearer_token>",
-        "RERANKER_PROVIDER=api",
-        f"RERANKER_BASE_URL={base(8081)}",
-        "RERANKER_API_KEY=<your pod_bearer_token>",
-        "KG_EXTRACTION_CONCURRENCY=10",
-    ])
+    ports = pu.SERVICE_PORTS                                             # name -> port
+    lines = []
+    if "llm" in ports:
+        lines += [f"LLM_BASE_URL={base(ports['llm'])}/v1",
+                  f"LLM_MODEL={pu.LLM_SERVED_NAME}",
+                  "LLM_API_KEY=<your pod_bearer_token>"]
+    if "embedder" in ports:
+        lines += [f"EMBEDDING_BASE_URL={base(ports['embedder'])}/v1",
+                  f"EMBEDDING_MODEL={pu.EMBED_MODEL_ID}",
+                  dim_line,
+                  "EMBEDDING_API_KEY=<your pod_bearer_token>"]
+    if "reranker" in ports:
+        lines += ["RERANKER_PROVIDER=api",
+                  f"RERANKER_BASE_URL={base(ports['reranker'])}",
+                  "RERANKER_API_KEY=<your pod_bearer_token>"]
+    lines.append("KG_EXTRACTION_CONCURRENCY=10")
+    # Extended images: one base-URL line per extra service (same bearer gates them all).
+    extra = [n for n in ports if n not in ("llm", "embedder", "reranker")]
+    if extra:
+        lines.append("# extra services (PODLINK_SERVICES); each takes the same bearer")
+        for name in extra:
+            lines.append(f"{name.upper()}_BASE_URL={base(ports[name])}")
+    return "\n".join(lines)
 
 
 def _snapshot() -> dict:
@@ -148,6 +159,10 @@ def _snapshot() -> dict:
     snap["volume_id"] = runpod_driver.pod_up.NETWORK_VOLUME_ID or None  # for the volume panel
     snap["active_profile"] = os.environ.get("PODLINK_PROFILE") or None  # start.sh --profile
     snap["llm_model_id"] = runpod_driver.pod_up.LLM_MODEL_ID   # which stack this launch serves
+    # The service spec (name -> port + health path) so the UI can lay out tiles and
+    # URLs for whatever the active profile's image runs; follows a profile switch.
+    snap["services_spec"] = {name: {"port": port, "health": path}
+                             for name, (port, path) in runpod_driver.pod_up.SERVICES.items()}
     return snap
 
 
@@ -219,6 +234,7 @@ def profile_select(profile: str | None = Body(default=None, embed=True),
         # Type only — a conf-parse/reload error message could embed local paths.
         raise HTTPException(status_code=400, detail=f"profile apply failed: {type(e).__name__}")
     SESSION.add_event(f"profile switched to {profile or 'base (no profile)'}", "system")
+    SESSION.update(services=session_mod._default_services())   # tiles follow the new service set
     return JSONResponse(_snapshot())                 # active_profile/model/volume now updated
 
 

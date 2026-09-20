@@ -484,11 +484,10 @@
       <div class="card">
         <span class="sheen"></span>
         <div class="card-h">Services <span class="scan"><i></i> SVC</span></div>
-        <div id="tiles" class="tiles">
-          <div class="tile" data-status="unknown" id="tile-llm"><span class="dot"></span><span class="lbl">LLM</span><span class="st"></span></div>
-          <div class="tile" data-status="unknown" id="tile-embedder"><span class="dot"></span><span class="lbl">embedder</span><span class="st"></span></div>
-          <div class="tile" data-status="unknown" id="tile-reranker"><span class="dot"></span><span class="lbl">reranker</span><span class="st"></span></div>
-        </div>
+        <!-- One tile per service in PODLINK_SERVICES; rendered from the status
+             snapshot (app.js renderTiles) so an extended image's extra services
+             (a second vLLM, ASR, TTS, an app gateway) get tiles too. -->
+        <div id="tiles" class="tiles"></div>
       </div>
 
       <div id="volinfo" class="volinfo"></div>

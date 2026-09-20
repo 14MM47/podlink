@@ -35,7 +35,7 @@ import _secrets          # noqa: E402  vendored secret reader (0600/ownership ch
 import egress_logger     # noqa: E402  vendored audited httpx client
 import pod_up            # noqa: E402  vendored: constants + find_existing/create_pod/…
 
-from .session import PodSession, State, SERVICES  # our state machine types + service names
+from .session import PodSession, State, _default_services  # state machine + fresh tiles
 
 # How long to wait, in seconds, for each phase before declaring failure.
 RUNNING_TIMEOUT_S = 900   # RunPod allocation + container boot
@@ -185,7 +185,7 @@ def start(session: PodSession) -> None:
             # Capture the id before anything can block — closes the billing race.
             session.update(pod_id=pod_id, phase="adopting running pod")
         else:                                             # none, or a dead/reaping leftover
-            pod = _create_with_fallback(session)          # resolve RTX Pro 6000 + create
+            pod = _create_with_fallback(session)          # resolve the configured GPU + create
             if pod is None:                               # cancel arrived during create
                 return                                    # let the stop worker take over
             pod_id = pod["id"]                            # id of the freshly created pod
@@ -197,8 +197,8 @@ def start(session: PodSession) -> None:
 
         llm_url = pod_up.derive_proxy_url(pod_id, pod_up.SERVICE_PORTS["llm"])  # primary URL
         session.update(proxy_url=llm_url,
-                       phase="waiting for all three services to become healthy")
-        if not _wait_for_all_ready(session, pod_id):       # LLM + embedder + reranker (or cancel)
+                       phase=f"waiting for all {len(pod_up.SERVICES)} services to become healthy")
+        if not _wait_for_all_ready(session, pod_id):       # every configured service (or cancel)
             return                                        # cancelled mid-wait
 
         # Persist state only once safely up, matching the scripts' contract.
@@ -301,15 +301,13 @@ def _wait_for_running(session: PodSession, pod_id: str) -> bool:
 
 
 def _service_probes(pod_id: str, bearer: str) -> dict:
-    """Map each service to its (health-url, auth-headers). All three are gated by
-    the same bearer (their ports are on RunPod's public proxy)."""
+    """Map each configured service to its (health-url, auth-headers). Every service is
+    gated by the same bearer (their ports are on RunPod's public proxy). The set and
+    the health paths come from PODLINK_SERVICES (pod_up.SERVICES)."""
     auth = {"Authorization": f"Bearer {bearer}"}
-    urls = pod_up.service_urls(pod_id)                   # {llm,embedder,reranker: base URL}
-    return {
-        "llm":      (f"{urls['llm']}/v1/models",   auth),
-        "embedder": (f"{urls['embedder']}/health", auth),
-        "reranker": (f"{urls['reranker']}/health", auth),
-    }
+    urls = pod_up.service_urls(pod_id)                   # {name: base URL}
+    return {name: (f"{urls[name]}{path}", auth)
+            for name, (_port, path) in pod_up.SERVICES.items()}
 
 
 def _probe_service(url: str, headers: dict) -> bool:
@@ -332,7 +330,7 @@ def _apply_health(session: PodSession, statuses: dict) -> None:
 
 
 def probe_health_once(session: PodSession, pod_id: str) -> None:
-    """Probe all three services once and update the health tiles — used by the
+    """Probe every configured service once and update the health tiles — used by the
     background poller while RUNNING (healthy | down)."""
     bearer = _read_secret(_secrets.bearer_token)
     probes = _service_probes(pod_id, bearer)
@@ -358,11 +356,13 @@ def _timed_post(url: str, headers: dict, body: dict) -> tuple:
 
 
 def test_stack(session: PodSession) -> None:
-    """Fire a REAL completion + embedding + rerank at the three services, recording
+    """Fire a REAL completion + embedding + rerank at the stock services, recording
     pass/fail + latency (and the embedding dimension) into session.test_result.
 
     Uses the same endpoints a RAG client will: vLLM OpenAI-compat
     /v1/chat/completions, TEI OpenAI-compat /v1/embeddings, and TEI native /rerank.
+    Only the services present in PODLINK_SERVICES are exercised (an extended image's
+    extra services are covered by the health probes, not this test).
     Runs in a background thread (launched by /pod/test)."""
     try:
         pod_id = session.pod_id
@@ -376,45 +376,52 @@ def test_stack(session: PodSession) -> None:
         session.add_event("stack test started", "system")
         services: dict = {}
 
+        dim = None
         # 1) LLM — OpenAI chat completion (model must equal vLLM --served-model-name).
-        ok, ms, status, data = _timed_post(
-            f"{urls['llm']}/v1/chat/completions", auth,
-            {"model": pod_up.LLM_SERVED_NAME,
-             "messages": [{"role": "user", "content": "ping"}],
-             "max_tokens": 1, "temperature": 0})
-        services["llm"] = {"ok": ok, "latency_ms": ms,
-                           "detail": "completion ok" if ok else f"HTTP {status}"}
-        session.add_event(f"stack test — llm {'ok' if ok else 'FAIL'} {ms}ms", "health")
+        if "llm" in urls:
+            ok, ms, status, data = _timed_post(
+                f"{urls['llm']}/v1/chat/completions", auth,
+                {"model": pod_up.LLM_SERVED_NAME,
+                 "messages": [{"role": "user", "content": "ping"}],
+                 "max_tokens": 1, "temperature": 0})
+            services["llm"] = {"ok": ok, "latency_ms": ms,
+                               "detail": "completion ok" if ok else f"HTTP {status}"}
+            session.add_event(f"stack test — llm {'ok' if ok else 'FAIL'} {ms}ms", "health")
 
         # 2) Embedder — OpenAI embeddings; the vector length is the served dimension.
-        ok, ms, status, data = _timed_post(
-            f"{urls['embedder']}/v1/embeddings", auth,
-            {"model": pod_up.EMBED_MODEL_ID, "input": "hello world"})
-        dim = None
-        try:
-            dim = len(data["data"][0]["embedding"])
-        except Exception:  # noqa: BLE001                # unexpected shape
-            pass
-        services["embedder"] = {"ok": bool(ok and dim), "latency_ms": ms,
-                                "detail": f"{dim}-dim" if dim else f"HTTP {status}"}
-        session.add_event(
-            f"stack test — embedder {'ok' if ok else 'FAIL'} {ms}ms"
-            f"{f' ({dim}-dim)' if dim else ''}", "health")
+        if "embedder" in urls:
+            ok, ms, status, data = _timed_post(
+                f"{urls['embedder']}/v1/embeddings", auth,
+                {"model": pod_up.EMBED_MODEL_ID, "input": "hello world"})
+            try:
+                dim = len(data["data"][0]["embedding"])
+            except Exception:  # noqa: BLE001                # unexpected shape
+                pass
+            services["embedder"] = {"ok": bool(ok and dim), "latency_ms": ms,
+                                    "detail": f"{dim}-dim" if dim else f"HTTP {status}"}
+            session.add_event(
+                f"stack test — embedder {'ok' if ok else 'FAIL'} {ms}ms"
+                f"{f' ({dim}-dim)' if dim else ''}", "health")
 
         # 3) Reranker — TEI native /rerank (query + candidate texts).
-        ok, ms, status, data = _timed_post(
-            f"{urls['reranker']}/rerank", auth,
-            {"query": "what does podlink do",
-             "texts": ["podlink controls a RunPod GPU pod", "an unrelated sentence"]})
-        top = None
-        try:
-            top = round(max(x["score"] for x in data), 3)  # TEI returns [{index, score}, ...]
-        except Exception:  # noqa: BLE001
-            pass
-        services["reranker"] = {"ok": ok, "latency_ms": ms,
-                                "detail": f"top score {top}" if top is not None else (f"HTTP {status}" if not ok else "ok")}
-        session.add_event(f"stack test — reranker {'ok' if ok else 'FAIL'} {ms}ms", "health")
+        if "reranker" in urls:
+            ok, ms, status, data = _timed_post(
+                f"{urls['reranker']}/rerank", auth,
+                {"query": "what does podlink do",
+                 "texts": ["podlink controls a RunPod GPU pod", "an unrelated sentence"]})
+            top = None
+            try:
+                top = round(max(x["score"] for x in data), 3)  # TEI returns [{index, score}, ...]
+            except Exception:  # noqa: BLE001
+                pass
+            services["reranker"] = {"ok": ok, "latency_ms": ms,
+                                    "detail": f"top score {top}" if top is not None else (f"HTTP {status}" if not ok else "ok")}
+            session.add_event(f"stack test — reranker {'ok' if ok else 'FAIL'} {ms}ms", "health")
 
+        if not services:
+            session.update(test_running=False,
+                           test_result={"error": "no llm/embedder/reranker service in PODLINK_SERVICES"})
+            return
         all_ok = all(s["ok"] for s in services.values())
         session.update(test_running=False,
                        test_result={"services": services, "embedding_dim": dim, "all_ok": all_ok})
@@ -425,23 +432,30 @@ def test_stack(session: PodSession) -> None:
 
 
 def stuck_service_hint(ready: set[str], pending: list[str]) -> str | None:
-    """When the LLM answers but a TEI service never listens, the service has almost
+    """When the LLM answers but another service never listens, that service has almost
     certainly failed to start (CUDA allocation while vLLM loaded, or a weight download
     error) and supervisor may have given up on it. Say so, and where to look."""
-    if "llm" in ready and pending and all(p in ("embedder", "reranker") for p in pending):
-        names = " and ".join(pending)
+    if "llm" not in ready or not pending or "llm" in pending:
+        return None
+    names = " and ".join(pending)
+    if all(p in ("embedder", "reranker") for p in pending):
         return (f"{names} still not listening while the LLM is up: this is usually a failed "
                 "start (VRAM taken by vLLM, or a weight download error), not a slow load — "
                 "check the container log in the RunPod dashboard for text-embeddings-router; "
                 "POD DOWN then POD UP restarts the stack (pod images built after 2026-09-16 "
                 "start the TEI services before vLLM)")
-    return None
+    return (f"{names} still not listening while the LLM is up: this is usually a failed "
+            "start (VRAM already taken, a missing model, or a wrapper error), not a slow "
+            "load — check the container log in the RunPod dashboard, or from the pod's web "
+            "terminal run `supervisorctl -c /etc/podlink/supervisord.conf status` and "
+            f"`tail -200 <service> stderr`; POD DOWN then POD UP restarts the stack")
 
 
 def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
-    """Poll all three services until each returns 200 (or cancel/timeout).
+    """Poll every configured service until each returns 200 (or cancel/timeout).
 
-    "Pod ready" = LLM /v1/models AND embedder /health AND reranker /health. Each
+    "Pod ready" = every PODLINK_SERVICES health path answers 200 (stock: LLM
+    /v1/models AND embedder /health AND reranker /health). Each
     service is dropped from the poll set once healthy; the per-service tiles and
     the phase text report which are still coming up.
     """
@@ -461,7 +475,7 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
                 ready.add(name)
         # Reflect per-service health onto the tiles (healthy vs still pending).
         _apply_health(session, {n: ("healthy" if n in ready else "pending") for n in probes})
-        if len(ready) == len(probes):                    # all three healthy
+        if len(ready) == len(probes):                    # every service healthy
             session.update(phase="all services healthy")
             return True                                  # start is complete
         pending = [n for n in probes if n not in ready]  # what's still loading
@@ -513,7 +527,7 @@ def recover_if_healthy(session: PodSession, pod_id: str) -> bool:
         return False
     session.update(error=None, proxy_url=llm_url,
                    phase="running — recovered: all services healthy")
-    session.add_event("recovered — all three services healthy; state is RUNNING", "system")
+    session.add_event("recovered — all services healthy; state is RUNNING", "system")
     try:                                                 # best effort, matches start()
         pod = runpod.get_pod(pod_id) or {}
         gpu_type = (pod.get("machine", {}).get("gpuTypeId") or pod.get("gpuTypeId") or "unknown")
@@ -568,7 +582,7 @@ def stop(session: PodSession) -> None:
             session.update(state=State.IDLE, phase="no pod found — nothing to terminate",
                            pod_id=None, proxy_url=None,   # settle back to IDLE
                            billing_started_at=None, cost_per_hr=None, auto_terminate_at=None,
-                           services={n: "unknown" for n in SERVICES})
+                           services=_default_services())
             return
 
         session.update(pod_id=pod_id, phase=f"terminating pod {pod_id}")  # progress text
@@ -579,7 +593,7 @@ def stop(session: PodSession) -> None:
             session.update(state=State.IDLE, phase="terminated — GPU released",
                            pod_id=None, proxy_url=None,   # safe: back to IDLE
                            billing_started_at=None, cost_per_hr=None, auto_terminate_at=None,  # stop the meter
-                           services={n: "unknown" for n in SERVICES},  # clear the health tiles
+                           services=_default_services(),  # clear the health tiles
                            test_result=None, test_running=False)  # clear the stack-test result
 
         else:                                            # could NOT confirm — do not lie

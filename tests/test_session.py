@@ -37,6 +37,20 @@ def test_start_records_target_and_resets():
     check("services reset to unknown", all(v == "unknown" for v in s.services.values()))
 
 
+def test_services_follow_the_spec_env():
+    import os
+    from app.session import service_names
+    check("stock service names", service_names() == ("llm", "embedder", "reranker"))
+    os.environ["PODLINK_SERVICES"] = "llm:8000:/v1/models,tts:8091:/health"
+    try:
+        check("service_names reads the env at call time", service_names() == ("llm", "tts"))
+        s = PodSession()
+        s.try_begin_start(None)
+        check("a fresh start lays out tiles for the new set", list(s.services) == ["llm", "tts"])
+    finally:
+        del os.environ["PODLINK_SERVICES"]
+
+
 def test_stop_transition_and_cancel():
     s = PodSession()
     check("stop from IDLE -> False", s.try_begin_stop() is False)
@@ -96,6 +110,7 @@ if __name__ == "__main__":
     print("session tests:")
     test_start_transition()
     test_start_records_target_and_resets()
+    test_services_follow_the_spec_env()
     test_stop_transition_and_cancel()
     test_commit_running_guarded_by_cancel()
     test_snapshot_button_flags()

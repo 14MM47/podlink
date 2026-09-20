@@ -147,6 +147,24 @@ if [[ "${CHECK_ONLY}" == "1" ]]; then
   say "  embedder: ${PODLINK_EMBED_MODEL_ID:-<pod_up.py default>}"
   say "  reranker: ${PODLINK_RERANK_MODEL_ID:-<pod_up.py default>}"
   say "  max model len: ${PODLINK_MAX_MODEL_LEN:-32768} · gpu share: ${PODLINK_GPU_MEMORY_UTILIZATION:-0.70}"
+  say "  gpu: ${PODLINK_GPU_MATCH:-RTX PRO 6000} (>= ${PODLINK_GPU_MIN_VRAM_GB:-90} GB) · container disk: ${PODLINK_CONTAINER_DISK_GB:-55} GB"
+  # Validate the service spec with the same parser the app uses, so a profile typo
+  # fails here instead of deploying a pod whose tiles never go green.
+  if svc="$(python - <<'PY'
+import sys; sys.path.insert(0, "pod_control")
+import pod_services
+try:
+    print(", ".join(f"{n}:{p}" for n, (p, _h) in pod_services.parse_services().items()))
+except ValueError as e:
+    print(e, file=sys.stderr); sys.exit(1)
+PY
+)"; then
+    say "  services: ${svc}"
+  else
+    warn "  ✗ PODLINK_SERVICES is malformed (see error above)"
+  fi
+  extra="$(env | grep -c '^PODLINK_POD_ENV_' || true)"
+  if [[ "${extra}" != "0" ]]; then say "  pod env passthrough: ${extra} PODLINK_POD_ENV_* value(s)"; fi
   if [[ -n "${PODLINK_REGISTRY_AUTH_ID:-}" ]]; then say "  registry auth: set (private image)"; else say "  registry auth: none (public image)"; fi
   say ""
   if [[ -n "${PODLINK_NETWORK_VOLUME_ID}" ]]; then

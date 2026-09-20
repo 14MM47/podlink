@@ -6,6 +6,19 @@ All notable changes to podlink are documented here. The format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Multi-service pods**: `PODLINK_SERVICES="name:port:/health-path,…"` declares
+  the services the image runs (default: the stock three). Exposed ports, the
+  readiness gate, the health tiles, `/status.services_spec` and **Copy .env**
+  (one `<NAME>_BASE_URL` per extra service) all follow it; `./start.sh --check`
+  validates it. The tiles are now rendered from the snapshot instead of fixed markup.
+- `PODLINK_GPU_MATCH` / `PODLINK_GPU_MIN_VRAM_GB` (default `RTX PRO 6000` / `90`):
+  target another card from a profile. `resolve_gpu_id()` reads them at call time so
+  a console profile switch is honoured.
+- `PODLINK_CONTAINER_DISK_GB` (default `55`) for larger extended images.
+- `PODLINK_POD_ENV_<KEY>=v` generic pod-env passthrough (lands as `<KEY>=v`); the
+  secrets and stock model keys podlink sets cannot be overridden this way.
+- `profiles/chat.conf`: a committed example profile — an eight-service voice
+  harness pod (fast + think + helper vLLMs, TEI ×2, ASR, TTS, gateway) on an H200.
 - **Profile switching from the console**: a profile dropdown above the pod
   selector (`GET /profiles`, `POST /profile/select`) switches the active stack
   for the NEXT POD UP without relaunching start.sh. Confs are parsed (shlex,

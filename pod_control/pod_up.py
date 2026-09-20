@@ -30,6 +30,7 @@ from runpod.error import QueryError
 from rich import print as rprint
 
 import _secrets
+import pod_services
 
 POD_NAME = os.environ.get("PODLINK_POD_NAME", "podlink")
 
@@ -76,15 +77,21 @@ LLM_SERVED_NAME = os.environ.get("PODLINK_LLM_SERVED_NAME", "llm")
 # gpt-oss LLM set "mxfp4"; NEVER "nvfp4" on sm_120.
 LLM_QUANT = os.environ.get("PODLINK_LLM_QUANT", "")
 
-# --- the three service ports, exposed via RunPod's HTTPS proxy ----------------
-SERVICE_PORTS = {"llm": 8000, "embedder": 8080, "reranker": 8081}
+# --- the services the image runs, exposed via RunPod's HTTPS proxy -------------
+# One `name:port:health-path` per service (see pod_services.py). Unset => the stock
+# three (vLLM :8000, TEI embedder :8080, TEI reranker :8081). An extended image adds
+# its services here in the profile, and every consumer (exposed ports, readiness
+# gate, health tiles, .env block) follows.
+SERVICES = pod_services.parse_services()                 # name -> (port, health_path)
+SERVICE_PORTS = {name: port for name, (port, _p) in SERVICES.items()}
 # HTTP port mode -> each port gets a proxy URL with auto TLS.
 EXPOSED_PORT = ",".join(f"{p}/http" for p in SERVICE_PORTS.values())
 
 # --- pod sizing ---------------------------------------------------------------
-CONTAINER_DISK_GB = 55    # must hold the bundled image (~38 GB on the 24.04/CUDA-12.9
-                          # base) + vLLM's torch_compile_cache (~1-2 GB, on container
-                          # disk, not the volume) + scratch. 40 GB was too tight.
+# Container disk must hold the bundled image (~38 GB on the 24.04/CUDA-12.9 base) +
+# vLLM's torch_compile_cache (~1-2 GB, on container disk, not the volume) + scratch.
+# 40 GB was too tight for the stock image; an extended image (ASR/TTS/app) needs more.
+CONTAINER_DISK_GB = int(os.environ.get("PODLINK_CONTAINER_DISK_GB", "55"))
 # Persistent HF-cache storage mounted at /workspace. Two modes:
 #   * NETWORK VOLUME (preferred) — set NETWORK_VOLUME_ID to a volume created in
 #     RunPod (Storage -> Network Volumes). It SURVIVES terminate, so the up/down
@@ -119,9 +126,13 @@ GPU_MEMORY_UTILIZATION = float(os.environ.get("PODLINK_GPU_MEMORY_UTILIZATION", 
 # to deploy without it once the image is trusted.
 START_SSH = os.environ.get("PODLINK_START_SSH", "1").strip().lower() not in ("0", "false", "no", "")
 
-# The specs never publish RunPod's exact GPU type id for the RTX Pro 6000, so we
-# resolve it live (resolve_gpu_id) by matching this substring against the catalog.
-GPU_MATCH = "RTX PRO 6000"
+# The GPU is resolved live (resolve_gpu_id) by matching this substring against the
+# RunPod catalog, keeping only full cards with at least GPU_MIN_VRAM_GB. The defaults
+# are the RTX Pro 6000 (96 GB) the stock image is sized for; a profile can target
+# another card (e.g. PODLINK_GPU_MATCH=H200, PODLINK_GPU_MIN_VRAM_GB=140) — the image
+# and the vLLM fractions in that profile must be sized for it.
+GPU_MATCH = os.environ.get("PODLINK_GPU_MATCH", "").strip() or "RTX PRO 6000"
+GPU_MIN_VRAM_GB = int(os.environ.get("PODLINK_GPU_MIN_VRAM_GB", "90"))
 
 STATE_PATH = Path(__file__).resolve().parents[1] / "pod_state.json"
 TEMPLATE_STATE_PATH = Path(__file__).resolve().parents[1] / "template_state.json"
@@ -197,19 +208,26 @@ def ensure_template() -> str:
     return template_id
 
 
-def resolve_gpu_id(match: str = GPU_MATCH) -> str:
-    """Resolve the RunPod gpu_type_id for a FULL 96 GB RTX PRO 6000.
+def resolve_gpu_id(match: str | None = None, min_vram_gb: int | None = None) -> str:
+    """Resolve the RunPod gpu_type_id for a FULL card matching GPU_MATCH.
 
-    RunPod lists several RTX PRO 6000 SKUs and the naive "first substring match"
-    picked the wrong one: the *Max-Q Workstation Edition* (a desktop variant
-    rarely stocked in Secure Cloud) → deploys hit "no instances available". The
-    catalog also has 24/48 GB **MIG slices** (too small for our stack) and a
-    *Workstation Edition*. The datacenter SKU that Secure Cloud actually stocks is
-    the **Server Edition** (displayName "RTX PRO 6000").
+    Defaults (None) read the module constants at call time, so a profile switch
+    that re-bakes GPU_MATCH / GPU_MIN_VRAM_GB is honoured without re-importing.
 
-    So among entries matching `match`, we drop MIG slices and anything under a
-    full 96 GB card, then prefer the Server Edition, and return its gpu_type_id.
+    RunPod lists several SKUs per card and the naive "first substring match"
+    picked the wrong one for the RTX Pro 6000: the *Max-Q Workstation Edition* (a
+    desktop variant rarely stocked in Secure Cloud) → deploys hit "no instances
+    available". The catalog also has 24/48 GB **MIG slices** (too small for the
+    stack) and a *Workstation Edition*. The datacenter SKU that Secure Cloud
+    actually stocks is the **Server Edition** (displayName "RTX PRO 6000").
+
+    So among entries matching `match`, we drop MIG slices and anything under
+    `min_vram_gb`, then prefer a Server Edition, and return its gpu_type_id.
     """
+    if match is None:
+        match = GPU_MATCH
+    if min_vram_gb is None:
+        min_vram_gb = GPU_MIN_VRAM_GB
     needle = match.upper().replace(" ", "")
     candidates = []
     for g in runpod.get_gpus():                              # live GPU catalog
@@ -219,13 +237,14 @@ def resolve_gpu_id(match: str = GPU_MATCH) -> str:
             continue
         if "MIG" in gid.upper():                             # skip 24/48 GB MIG slices
             continue
-        if (g.get("memoryInGb") or 0) < 90:                  # require a full 96 GB card
+        if (g.get("memoryInGb") or 0) < min_vram_gb:         # require the full card
             continue
         candidates.append(gid)
     if not candidates:
         raise RuntimeError(
-            f"No full-96GB GPU type matched {match!r}. Inspect the catalog with "
-            f"runpod.get_gpus()."
+            f"No GPU type with >= {min_vram_gb} GB matched {match!r}. Inspect the "
+            f"catalog with runpod.get_gpus(), or adjust PODLINK_GPU_MATCH / "
+            f"PODLINK_GPU_MIN_VRAM_GB."
         )
     # Prefer the Secure-stocked datacenter SKU (Server Edition) over the
     # workstation variants; stable tiebreak by id.
@@ -270,6 +289,14 @@ def _pod_env(bearer: str, hf: str) -> dict:
         val = os.environ.get(src, "").strip()
         if val:
             env[dst] = val
+    # Generic passthrough for extended images: PODLINK_POD_ENV_<KEY>=v lands in the pod
+    # as <KEY>=v (e.g. a second vLLM's THINK_MODEL_ID, an ASR model id, the image's own
+    # service list). Keys podlink already sets above — the secrets and the stock model
+    # config — are never overridden this way, so a profile cannot redirect a token.
+    prefix = "PODLINK_POD_ENV_"
+    for key, val in sorted(os.environ.items()):
+        if key.startswith(prefix) and len(key) > len(prefix) and key[len(prefix):] not in env:
+            env[key[len(prefix):]] = val
     return env
 
 
@@ -346,8 +373,8 @@ def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None =
 
 
 def try_create() -> dict:
-    """CLI helper: resolve the RTX Pro 6000 id and create the pod (no GPU fallback
-    — the image + models are sized for the 96 GB card; a smaller GPU would OOM)."""
+    """CLI helper: resolve the configured GPU id and create the pod (no GPU fallback
+    — the image + models are sized for that card; a smaller GPU would OOM)."""
     bearer = _secrets.bearer_token()
     hf = _secrets.hf_token()
     gpu_id = resolve_gpu_id()
@@ -368,7 +395,7 @@ def derive_proxy_url(pod_id: str, port: int = 8000) -> str:
 
 
 def service_urls(pod_id: str) -> dict[str, str]:
-    """The three proxy base URLs keyed by service name (llm/embedder/reranker)."""
+    """The proxy base URL of every configured service, keyed by name (spec order)."""
     return {name: derive_proxy_url(pod_id, port) for name, port in SERVICE_PORTS.items()}
 
 
@@ -396,7 +423,7 @@ def write_state(pod: dict, gpu_type_id: str) -> None:
         "pod_id": pod_id,
         "name": pod.get("name"),
         "proxy_url": urls["llm"],          # primary (kept for back-compat)
-        "service_urls": urls,              # all three: llm / embedder / reranker
+        "service_urls": urls,              # every configured service (PODLINK_SERVICES)
         "models": {
             "llm": LLM_MODEL_ID,
             "served_as": LLM_SERVED_NAME,

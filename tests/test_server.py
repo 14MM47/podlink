@@ -120,7 +120,30 @@ def test_env_and_test_guards():
     check("env has the live pod URLs", "abc123def-8000.proxy.runpod.net" in env)
     check("env uses the served name", f"LLM_MODEL={server.runpod_driver.pod_up.LLM_SERVED_NAME}" in env)
     check("bearer is a placeholder, not a secret", "<your pod_bearer_token>" in env)
+    check("/status carries the service spec",
+          client.get("/status").json()["services_spec"]["llm"] == {"port": 8000, "health": "/v1/models"})
     _reset()
+
+
+def test_extended_service_spec_reaches_env_and_snapshot():
+    import importlib
+
+    os.environ["PODLINK_SERVICES"] = ("llm:8000:/v1/models,embedder:8080:/health,"
+                                      "reranker:8081:/health,harness:8100:/health")
+    try:
+        importlib.reload(server.runpod_driver.pod_up)
+        _reset()
+        S.pod_id = "abc123def"; S.state = State.RUNNING
+        env = client.get("/pod/env", headers=H).json()["env"]
+        check("extra service gets a BASE_URL line",
+              "HARNESS_BASE_URL=https://abc123def-8100.proxy.runpod.net" in env)
+        check("stock lines still present", "LLM_BASE_URL=https://abc123def-8000.proxy.runpod.net/v1" in env)
+        spec = client.get("/status").json()["services_spec"]
+        check("snapshot spec lists the extra service", spec["harness"] == {"port": 8100, "health": "/health"})
+    finally:
+        del os.environ["PODLINK_SERVICES"]
+        importlib.reload(server.runpod_driver.pod_up)
+        _reset()
 
 
 def test_profile_parsing_and_switching():
@@ -202,5 +225,6 @@ if __name__ == "__main__":
     test_down_guard()
     test_keepalive_clears_deadline()
     test_env_and_test_guards()
+    test_extended_service_spec_reaches_env_and_snapshot()
     test_profile_parsing_and_switching()
     print("all server tests passed.")

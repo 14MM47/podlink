@@ -11,8 +11,18 @@ make policy decisions — it just renders `up_enabled` / `down_enabled`.
 from __future__ import annotations  # allow `str | None` annotations on older runtimes
 
 import enum       # for the State enumeration below
+import sys        # to reach the vendored pod_control modules
 import threading  # Lock + Event for thread-safe coordination
 import time        # uptime / cost / auto-terminate countdown maths
+from pathlib import Path
+
+# The service spec parser lives with the vendored pod-control scripts (pod_up.py reads
+# it too). Same sys.path bootstrap as runpod_driver, so this module also imports
+# standalone (the session tests import it without the driver).
+_POD_CONTROL_DIR = Path(__file__).resolve().parents[1] / "pod_control"
+if str(_POD_CONTROL_DIR) not in sys.path:
+    sys.path.insert(0, str(_POD_CONTROL_DIR))
+import pod_services  # noqa: E402  PODLINK_SERVICES -> ordered service names
 
 
 class State(str, enum.Enum):           # str-mixin so `.value` JSON-serialises cleanly
@@ -23,12 +33,20 @@ class State(str, enum.Enum):           # str-mixin so `.value` JSON-serialises c
     ERROR = "ERROR"        # something failed; both buttons live so the user can recover
 
 
-SERVICES = ("llm", "embedder", "reranker")   # the three services whose health we track
 _MAX_EVENTS = 60                              # ring-buffer cap for the status event feed
 
 
+def service_names() -> tuple[str, ...]:
+    """The services whose health we track, from PODLINK_SERVICES (read at call time so
+    a profile switch — which rewrites the process env — changes the tile set)."""
+    return pod_services.service_names()
+
+
+SERVICES = service_names()                    # the set at import time (stock: llm/embedder/reranker)
+
+
 def _default_services() -> dict:
-    return {name: "unknown" for name in SERVICES}
+    return {name: "unknown" for name in service_names()}
 
 
 class PodSession:

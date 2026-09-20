@@ -126,6 +126,10 @@ export PODLINK_NETWORK_VOLUME_ID=<volume-id>         # terminate-safe weight per
 | `PODLINK_READY_WARN_S` / `PODLINK_READY_TIMEOUT_S` | `900` / `3600` | Readiness wait after the pod is RUNNING: warn in the feed every `WARN` seconds and keep waiting (the pod is billing either way); give up only after `TIMEOUT` seconds (`0` = never). Big volume-less boots can take 15–20 min. |
 | `PODLINK_ADOPT_ON_START` | `1` (on) | On console start, adopt a RUNNING pod with our name (e.g. after a console restart or a lost start) instead of showing IDLE. |
 | `PODLINK_CREATE_RETRIES` / `PODLINK_CREATE_RETRY_DELAY` | `40` / `15` | Host-capacity retry attempts and delay. |
+| `PODLINK_GPU_MATCH` / `PODLINK_GPU_MIN_VRAM_GB` | `RTX PRO 6000` / `90` | Which card to resolve from the RunPod catalog (substring match, MIG slices skipped) and the VRAM floor. A profile targeting another card (e.g. `H200` / `140`) must also size its image and vLLM fractions for it. |
+| `PODLINK_CONTAINER_DISK_GB` | `55` | Container disk for the image + compile cache; raise it for an extended image. |
+| `PODLINK_SERVICES` | the stock three | `name:port:/health-path,…` — the services the image runs (see [Multi-service pods](#multi-service-pods)). |
+| `PODLINK_POD_ENV_<KEY>` | *(none)* | Generic passthrough: lands in the pod env as `<KEY>` for an extended image's own services. Cannot override the secrets or the stock model keys podlink sets. |
 | `PODLINK_START_SSH` | `1` (on) | Enable SSH on the pod for first-boot debug. |
 
 ### Profiles — switching between whole stacks
@@ -155,6 +159,28 @@ Switching stacks does not need a relaunch: the console's **profile dropdown**
 Profile confs are parsed (only `export PODLINK_*` lines are honoured), never
 executed, and the switch is only allowed while no pod exists — take the pod
 DOWN first. `--profile` at launch simply sets the initial selection.
+
+### Multi-service pods
+
+The stock image runs three services, but podlink is not limited to three. Everything
+that enumerates services — the exposed ports, the readiness gate, the health tiles,
+**Copy .env** — reads one spec:
+
+```bash
+export PODLINK_SERVICES="llm:8000:/v1/models,embedder:8080:/health,reranker:8081:/health"   # the default
+```
+
+One `name:port:/health-path` entry per service, in start/tile order. Each port is
+exposed through RunPod's HTTPS proxy and probed at its health path with the bearer;
+"pod ready" means every entry answers 200. An extended image (a second vLLM, ASR, TTS,
+an app gateway) declares its extra services here in its profile and passes its own
+configuration through with `PODLINK_POD_ENV_<KEY>=value`, which reaches the pod as
+`<KEY>=value` — no podlink code change per service. `./start.sh --check` validates the
+spec. [`profiles/chat.conf`](profiles/chat.conf) is a worked example: an eight-service
+voice-assistant pod on an H200, with `PODLINK_GPU_MATCH=H200`.
+
+The stack test (**Test stack**) exercises `llm`, `embedder` and `reranker` when present;
+extra services are covered by their health tiles.
 
 ## Pod image (build once)
 
