@@ -47,6 +47,21 @@ All notable changes to podlink are documented here. The format loosely follows
   instance now keeps its access path open (on GCP, the IAP tunnels) until POD DOWN,
   and recovery re-ensures that path before probing. Otherwise recovery would probe
   closed local ports and never succeed.
+- Recovery never abandons an instance on doubt: a lookup that fails, or a record with
+  no status, counts as still running (restores master's rule after the port).
+- An instance in ERROR that the provider confirms is gone settles the console to
+  IDLE (meter stopped, error cleared, access path closed), instead of sitting in
+  ERROR with the meter running and, on GCP, re-opening tunnels to a dead VM.
+- Idle auto-terminate also covers ERROR while an instance exists, so a pod left
+  behind by a failed start is not exempt from the safety timer.
+- GCP tunnels: tunnel start/kill is serialised, so the supervisor and a concurrent
+  `ensure()` from recovery cannot spawn the same tunnel twice.
+- Recovery loads provider credentials before its first cloud call.
+
+### Known issues
+- Startup adoption checks for a RUNNING instance, then runs the normal start path,
+  which looks again. If the instance stops between the two lookups, console start
+  creates a fresh instance instead of staying IDLE.
 
 ## [0.2.0] — 2026-07-28
 

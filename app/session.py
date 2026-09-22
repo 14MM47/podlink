@@ -110,6 +110,31 @@ class PodSession:
             self.phase = "running — model serving"           # progress text
             return True                                      # start succeeded
 
+    def settle_idle_if_error(self, pod_id: str, phase: str) -> bool:
+        """ERROR -> IDLE, only if still ERROR on this same instance.
+
+        Used when the provider confirms the instance an errored start left behind
+        is gone. Atomic, so a POD UP / POD DOWN that moved the session on in the
+        meantime is never clobbered by the (slower) health-watch thread.
+        """
+        with self._lock:
+            if self.state != State.ERROR or self.pod_id != pod_id:
+                return False
+            self._record_event(phase, "lifecycle")
+            self.state = State.IDLE
+            self.phase = phase
+            self.error = None
+            self.pod_id = None
+            self.target_pod_id = None
+            self.proxy_url = None
+            self.cost_per_hr = None
+            self.billing_started_at = None
+            self.auto_terminate_at = None
+            self.services = _default_services()
+            self.test_result = None
+            self.test_running = False
+            return True
+
     # --- generic field updates -------------------------------------------
 
     def update(self, **fields) -> None:

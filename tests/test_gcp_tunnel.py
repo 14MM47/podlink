@@ -160,6 +160,34 @@ def test_supervisor_restarts_a_dropped_tunnel():
     m.release()
 
 
+def test_ensure_racing_the_supervisor_spawns_once():
+    # The health watch's recovery calls ensure() while the supervisor may be
+    # mid-restart of the same dropped tunnel: exactly one respawn, no spurious
+    # "already in use" error, no orphaned process.
+    import threading
+    h = Harness()
+    m = h.manager(check_interval=0.02)
+    m.ensure(); m.drain_events()
+    in_spawn = threading.Event()
+    def slow_spawn(t):
+        in_spawn.set()
+        time.sleep(0.3)                          # the supervisor is inside _start
+        return h.spawn(t)
+    m._spawn = slow_spawn
+    h.procs[18080].exit = 1
+    h.open_ports.discard(18080)
+    check("supervisor began the restart", in_spawn.wait(2))
+    err = None
+    try:
+        m.ensure()                               # concurrent ensure from another thread
+    except Exception as e:  # noqa: BLE001
+        err = e
+    check("concurrent ensure raised nothing", err is None)
+    check("the dropped tunnel was respawned exactly once",
+          [t.service for t in h.spawned[3:]] == ["embedder"])
+    m.release()
+
+
 def test_supervisor_gives_up_after_the_budget():
     h = Harness()
     m = h.manager(check_interval=0.02)
@@ -236,6 +264,7 @@ if __name__ == "__main__":
     test_never_listens_times_out_and_kills()
     test_busy_local_port_is_refused_not_adopted()
     test_supervisor_restarts_a_dropped_tunnel()
+    test_ensure_racing_the_supervisor_spawns_once()
     test_supervisor_gives_up_after_the_budget()
     test_gcloud_argv_is_loopback_bound_and_shell_free()
     test_missing_gcloud_is_a_clear_error()

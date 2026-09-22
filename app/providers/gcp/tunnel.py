@@ -81,7 +81,12 @@ class TunnelManager:
         self._ready_timeout = ready_timeout
         self._check_interval = check_interval
         self._events: list[str] = []
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()                    # guards _events only
+        # Serialises every alive-check -> _start / _kill on the tunnels, so the
+        # supervisor and an ensure() from another thread (the health watch's
+        # recovery) cannot both spawn the same tunnel. Separate from _lock
+        # because _start() emits events while holding it.
+        self._op_lock = threading.Lock()
         self._stop = threading.Event()
         self._watcher: threading.Thread | None = None
 
@@ -90,10 +95,11 @@ class TunnelManager:
     def ensure(self) -> None:
         """Start every tunnel that is not already up, prove each is listening,
         and start the supervisor. Idempotent: alive tunnels are left alone."""
-        for t in self._tunnels:
-            if t.alive:
-                continue
-            self._start(t, first=True)
+        with self._op_lock:
+            for t in self._tunnels:
+                if t.alive:
+                    continue
+                self._start(t, first=True)
         if self._watcher is None or not self._watcher.is_alive():
             self._stop.clear()
             self._watcher = threading.Thread(target=self._watch, name="podlink-iap-watch", daemon=True)
@@ -102,8 +108,9 @@ class TunnelManager:
     def release(self) -> None:
         """Stop the supervisor and every tunnel process. Never raises."""
         self._stop.set()
-        for t in self._tunnels:
-            self._kill(t)
+        with self._op_lock:                              # waits out an in-flight _start
+            for t in self._tunnels:
+                self._kill(t)
         self._event("tunnels closed")
 
     def alive(self) -> dict[str, bool]:
@@ -159,20 +166,21 @@ class TunnelManager:
         restart budget is spent. Never raises out of the thread."""
         while not self._stop.wait(self._check_interval):
             for t in self._tunnels:
-                if t.alive or self._stop.is_set():
-                    continue
-                if t.restarts >= MAX_RESTARTS:
-                    continue                                 # already reported below
-                t.restarts += 1
-                self._event(f"{t.service} tunnel dropped ({self._stderr_line(t)}) — restarting "
-                            f"({t.restarts}/{MAX_RESTARTS})")
-                try:
-                    self._start(t, first=False)
-                except Exception as e:  # noqa: BLE001 — keep supervising the others
-                    self._event(f"{t.service} restart failed: {e}")
+                with self._op_lock:
+                    if t.alive or self._stop.is_set():
+                        continue
                     if t.restarts >= MAX_RESTARTS:
-                        self._event(f"{t.service} tunnel given up after {MAX_RESTARTS} restarts — "
-                                    f"POD DOWN and POD UP to re-establish")
+                        continue                             # already reported below
+                    t.restarts += 1
+                    self._event(f"{t.service} tunnel dropped ({self._stderr_line(t)}) — restarting "
+                                f"({t.restarts}/{MAX_RESTARTS})")
+                    try:
+                        self._start(t, first=False)
+                    except Exception as e:  # noqa: BLE001 — keep supervising the others
+                        self._event(f"{t.service} restart failed: {e}")
+                        if t.restarts >= MAX_RESTARTS:
+                            self._event(f"{t.service} tunnel given up after {MAX_RESTARTS} restarts — "
+                                        f"POD DOWN and POD UP to re-establish")
 
     def _kill(self, t: _Tunnel) -> None:
         proc, t.proc = t.proc, None

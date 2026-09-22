@@ -92,6 +92,23 @@ def test_cost_meter_and_auto_terminate_derived():
     check("auto-terminate countdown ~300s", abs(snap["auto_terminate_in_s"] - 300) <= 3)
 
 
+def test_settle_idle_if_error_is_guarded():
+    s = PodSession()
+    s.try_begin_start(None)
+    s.update(pod_id="p1", state=State.ERROR, error="x", billing_started_at=1.0, cost_per_hr=2.0)
+    check("wrong pod id: no settle", s.settle_idle_if_error("other", "gone") is False
+          and s.state == State.ERROR)
+    check("same pod in ERROR: settles", s.settle_idle_if_error("p1", "gone") is True)
+    snap = s.snapshot()
+    check("settled: IDLE, no pod, no error, meter off",
+          snap["state"] == "IDLE" and s.pod_id is None and snap["error"] is None
+          and snap["uptime_s"] is None)
+    s.try_begin_start(None)
+    s.update(pod_id="p2")
+    check("not ERROR: no settle", s.settle_idle_if_error("p2", "gone") is False
+          and s.state == State.STARTING)
+
+
 if __name__ == "__main__":
     print("session tests:")
     test_start_transition()
@@ -101,4 +118,5 @@ if __name__ == "__main__":
     test_snapshot_button_flags()
     test_phase_events_and_categories()
     test_cost_meter_and_auto_terminate_derived()
+    test_settle_idle_if_error_is_guarded()
     print("all session tests passed.")

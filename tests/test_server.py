@@ -51,6 +51,34 @@ def test_error_with_known_pod_keeps_cost_meter_live():
     _reset()
 
 
+def test_auto_terminate_covers_error_with_a_pod():
+    launched = []
+    saved = server._launch
+    server._launch = lambda target: launched.append(target)
+    past = __import__("time").time() - 1
+    try:
+        _reset()
+        S.state = State.ERROR
+        S.pod_id = "podErr"
+        S.update(auto_terminate_at=past)
+        check("ERROR + pod past the deadline: auto-terminate fires",
+              server._auto_terminate_tick() is True and S.state == State.STOPPING
+              and launched == [server.driver.stop])
+        _reset()
+        S.state = State.ERROR
+        S.update(auto_terminate_at=past)
+        check("ERROR without a pod: nothing to terminate",
+              server._auto_terminate_tick() is False and S.state == State.ERROR)
+        _reset()
+        S.state = State.RUNNING
+        S.pod_id = "podRun"
+        S.update(auto_terminate_at=past + 3600)
+        check("before the deadline: no terminate", server._auto_terminate_tick() is False)
+    finally:
+        server._launch = saved
+        _reset()
+
+
 def test_config_and_status():
     check("/config returns a token", isinstance(TOK, str) and len(TOK) > 10)
     snap = client.get("/status").json()
@@ -280,6 +308,7 @@ def test_cross_cloud_switch_guard():
 if __name__ == "__main__":
     print("server tests:")
     test_error_with_known_pod_keeps_cost_meter_live()
+    test_auto_terminate_covers_error_with_a_pod()
     test_config_and_status()
     test_status_active_profile()
     test_token_gate()

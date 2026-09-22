@@ -503,9 +503,12 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
 
 
 def _pod_still_running(pod_id: str) -> bool:
-    """True unless the provider positively reports the instance is no longer RUNNING. A
-    failed lookup counts as still running: never abandon an instance on a transient API
-    error."""
+    """True unless the provider positively reports the instance is no longer RUNNING.
+
+    Never abandon an instance on doubt: a failed lookup, or a record that carries
+    no status at all (a transient partial response), both count as still running.
+    Only a missing instance or a definite non-running status returns False.
+    """
     provider = active_provider()
     try:
         instance = provider.get_instance(pod_id)
@@ -513,6 +516,8 @@ def _pod_still_running(pod_id: str) -> bool:
         return True
     if not instance:
         return False
+    if provider.status_of(instance) is None:             # no status reported — not proof
+        return True
     return provider.is_running(instance)
 
 
@@ -520,13 +525,31 @@ def recover_if_healthy(session: PodSession, pod_id: str) -> bool:
     """Health-watch hook for the ERROR state: the instance is still ours and still
     billing, so keep probing; the moment all three services answer, flip to RUNNING.
 
-    Re-ensures the access path first (idempotent): a start that failed before or
-    inside ensure_access may never have opened it, and without it every probe of a
-    tunnelled service reads "down" forever.
+    If the provider confirms the instance is gone, settle to IDLE instead: nothing
+    is billing, and probing (or re-opening a tunnel to) a dead instance every pass
+    would only churn. Otherwise re-ensure the access path first (idempotent): a
+    start that failed before or inside ensure_access may never have opened it, and
+    without it every probe of a tunnelled service reads "down" forever.
 
     Returns True when the session recovered. A stop that has begun wins.
     """
     provider = active_provider()
+    try:
+        provider.authenticate()                          # as start()/stop() do, before any call
+    except Exception as e:  # noqa: BLE001 — no credentials is just "not recovered yet"
+        session.add_event(f"recovery: could not authenticate: {type(e).__name__}", "health")
+        return False
+    if not _pod_still_running(pod_id):                   # confirmed gone / not running
+        if session.settle_idle_if_error(pod_id,
+                                        "instance gone — nothing running or billing"):
+            _release_access(session, provider)
+            try:
+                provider.clear_state()
+            except Exception:  # noqa: BLE001 — best-effort, like stop()
+                pass
+            session.add_event(f"pod {pod_id} is no longer running — cleared the error; "
+                              "back to IDLE", "system")
+        return False
     try:
         provider.ensure_access(pod_id)
     except Exception as e:  # noqa: BLE001 — unreachable is just "not recovered yet"
@@ -545,7 +568,6 @@ def recover_if_healthy(session: PodSession, pod_id: str) -> bool:
                    phase="running — recovered: all services healthy")
     session.add_event("recovered — all three services healthy; state is RUNNING", "system")
     try:                                                 # best effort, matches start()
-        provider.authenticate()
         provider.write_state(pod_id)
     except Exception:  # noqa: BLE001
         pass

@@ -88,21 +88,33 @@ def _auto_terminate_watch() -> None:
 
     Guards against a forgotten pod billing indefinitely. The deadline is armed by
     the driver when a pod is created (PODLINK_AUTO_TERMINATE_MIN) and cleared by
-    /pod/keepalive. We only fire while a pod is actually up/coming up, and go
-    through the same try_begin_stop + stop path as a manual POD DOWN.
+    /pod/keepalive. We only fire while a pod exists (coming up, up, or left behind
+    by a failed start), and go through the same try_begin_stop + stop path as a
+    manual POD DOWN.
     """
     while True:
         time.sleep(_WATCH_INTERVAL_S)
         try:
-            deadline = SESSION.auto_terminate_at
-            if (deadline and time.time() >= deadline
-                    and SESSION.state in (State.STARTING, State.RUNNING)):
-                if SESSION.try_begin_stop():          # atomic: enter STOPPING + cancel
-                    SESSION.add_event("idle auto-terminate — deadline reached", "system")
-                    SESSION.update(phase="idle auto-terminate — deadline reached")
-                    _launch(driver.stop)              # terminate + verify in the background
+            _auto_terminate_tick()
         except Exception:  # noqa: BLE001 — a watchdog must never die on a transient error
             pass
+
+
+def _auto_terminate_tick() -> bool:
+    """One watchdog pass. Returns True when it launched a terminate."""
+    deadline = SESSION.auto_terminate_at
+    # ERROR counts while an instance exists: a start that gave up leaves it
+    # billing, and the idle timer is the backstop for that too.
+    live = (SESSION.state in (State.STARTING, State.RUNNING)
+            or (SESSION.state == State.ERROR and SESSION.pod_id))
+    if not (deadline and time.time() >= deadline and live):
+        return False
+    if not SESSION.try_begin_stop():                  # atomic: enter STOPPING + cancel
+        return False
+    SESSION.add_event("idle auto-terminate — deadline reached", "system")
+    SESSION.update(phase="idle auto-terminate — deadline reached")
+    _launch(driver.stop)                              # terminate + verify in the background
+    return True
 
 
 def _client_env(pod_id: str) -> str:

@@ -293,6 +293,91 @@ def test_adopt_running_on_startup_adopts_our_running_pod():
         scratch.unlink(missing_ok=True)
 
 
+def test_pod_still_running_never_abandons_on_doubt():
+    saved = fake_runpod.get_pod
+    try:
+        fake_runpod.get_pod = lambda pod_id: {"id": pod_id}              # no status at all
+        check("a record with no status counts as still running", rd._pod_still_running("p") is True)
+        def _boom(pod_id):
+            raise RuntimeError("api blip")
+        fake_runpod.get_pod = _boom
+        check("a failed lookup counts as still running", rd._pod_still_running("p") is True)
+        fake_runpod.get_pod = lambda pod_id: None
+        check("a missing instance is not running", rd._pod_still_running("p") is False)
+        fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "EXITED"}
+        check("a definite non-running status is not running", rd._pod_still_running("p") is False)
+    finally:
+        fake_runpod.get_pod = saved
+
+
+def test_recover_settles_idle_when_the_instance_is_gone():
+    rec = _AccessRecorder()
+    saved = (fake_runpod.get_pod, rp.pod_up.STATE_PATH)
+    scratch = Path("/tmp/podlink_smoke_recover_gone.json")
+    scratch.write_text("{}")
+    rp.pod_up.STATE_PATH = scratch
+    fake_runpod.get_pod = lambda pod_id: None           # the instance no longer exists
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        s.update(pod_id="podGone", state=State.ERROR, error="RuntimeError — gave up",
+                 billing_started_at=1.0, cost_per_hr=2.0, auto_terminate_at=9e9)
+        check("gone instance: not a recovery", rd.recover_if_healthy(s, "podGone") is False)
+        snap = s.snapshot()
+        check("gone instance: session settles to IDLE with the error cleared",
+              snap["state"] == "IDLE" and snap["error"] is None and s.pod_id is None)
+        check("gone instance: meter and idle timer stopped",
+              snap["uptime_s"] is None and s.auto_terminate_at is None)
+        check("gone instance: access released, never re-ensured",
+              rec.released == 1 and rec.opened == [])
+        check("gone instance: state file cleared", not scratch.exists())
+        check("gone instance: explained in the feed",
+              any("no longer running" in m for (_, c, m) in s.events if c == "system"))
+    finally:
+        fake_runpod.get_pod, rp.pod_up.STATE_PATH = saved
+        scratch.unlink(missing_ok=True)
+        rec.restore()
+
+
+def test_recover_does_not_clobber_a_session_that_moved_on():
+    saved = fake_runpod.get_pod
+    fake_runpod.get_pod = lambda pod_id: None
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        s.update(pod_id="podOld", state=State.ERROR, error="x")
+        s.try_begin_start(None)                          # user pressed POD UP meanwhile
+        rd.recover_if_healthy(s, "podOld")
+        check("a new start is not settled to IDLE by a stale recovery",
+              s.state == State.STARTING)
+    finally:
+        fake_runpod.get_pod = saved
+
+
+def test_recover_authenticates_before_any_provider_call():
+    p = providers.active()
+    calls = []
+    p.authenticate = lambda: calls.append("auth")
+    saved = fake_runpod.get_pod
+    fake_runpod.get_pod = lambda pod_id: (calls.append("get"), {"id": pod_id, "desiredStatus": "RUNNING",
+                                                                "runtime": {"x": 1}})[1]
+    install_fake_client(lambda url: 503)
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        s.update(pod_id="podA", state=State.ERROR, error="x")
+        rd.recover_if_healthy(s, "podA")
+        check("recovery authenticates first", calls[:2] == ["auth", "get"])
+        def _noauth():
+            raise RuntimeError("no key")
+        p.authenticate = _noauth
+        check("no credentials: not recovered, no exception",
+              rd.recover_if_healthy(s, "podA") is False and s.state == State.ERROR)
+    finally:
+        del p.authenticate
+        fake_runpod.get_pod = saved
+
+
 def test_all_ready_cancels_promptly():
     install_fake_client(lambda url: 503)             # nothing healthy
     s = PodSession()
@@ -817,6 +902,10 @@ if __name__ == "__main__":
     test_all_ready_raises_when_the_pod_itself_leaves_running()
     test_recover_if_healthy_flips_error_to_running()
     test_adopt_running_on_startup_adopts_our_running_pod()
+    test_pod_still_running_never_abandons_on_doubt()
+    test_recover_settles_idle_when_the_instance_is_gone()
+    test_recover_does_not_clobber_a_session_that_moved_on()
+    test_recover_authenticates_before_any_provider_call()
     test_all_ready_cancels_promptly()
     test_create_aborts_on_cancel_before_create()
     test_provider_selection()
