@@ -11,6 +11,42 @@ All notable changes to podlink are documented here. The format loosely follows
   for the NEXT POD UP without relaunching start.sh. Confs are parsed (shlex,
   `export PODLINK_*` lines only), never executed; switching is allowed only
   while no pod exists, and pod_up's constants are re-baked via module reload.
+- `PODLINK_ADOPT_ON_START` (default on): a console start adopts a RUNNING pod with
+  our name, so a restarted console shows the real state.
+
+### Fixed
+- **Pod image start order** (`pod_image/`): the two TEI services now start before
+  vLLM, and `start-vllm.sh` waits for both `/health` endpoints (bounded by
+  `VLLM_WAIT_FOR_TEI_S`, default 20 min) before vLLM profiles its KV cache. This
+  removes the first-start OOM seen when the embedder was still allocating as vLLM
+  measured free memory, and the opposite race where vLLM took the GPU first and the
+  embedder could never allocate. `startretries=50` on all three programs so a few
+  early failures no longer leave a service FATAL (one tile pending forever while the
+  pod bills). Rebuild and push the image for this to take effect.
+- Embedder warm-up no longer OOMs beside a loaded vLLM: `start-embedder.sh` passes
+  `--max-batch-tokens` (`EMBED_MAX_BATCH_TOKENS`, default 4096; TEI's default 16384
+  warm-up batch needed more activation memory than the ~2 GB left after the weights).
+- `supervisorctl` works inside the pod (`unix_http_server` / `rpcinterface` /
+  `supervisorctl` sections were missing, so `status`, `tail` and `restart <service>`
+  failed with ".ini file does not include supervisorctl section"). A service that
+  failed to start can now be restarted in place from the web terminal.
+- The readiness feed names the likely cause when the LLM answers but a TEI service
+  never listens (failed start, check the container log, POD DOWN/UP).
+- A start no longer abandons a billing pod. The readiness wait (pod RUNNING but a
+  service not yet answering) used to raise after a fixed 15 min, which is shorter
+  than a volume-less 122B boot; the console then showed ERROR / "no pod running"
+  while RunPod kept billing. It now warns in the feed every `PODLINK_READY_WARN_S`
+  and keeps waiting, gives up only at `PODLINK_READY_TIMEOUT_S` (default 60 min,
+  `0` = never), and raises promptly if RunPod reports the pod left RUNNING.
+- ERROR with a known pod keeps the health watch probing, keeps the cost meter live,
+  and recovers to RUNNING automatically once all three services answer.
+- The error line says the pod may still be running and how to recover (POD UP
+  re-adopts, POD DOWN stops).
+- Provider seam: the soft wait, ERROR recovery and startup adoption run through the
+  provider contract, so they cover every cloud. A failed start that already has an
+  instance now keeps its access path open (on GCP, the IAP tunnels) until POD DOWN,
+  and recovery re-ensures that path before probing. Otherwise recovery would probe
+  closed local ports and never succeed.
 
 ## [0.2.0] — 2026-07-28
 

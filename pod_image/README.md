@@ -9,7 +9,10 @@ One Docker image that runs **three co-resident services** on a single RTX Pro 60
 | 8080 | TEI embedder | `GET /health` → 200 |
 | 8081 | TEI reranker | `GET /health` → 200 |
 
-`supervisord` supervises all three. Model weights are **not** baked in — they
+`supervisord` supervises all three, starting the two TEI services first; `start-vllm.sh`
+waits for both `/health` endpoints (up to `VLLM_WAIT_FOR_TEI_S`, default 1200 s, `0` to
+skip) before vLLM profiles its KV cache, so the embedder owns its VRAM before vLLM
+sizes itself. From the RunPod web terminal, `supervisorctl -c /etc/podlink/supervisord.conf status|tail -200 <service> stderr|restart <service>` inspects and restarts a service in place. Model weights are **not** baked in — they
 download on first boot into `$HF_HOME=/workspace/hf` (the persistent volume), so
 the download is a one-time cost and later resumes are fast.
 
@@ -53,6 +56,8 @@ podlink's `create_pod` passes these as env — you don't set them here:
 | `LLM_SERVED_NAME` | vLLM `--served-model-name` (a client's model field must match; default `llm`) |
 | `LLM_QUANT` | vLLM `--quantization` (e.g. `awq_marlin`); leave empty for an FP8 checkpoint |
 | `MAX_MODEL_LEN`, `GPU_MEMORY_UTILIZATION` | vLLM sizing (defaults 32768 / 0.70) |
+| `EMBED_MAX_BATCH_TOKENS` | TEI embedder `--max-batch-tokens` (default 4096; keeps warm-up inside the memory vLLM leaves) |
+| `VLLM_WAIT_FOR_TEI_S` | how long `start-vllm.sh` waits for both TEI `/health` endpoints before starting vLLM (default 1200, `0` = don't wait) |
 | `VLLM_API_KEY` | vLLM bearer (read natively by vLLM; never on argv) |
 | `TEI_API_KEY` | gates both TEI services; the wrappers `export API_KEY=$TEI_API_KEY` so TEI reads it from env (not argv). Same value as the vLLM bearer. |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | weight-pull token, seen by all three services |

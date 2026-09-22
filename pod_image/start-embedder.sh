@@ -11,7 +11,13 @@ set -euo pipefail
 # via the RunPod web terminal). podlink injects TEI_API_KEY; unset => fail closed.
 export API_KEY="${TEI_API_KEY}"
 
+# TEI warms up with a full --max-batch-tokens batch (default 16384) on top of the model
+# weights. Beside a vLLM that already holds its GPU share that warm-up OOMs (seen 16 Sept
+# 2026: 8.4 GiB weights loaded, then CUDA_ERROR_OUT_OF_MEMORY at warm-up with ~10 GB
+# free). RAG chunks are far shorter, so a 4096-token ceiling costs nothing and warms up in
+# a quarter of the activation memory. Override with EMBED_MAX_BATCH_TOKENS.
 exec text-embeddings-router \
   --model-id "${EMBED_MODEL_ID}" \
   --hostname 0.0.0.0 \
-  --port 8080
+  --port 8080 \
+  --max-batch-tokens "${EMBED_MAX_BATCH_TOKENS:-4096}"

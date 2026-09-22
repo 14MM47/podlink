@@ -28,6 +28,36 @@ if [[ -n "${VLLM_EXTRA_ARGS:-}" ]]; then
   read -r -a EXTRA_ARGS <<< "${VLLM_EXTRA_ARGS}"
 fi
 
+# Start order: the two TEI services take their VRAM first. vLLM sizes its KV cache from
+# what is free when it profiles; if the embedder is still allocating at that instant the
+# first EngineCore start OOMs (seen on the 122B: "Available KV cache memory: -0.34 GiB"),
+# and if vLLM wins the race the embedder cannot allocate at all and supervisor gives up.
+# So wait for both /health endpoints on localhost, bounded by VLLM_WAIT_FOR_TEI_S
+# (default 20 min, 0 = don't wait); after that start anyway and say so in the log.
+wait_s="${VLLM_WAIT_FOR_TEI_S:-1200}"
+if [[ "${wait_s}" != "0" ]]; then
+  auth=()
+  if [[ -n "${TEI_API_KEY:-}" ]]; then auth=(-H "Authorization: Bearer ${TEI_API_KEY}"); fi
+  started=$(date +%s)
+  while :; do
+    ok=0
+    for port in 8080 8081; do
+      if curl -fsS -m 5 "${auth[@]}" "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+        ok=$((ok + 1))
+      fi
+    done
+    if [[ "${ok}" -eq 2 ]]; then
+      echo "[start-vllm] embedder and reranker healthy after $(( $(date +%s) - started ))s; starting vLLM"
+      break
+    fi
+    if (( $(date +%s) - started >= wait_s )); then
+      echo "[start-vllm] WARNING: TEI services not both healthy after ${wait_s}s (healthy: ${ok}/2); starting vLLM anyway" >&2
+      break
+    fi
+    sleep 10
+  done
+fi
+
 exec vllm serve "${LLM_MODEL_ID}" \
   --served-model-name "${SERVED_NAME}" \
   "${QUANT_FLAG[@]}" \

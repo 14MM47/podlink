@@ -145,7 +145,8 @@ class PodSession:
             now = time.time()
             # Cost meter — live only while a pod exists (STARTING..STOPPING). Once
             # IDLE the pod is gone, so uptime/cost read as None (blank in the UI).
-            live = state in (State.STARTING, State.RUNNING, State.STOPPING)
+            live = (state in (State.STARTING, State.RUNNING, State.STOPPING)
+                    or (state == State.ERROR and self.pod_id is not None))
             uptime_s = int(now - self.billing_started_at) if (live and self.billing_started_at) else None
             session_cost = (round(self.cost_per_hr * uptime_s / 3600.0, 4)
                             if (self.cost_per_hr and uptime_s) else None)

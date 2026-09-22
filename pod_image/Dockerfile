@@ -42,7 +42,7 @@ COPY --from=tei /usr/local/bin/text-embeddings-router /usr/local/bin/text-embedd
 # TEI runtime deps the vLLM image may not ship (libssl for HTTPS weight pulls, CA
 # certs). Without them the router can fail to start or fail to reach the HF hub.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+      libssl3 ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 # supervisor runs the three long-lived services inside the one container.
 RUN pip install --no-cache-dir supervisor==4.2.5

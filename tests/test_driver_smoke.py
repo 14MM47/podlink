@@ -176,6 +176,123 @@ def test_all_ready_waits_for_stragglers_then_times_out():
           "pending" in raised_msg and "llm" in raised_msg)
 
 
+def test_all_ready_warns_and_keeps_waiting_past_the_soft_deadline():
+    # Soft deadline passes while the LLM is still loading: the feed gets a reminder,
+    # the wait continues, and it still succeeds once the service answers.
+    calls = {"n": 0}
+    def status_for(url):
+        if "/v1/models" in url:
+            calls["n"] += 1
+            return 200 if calls["n"] > 6 else 503
+        return 200
+    install_fake_client(status_for)
+    saved_warn, saved_hard = rd.READY_WARN_S, rd.READY_TIMEOUT_S
+    rd.READY_WARN_S, rd.READY_TIMEOUT_S = 0.05, 30
+    s = PodSession()
+    s.try_begin_start(None)
+    try:
+        ok = rd._wait_for_all_ready(s, "pod1")
+    finally:
+        rd.READY_WARN_S, rd.READY_TIMEOUT_S = saved_warn, saved_hard
+    msgs = [m for (_, cat, m) in s.events if cat == "system"]
+    check("_wait_for_all_ready keeps waiting past the soft deadline and succeeds", ok is True)
+    check("soft deadline posts a 'still pending' reminder that names the pod as billing",
+          any("still pending" in m and "billing" in m for m in msgs))
+
+
+def test_soft_deadline_names_a_stuck_tei_service_when_the_llm_is_up():
+    # The LLM answers but the embedder never listens: the reminder is followed by a hint
+    # that this is a failed start, not a slow load, and where to look.
+    install_fake_client(lambda url: 503 if "8080" in url else 200)
+    saved_warn, saved_hard = rd.READY_WARN_S, rd.READY_TIMEOUT_S
+    rd.READY_WARN_S, rd.READY_TIMEOUT_S = 0.05, 0.4
+    s = PodSession()
+    s.try_begin_start(None)
+    try:
+        try:
+            rd._wait_for_all_ready(s, "pod1")
+        except RuntimeError:
+            pass
+    finally:
+        rd.READY_WARN_S, rd.READY_TIMEOUT_S = saved_warn, saved_hard
+    msgs = [m for (_, cat, m) in s.events if cat == "system"]
+    check("stuck embedder while llm is up posts the failed-start hint",
+          any("embedder" in m and "failed start" in m and "container log" in m for m in msgs))
+    check("no hint when the LLM itself is the straggler",
+          rd.stuck_service_hint({"embedder", "reranker"}, ["llm"]) is None)
+
+
+def test_all_ready_raises_when_the_pod_itself_leaves_running():
+    install_fake_client(lambda url: 503)
+    saved_get = fake_runpod.get_pod
+    fake_runpod.get_pod = lambda pod_id: {"id": pod_id, "desiredStatus": "EXITED"}
+    s = PodSession()
+    s.try_begin_start(None)
+    msg = ""
+    try:
+        rd._wait_for_all_ready(s, "pod1")
+    except RuntimeError as e:
+        msg = str(e)
+    finally:
+        fake_runpod.get_pod = saved_get
+    check("_wait_for_all_ready raises promptly when RunPod says the pod left RUNNING",
+          "left RUNNING" in msg)
+
+
+def test_recover_if_healthy_flips_error_to_running():
+    saved_state = rp.pod_up.STATE_PATH
+    scratch = Path("/tmp/podlink_smoke_recover_state.json")
+    rp.pod_up.STATE_PATH = scratch
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        s.update(pod_id="podLost", state=State.ERROR, error="RuntimeError — gave up")
+        install_fake_client(lambda url: 503)
+        check("not healthy yet: stays ERROR",
+              rd.recover_if_healthy(s, "podLost") is False and s.state == State.ERROR)
+        install_fake_client(lambda url: 200)
+        check("all healthy: recovers to RUNNING",
+              rd.recover_if_healthy(s, "podLost") is True and s.state == State.RUNNING)
+        snap = s.snapshot()
+        check("recovery clears the error and sets the proxy url",
+              snap["error"] is None and snap["proxy_url"] and "podLost" in snap["proxy_url"])
+        check("recovery is logged to the feed",
+              any("recovered" in m for (_, c, m) in s.events if c == "system"))
+    finally:
+        rp.pod_up.STATE_PATH = saved_state
+        scratch.unlink(missing_ok=True)
+
+
+def test_adopt_running_on_startup_adopts_our_running_pod():
+    import os
+    saved_pods, saved_state = fake_runpod.get_pods, rp.pod_up.STATE_PATH
+    scratch = Path("/tmp/podlink_smoke_adopt_state.json")
+    rp.pod_up.STATE_PATH = scratch
+    install_fake_client(lambda url: 200)
+    try:
+        fake_runpod.get_pods = lambda: [{"id": "podLive", "name": rp.pod_up.POD_NAME,
+                                         "desiredStatus": "RUNNING", "runtime": {"x": 1}}]
+        s = PodSession()
+        rd.adopt_running_on_startup(s)
+        check("console start adopts the RUNNING pod by name",
+              s.state == State.RUNNING and s.pod_id == "podLive")
+        fake_runpod.get_pods = lambda: []
+        s2 = PodSession()
+        rd.adopt_running_on_startup(s2)
+        check("no live pod: stays IDLE and creates nothing", s2.state == State.IDLE)
+        os.environ["PODLINK_ADOPT_ON_START"] = "0"
+        fake_runpod.get_pods = lambda: [{"id": "podLive", "name": rp.pod_up.POD_NAME,
+                                         "desiredStatus": "RUNNING", "runtime": {"x": 1}}]
+        s3 = PodSession()
+        rd.adopt_running_on_startup(s3)
+        check("PODLINK_ADOPT_ON_START=0 disables adoption", s3.state == State.IDLE)
+    finally:
+        os.environ.pop("PODLINK_ADOPT_ON_START", None)
+        fake_runpod.get_pods = saved_pods
+        rp.pod_up.STATE_PATH = saved_state
+        scratch.unlink(missing_ok=True)
+
+
 def test_all_ready_cancels_promptly():
     install_fake_client(lambda url: 503)             # nothing healthy
     s = PodSession()
@@ -341,9 +458,30 @@ def test_start_opens_access_on_the_create_path():
         rec.restore()
 
 
-def test_failed_start_closes_the_access_path():
+def test_failed_start_before_an_instance_closes_the_access_path():
     # No stop worker follows a failed start, so start() owns the teardown —
     # otherwise a tunnel process outlives the launch that opened it.
+    rec = _AccessRecorder()
+    saved = (rp.pod_up.find_existing, rp.pod_up.ensure_template)
+    rp.pod_up.find_existing = lambda: None           # nothing to adopt -> prepare/create
+    def _boom():
+        raise RuntimeError("template lookup failed")
+    rp.pod_up.ensure_template = _boom                # fails before any instance exists
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        rd.start(s)
+        check("failed start with no instance closed the access path", rec.released == 1)
+        check("failed start lands in ERROR", s.snapshot()["state"] == "ERROR")
+    finally:
+        rp.pod_up.find_existing, rp.pod_up.ensure_template = saved
+        rec.restore()
+
+
+def test_failed_start_with_an_instance_keeps_the_access_path():
+    # The instance outlived the failed start and is still billing: the health watch
+    # keeps probing it to recover, so its access path (a tunnel, on some clouds)
+    # must stay open until stop() releases it.
     rec = _AccessRecorder()
     saved = (rp.pod_up.find_existing, rd.READY_TIMEOUT_S)
     rp.pod_up.find_existing = lambda: {"id": "doomed1", "desiredStatus": "RUNNING",
@@ -354,11 +492,47 @@ def test_failed_start_closes_the_access_path():
         s = PodSession()
         s.try_begin_start(None)
         rd.start(s)
-        check("failed start opened then closed the access path",
-              rec.opened == ["doomed1"] and rec.released == 1)
-        check("failed start lands in ERROR", s.snapshot()["state"] == "ERROR")
+        check("failed start with an instance opened and kept the access path",
+              rec.opened == ["doomed1"] and rec.released == 0)
+        snap = s.snapshot()
+        check("failed start lands in ERROR with the instance id kept",
+              snap["state"] == "ERROR" and s.pod_id == "doomed1")
+        check("the error says the instance may still be billing", "billing" in snap["error"])
     finally:
         rp.pod_up.find_existing, rd.READY_TIMEOUT_S = saved
+        rec.restore()
+
+
+def test_recover_if_healthy_reopens_the_access_path_before_probing():
+    # Probes of a tunnelled service read "down" until the path exists, so recovery
+    # must ensure it first — and a path that won't open is "not recovered yet".
+    rec = _AccessRecorder()
+    order = []
+    rec.provider.ensure_access = lambda instance_id: order.append(("ensure", instance_id))
+    install_fake_client(lambda url: (order.append(("probe", url)), 200)[1])
+    saved_state = rp.pod_up.STATE_PATH
+    scratch = Path("/tmp/podlink_smoke_recover_access.json")
+    rp.pod_up.STATE_PATH = scratch
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        s.update(pod_id="podT", state=State.ERROR, error="RuntimeError — gave up")
+        check("recovery succeeds once the path is up and all answer",
+              rd.recover_if_healthy(s, "podT") is True and s.state == State.RUNNING)
+        check("ensure_access ran before the first probe",
+              order and order[0] == ("ensure", "podT")
+              and any(k == "probe" for k, _ in order[1:]))
+        def _no_path(instance_id):
+            raise RuntimeError("tunnel refused")
+        rec.provider.ensure_access = _no_path
+        s2 = PodSession()
+        s2.try_begin_start(None)
+        s2.update(pod_id="podT", state=State.ERROR, error="x")
+        check("access path down: stays ERROR, no exception",
+              rd.recover_if_healthy(s2, "podT") is False and s2.state == State.ERROR)
+    finally:
+        rp.pod_up.STATE_PATH = saved_state
+        scratch.unlink(missing_ok=True)
         rec.restore()
 
 
@@ -638,6 +812,11 @@ if __name__ == "__main__":
     test_resolve_gpu_id_raises_when_absent()
     test_all_ready_true_when_all_200()
     test_all_ready_waits_for_stragglers_then_times_out()
+    test_all_ready_warns_and_keeps_waiting_past_the_soft_deadline()
+    test_soft_deadline_names_a_stuck_tei_service_when_the_llm_is_up()
+    test_all_ready_raises_when_the_pod_itself_leaves_running()
+    test_recover_if_healthy_flips_error_to_running()
+    test_adopt_running_on_startup_adopts_our_running_pod()
     test_all_ready_cancels_promptly()
     test_create_aborts_on_cancel_before_create()
     test_provider_selection()
@@ -648,7 +827,9 @@ if __name__ == "__main__":
     test_verify_terminated_keeps_polling_on_unknown_status()
     test_start_opens_access_on_the_adopt_path()
     test_start_opens_access_on_the_create_path()
-    test_failed_start_closes_the_access_path()
+    test_failed_start_before_an_instance_closes_the_access_path()
+    test_failed_start_with_an_instance_keeps_the_access_path()
+    test_recover_if_healthy_reopens_the_access_path_before_probing()
     test_stop_closes_the_access_path()
     test_stop_terminates_and_lands_idle()
     test_read_secret_converts_systemexit()
