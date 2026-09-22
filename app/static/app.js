@@ -104,6 +104,7 @@ function fmtClock(epochSec) {
 function renderTiles(services) {
   services = services || {};
   const names = Object.keys(services);
+  tilesEl.classList.toggle("compact", names.length > 5);   // tighter tiles for long service lists
   const have = new Map([...tilesEl.querySelectorAll(".tile")].map((el) => [el.dataset.svc, el]));
   for (const el of have.values()) {                 // drop tiles for services no longer configured
     if (!names.includes(el.dataset.svc)) el.remove();
@@ -208,7 +209,8 @@ function render(s) {
   if (metaKey !== mMeta) {
     if (s.pod_id) {
       const pid = escapeHtml(s.pod_id);
-      let m = `<div><span class="k">pod</span> <span class="pid">${pid}</span></div>`;
+      let m = `<div class="pidrow"><span class="k">pod</span> <span class="pid">${pid}</span>` +
+              `<button class="mini" data-copy="${pid}" title="Copy pod id">copy</button></div>`;
       if (s.proxy_url) {
         const base = (port) => `https://${pid}-${port}.proxy.runpod.net`;
         // One line per configured service; OpenAI-style services (health under /v1)
@@ -365,6 +367,14 @@ copyenvBtn.addEventListener("click", async () => {  // copy the shown client con
   try { await navigator.clipboard.writeText(env); } catch { /* clipboard blocked; text is shown to select */ }
   copiedEl.style.display = "inline";
   setTimeout(() => { copiedEl.style.display = "none"; }, 2000);
+});
+
+metaEl.addEventListener("click", async (e) => {    // copy buttons inside Pod & endpoints (pod id)
+  const b = e.target.closest("button[data-copy]");
+  if (!b) return;
+  try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "copied ✓"; }
+  catch { b.textContent = "select it"; }          // clipboard blocked; the id is shown as text
+  setTimeout(() => { b.textContent = "copy"; }, 1500);
 });
 
 // Live updates via SSE, with a polling fallback if the stream drops.

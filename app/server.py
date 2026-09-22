@@ -168,12 +168,13 @@ def _snapshot() -> dict:
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")   # serve the two-button page
+    # no-cache: the browser revalidates, so a console update shows on a plain reload
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/app.js")
 def app_js() -> FileResponse:
-    return FileResponse(STATIC_DIR / "app.js")       # serve the frontend script
+    return FileResponse(STATIC_DIR / "app.js", headers={"Cache-Control": "no-cache"})  # frontend script
 
 
 @app.get("/config")

@@ -96,6 +96,18 @@
       gap: 14px; padding: 14px; position: relative; z-index: 1;
     }
     .zone { min-height: 0; display: flex; flex-direction: column; gap: 12px; }
+    /* Side columns: cards never shrink below their content (overflow:hidden cards would
+       otherwise be crushed to a sliver — the Status card on short windows). One .elastic card
+       per column absorbs the leftover height and scrolls inside; if even the fixed cards don't
+       fit, the column itself scrolls. */
+    .zone.left, .zone.right {
+      overflow-y: auto; overflow-x: hidden;
+      scrollbar-width: thin; scrollbar-color: rgba(53,214,207,.3) transparent;
+    }
+    .zone.left::-webkit-scrollbar, .zone.right::-webkit-scrollbar { width: 8px; }
+    .zone.left::-webkit-scrollbar-thumb, .zone.right::-webkit-scrollbar-thumb { background: rgba(53,214,207,.22); border-radius: 8px; }
+    .zone.left > *, .zone.right > * { flex-shrink: 0; }
+    .zone > .elastic { flex: 1 1 auto; min-height: 120px; display: flex; flex-direction: column; }
 
     /* ===== generic frosted glass card with HUD framing ===== */
     .card {
@@ -264,7 +276,13 @@
     .autoterm .mini:hover:not(:disabled) { background: rgba(230,167,64,.18); color: #fff; box-shadow: var(--lift), 0 0 14px rgba(230,167,64,.4); }
 
     /* health tiles */
-    .tiles { display: flex; flex-direction: column; gap: 8px; padding: .65rem .7rem; position: relative; z-index: 1; }
+    .tiles { display: flex; flex-direction: column; gap: 8px; padding: .65rem .7rem; position: relative; z-index: 1;
+      flex: 1 1 auto; min-height: 0; overflow-y: auto;
+      scrollbar-width: thin; scrollbar-color: rgba(53,214,207,.3) transparent; }
+    .tiles::-webkit-scrollbar { width: 8px; }
+    .tiles::-webkit-scrollbar-thumb { background: rgba(53,214,207,.22); border-radius: 8px; }
+    .tiles.compact { gap: 5px; }
+    .tiles.compact .tile { padding: .3rem .6rem .3rem .7rem; }
     .tile {
       display: flex; align-items: center; gap: .55rem; position: relative;
       background: rgba(9,15,20,.5);
@@ -355,6 +373,8 @@
     .meta { padding: .6rem .8rem; font-size: .72rem; color: var(--ink); line-height: 1.7; word-break: break-all; position: relative; z-index: 1; }
     .meta .k { color: var(--cyan-dim); text-transform: uppercase; letter-spacing: .1em; font-size: .62rem; }
     .meta .pid { color: var(--cyan); text-shadow: 0 0 8px rgba(53,214,207,.35); }
+    .meta .pidrow { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+    .meta .pidrow .mini { padding: .18rem .5rem; font-size: .6rem; }
     .meta .urls { margin-top: .45rem; display: flex; flex-direction: column; gap: .3rem; }
     .meta .urls span b { color: var(--amber-t); font-weight: 400; letter-spacing: .07em; }
     .meta .urls span { color: var(--ink-mute); }
@@ -481,7 +501,7 @@
         </div>
       </div>
 
-      <div class="card">
+      <div class="card elastic">
         <span class="sheen"></span>
         <div class="card-h">Services <span class="scan"><i></i> SVC</span></div>
         <!-- One tile per service in PODLINK_SERVICES; rendered from the status
@@ -533,7 +553,7 @@
         <div id="meta" class="meta"></div>
       </div>
 
-      <div class="card envwrap">
+      <div class="card envwrap elastic">
         <span class="sheen"></span>
         <div class="card-h">client .env <span class="scan"><i></i> ENV</span></div>
         <pre id="envview" class="envview"></pre>
