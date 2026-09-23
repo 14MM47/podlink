@@ -93,9 +93,10 @@ class Store:
 
 
 def _pod_env_list(**overrides) -> list[str]:
-    """The env a create would send now, as the API returns it (["K=V", ...]),
-    with made-up secrets — which matches_stack must ignore."""
-    env = {**rp.pod_up._pod_env("real-bearer", "real-hf"), **overrides}
+    """The env a create would send now, as the API returns it (["K=V", ...])."""
+    # The live secrets the fake reader returns — a stopped pod created now
+    # carries exactly these (matches_stack compares their digests).
+    env = {**rp.pod_up._pod_env(T.fake_secrets.bearer_token(), T.fake_secrets.hf_token()), **overrides}
     return [f"{k}={v}" for k, v in env.items()]
 
 
@@ -273,6 +274,21 @@ def test_stack_mismatch_recreates_without_resuming():
         check("mismatch: feed names the reason", "stack changed" in _events(s))
         check("mismatch: feed names the differing setting, not its value",
               "(image)" in _events(s) and "old:1" not in _events(s))
+
+    finally:
+        teardown()
+
+
+def test_rotated_bearer_recreates_and_never_logs_the_secret():
+    store = setup()
+    try:
+        store.add("pod1", "EXITED", env=_runpod_stored_env(VLLM_API_KEY="leaked-key", TEI_API_KEY="leaked-key"))
+        s = _start()
+        check("rotation: never resumed", "resume" not in store.verbs())
+        check("rotation: terminate + create", store.verbs() == ["terminate", "create"])
+        check("rotation: feed names 'bearer'", "(bearer)" in _events(s))
+        check("rotation: no secret text in the feed",
+              "leaked-key" not in _events(s) and T.fake_secrets.bearer_token() not in _events(s))
     finally:
         teardown()
 
@@ -344,8 +360,32 @@ def test_matches_stack_rules():
         p = rp.PROVIDER()
         base = {"imageName": rp.pod_up.IMAGE, "env": _pod_env_list()}
         check("fingerprint: identical config matches", p.matches_stack(base))
-        check("fingerprint: secrets ignored",
-              p.matches_stack({**base, "env": _pod_env_list(VLLM_API_KEY="other", HF_TOKEN="x")}))
+        # A rotated secret is a change (a resumed pod would keep the old key and
+        # 401 every request) — reported by LABEL only, never value or digest.
+        rotated = p.stack_diff({**base, "env": _pod_env_list(VLLM_API_KEY="old-leaked", TEI_API_KEY="old-leaked")})
+        check("fingerprint: rotated bearer -> ['bearer']", rotated == ["bearer"])
+        check("fingerprint: rotated HF token -> ['hf_token']",
+              p.stack_diff({**base, "env": _pod_env_list(HF_TOKEN="old", HUGGING_FACE_HUB_TOKEN="old")}) == ["hf_token"])
+        check("fingerprint: bearer on only one key still differs",
+              p.stack_diff({**base, "env": _pod_env_list(TEI_API_KEY="old-leaked")}) == ["bearer"])
+        # Review: a secret key MISSING from the pod (not just different) is a change…
+        no_bearer = [e for e in _pod_env_list() if not e.startswith(("VLLM_API_KEY=", "TEI_API_KEY="))]
+        check("fingerprint: bearer key missing on the pod -> ['bearer']",
+              p.stack_diff({**base, "env": no_bearer}) == ["bearer"])
+        # …while a local secret that can't be read is skipped, not reported.
+        from app.providers.runpod import provider as rpp
+        saved_checks = rpp._SECRET_CHECKS
+
+        def unreadable():
+            raise SystemExit("Missing secret: pod_bearer_token")   # what _secrets does
+        rpp._SECRET_CHECKS = (("bearer", unreadable, ("VLLM_API_KEY", "TEI_API_KEY")),) + saved_checks[1:]
+        try:
+            check("fingerprint: unreadable local bearer is skipped (no label, no crash)",
+                  p.stack_diff({**base, "env": _pod_env_list(VLLM_API_KEY="x", TEI_API_KEY="x")}) == [])
+        finally:
+            rpp._SECRET_CHECKS = saved_checks
+        check("fingerprint: diff never carries secret text",
+              not any("old-leaked" in d or T.fake_secrets.bearer_token() in d for d in rotated))
         check("fingerprint: image drift -> mismatch", not p.matches_stack({**base, "imageName": "other:1"}))
         check("fingerprint: model drift -> mismatch",
               not p.matches_stack({**base, "env": _pod_env_list(RERANK_MODEL_ID="other/model")}))
@@ -474,7 +514,8 @@ def test_config_key_set_covers_everything_pod_env_can_send():
     from app.providers.runpod import provider as rpp
     extra = {"PODLINK_VLLM_EXTRA_ARGS": "x", "PODLINK_PYTORCH_CUDA_ALLOC_CONF": "x",
              "PODLINK_RERANK_GPU_MEMORY_UTILIZATION": "0.1", "PODLINK_RERANK_VLLM_EXTRA_ARGS": "x",
-             "PODLINK_RERANK_MAX_MODEL_LEN": "1", "PODLINK_RERANK_WAIT_FOR_EMBEDDER_S": "1"}
+             "PODLINK_RERANK_MAX_MODEL_LEN": "1", "PODLINK_RERANK_WAIT_FOR_EMBEDDER_S": "1",
+             "PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0"}
     saved_backend = rp.pod_up.RERANK_BACKEND
     os.environ.update(extra)
     rp.pod_up.RERANK_BACKEND = "vllm"
@@ -507,4 +548,5 @@ if __name__ == "__main__":
     test_terminate_from_idle_refuses_a_running_pod()
     test_stop_flags_reset_on_start()
     test_config_key_set_covers_everything_pod_env_can_send()
+    test_rotated_bearer_recreates_and_never_logs_the_secret()
     print("all lifecycle tests passed.")

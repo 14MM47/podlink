@@ -22,6 +22,13 @@ if [[ "${BACKEND}" == "tei" ]]; then
   # here rather than passing --api-key on argv (visible in `ps aux`). podlink
   # injects TEI_API_KEY; unset => fail closed (service won't start without a key).
   export API_KEY="${TEI_API_KEY}"
+  # Keep TEI's startup INFO line out of the logs: it prints its full argument list,
+  # INCLUDING api_key in plain text (seen in RunPod container logs 2026-09-23; only
+  # the HF token is masked). /health gates readiness, not log lines, so warn-level
+  # logging loses nothing podlink uses. TEI reads LOG_LEVEL (NOT RUST_LOG — verified
+  # against the TEI 1.9 router: RUST_LOG=warn still printed the key, LOG_LEVEL=warn
+  # did not). An explicit LOG_LEVEL still wins.
+  export LOG_LEVEL="${LOG_LEVEL:-warn}"
 
   exec text-embeddings-router \
     --model-id "${RERANK_MODEL_ID}" \
@@ -90,6 +97,24 @@ EXTRA_ARGS=()
 if [[ -n "${RERANK_VLLM_EXTRA_ARGS:-}" ]]; then
   read -r -a EXTRA_ARGS <<< "${RERANK_VLLM_EXTRA_ARGS}"
 fi
+
+# Never let a key reach vLLM's argv: vLLM logs every non-default CLI arg at INFO,
+# unredacted (v0.25.1 log_non_default_args), and argv shows in `ps`. The key comes
+# from VLLM_API_KEY in the env only.
+# (vLLM's parser accepts --api_key too, and --flag=value forms.)
+for arg in "${EXTRA_ARGS[@]}"; do
+  case "${arg}" in
+    --api-key|--api-key=*|--api_key|--api_key=*) api_key_on_argv=1 ;;
+  esac
+done
+if [[ -n "${api_key_on_argv:-}" ]]; then
+  echo "[start-reranker] ERROR: --api-key in the extra args would be logged in plain text; set VLLM_API_KEY instead" >&2
+  exit 1
+fi
+
+# Compile caches on the persistent volume (see vllm-cache-env.sh).
+source "$(dirname "$0")/vllm-cache-env.sh"
+podlink_vllm_cache_env start-reranker 18081
 
 # Small memory share: a 4B reranker is ~8 GB bf16 weights + a little KV. 4096
 # tokens covers query + one ~512-token chunk + the template with room to spare.

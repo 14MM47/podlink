@@ -57,7 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nginx \
 RUN pip install --no-cache-dir supervisor==4.2.5
 
 # Service launch wrappers + supervisor config.
-COPY start-vllm.sh start-embedder.sh start-reranker.sh authproxy.py /opt/podlink/
+COPY start-vllm.sh start-embedder.sh start-reranker.sh authproxy.py vllm-cache-env.sh /opt/podlink/
 COPY supervisord.conf /etc/podlink/supervisord.conf
 # Chat template for the vLLM reranker backend's Qwen3-Reranker preset (the vLLM
 # image ships no examples/ tree). See templates/PROVENANCE.md.

@@ -926,7 +926,8 @@ def test_vllm_backend_env_passthroughs_and_client_format():
             "PODLINK_RERANK_GPU_MEMORY_UTILIZATION": "0.12",
             "PODLINK_RERANK_VLLM_EXTRA_ARGS": "--foo=1",
             "PODLINK_RERANK_MAX_MODEL_LEN": "8192",
-            "PODLINK_RERANK_WAIT_FOR_EMBEDDER_S": "600"}
+            "PODLINK_RERANK_WAIT_FOR_EMBEDDER_S": "600",
+            "PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0"}
     saved_backend = rp.pod_up.RERANK_BACKEND
     _os.environ.update(keys)
     rp.pod_up.RERANK_BACKEND = "vllm"                      # import-time constant in pod_up
@@ -939,6 +940,7 @@ def test_vllm_backend_env_passthroughs_and_client_format():
         check("vllm: reranker extra args sent", env.get("RERANK_VLLM_EXTRA_ARGS") == "--foo=1")
         check("vllm: reranker max len sent", env.get("RERANK_MAX_MODEL_LEN") == "8192")
         check("vllm: reranker embedder wait sent", env.get("RERANK_WAIT_FOR_EMBEDDER_S") == "600")
+        check("cuda-graph profiling switch sent", env.get("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS") == "0")
         check("vllm: container env keys == pod_up's", set(env) == set(rp.pod_up._pod_env("B", "H")))
         urls = {"llm": "L", "embedder": "E", "reranker": "R"}
         check("vllm: client block says cohere",

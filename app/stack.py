@@ -51,6 +51,11 @@ def from_env() -> dict:
         "rerank_vllm_extra_args": os.environ.get("PODLINK_RERANK_VLLM_EXTRA_ARGS", "").strip(),
         "rerank_max_model_len": os.environ.get("PODLINK_RERANK_MAX_MODEL_LEN", "").strip(),
         "rerank_wait_for_embedder_s": os.environ.get("PODLINK_RERANK_WAIT_FOR_EMBEDDER_S", "").strip(),
+        # "0" skips vLLM's CUDA-graph memory profiling (~39 s on the 30B LLM); the
+        # graphs (~1 GB) then sit outside the gpu-memory-utilization budget. Off
+        # (unset) by default: only for profiles with GPU headroom to spare.
+        "vllm_memory_profiler_estimate_cudagraphs":
+            os.environ.get("PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "").strip(),
     }
 
 
@@ -90,6 +95,8 @@ def container_env(stack: dict, bearer: str, hf: str) -> dict[str, str]:
         env["RERANK_MAX_MODEL_LEN"] = stack["rerank_max_model_len"]
     if stack["rerank_wait_for_embedder_s"]:
         env["RERANK_WAIT_FOR_EMBEDDER_S"] = stack["rerank_wait_for_embedder_s"]
+    if stack["vllm_memory_profiler_estimate_cudagraphs"]:
+        env["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = stack["vllm_memory_profiler_estimate_cudagraphs"]
     return env
 
 

@@ -65,6 +65,9 @@ podlink's `create_pod` passes these as env — you don't set them here:
 | `RERANK_GPU_MEMORY_UTILIZATION`, `RERANK_MAX_MODEL_LEN` | vLLM reranker sizing (defaults 0.12 / 4096); `vllm` backend only. Lower the LLM's `GPU_MEMORY_UTILIZATION` to make room |
 | `RERANK_VLLM_EXTRA_ARGS` | extra `vllm serve` flags for rerankers without a built-in preset (space-split). `Qwen/Qwen3-Reranker-*` has a preset (hf-overrides + `templates/qwen3_reranker.jinja`) |
 | `RERANK_WAIT_FOR_EMBEDDER_S` | how long the vLLM reranker waits for the embedder's `/health` before profiling memory (default 1200, `0` = don't wait) |
+| `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` | vLLM's own switch, passed through from `PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`. `0` skips CUDA-graph memory profiling (~39 s on the 30B LLM) in **every** vLLM process in the container (the LLM and a vLLM reranker), so their graphs (~0.65 + ~0.3 GB) sit outside each `--gpu-memory-utilization` budget — only for stacks with GPU headroom. Unset by default |
+| `PODLINK_CACHE_BASE` | where the vLLM processes keep their compile caches (default `/workspace/cache`, the persistent volume): `<base>/<service>/{vllm,triton}-<vllm version>/`, one tree per service so they never share files. An explicit `VLLM_CACHE_ROOT` / `TRITON_CACHE_DIR` wins; unwritable base = container-disk defaults. A start that never reached `/health` leaves a marker, and the next start clears that service's cache (self-heal). Old-version trees are not pruned — after an image upgrade, `rm -rf /workspace/cache/*/*-<old version>` from the web terminal reclaims the space |
+| `LOG_LEVEL` | TEI log level, default `warn` in both TEI wrappers: TEI's INFO startup line prints its args **including `api_key`**. (TEI reads `LOG_LEVEL`, not `RUST_LOG`.) |
 
 **Auth proxy (nginx, `authproxy.py`):** vLLM's `--api-key` guards only `/v1`,
 `/v2` and `/inference` paths (v0.25.1 `serve/utils/server_utils.py`); its root

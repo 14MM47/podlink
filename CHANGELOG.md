@@ -5,7 +5,33 @@ All notable changes to podlink are documented here. The format loosely follows
 
 ## [Unreleased]
 
+### Security
+- **TEI no longer logs the pod bearer.** TEI's INFO startup line prints its full
+  argument list including `api_key` in plain text (only the HF token is masked) —
+  seen in RunPod container logs, readable by anyone on the account. Both TEI wrappers
+  now default `LOG_LEVEL=warn` (TEI ignores `RUST_LOG`; verified against the 1.9
+  router: the key line disappears, warnings and errors still print). Needs image
+  `2026-09c`. **Rotate `pod_bearer_token` if an older image ever ran.**
+- Both vLLM wrappers refuse to start if `--api-key` / `--api_key` appears in their
+  extra args: vLLM logs every non-default CLI arg unredacted. The key comes from
+  `VLLM_API_KEY` in the environment only.
+- **Stop/resume notices a rotated secret.** The stack fingerprint now also compares
+  SHA-256 digests (constant-time, in memory) of the local bearer / HF token with the
+  stopped pod's env; a difference is reported only as the label `bearer` / `hf_token`
+  and POD UP recreates instead of resuming a pod that would 401 every request.
+
 ### Added
+- **vLLM compile caches on the volume** (`pod_image/vllm-cache-env.sh`, sourced by
+  both vLLM wrappers): `VLLM_CACHE_ROOT` / `TRITON_CACHE_DIR` under
+  `/workspace/cache/<service>/{vllm,triton}-<vllm version>/` (one tree per service, so
+  the LLM and a vLLM reranker never race on a file over FUSE), so later boots load
+  compiled graphs instead of recompiling (~14 s reranker + ~17 s LLM measured).
+  Self-heal: a start that never reaches `/health` leaves a marker and the next start
+  clears that service's cache, so a half-written artifact costs at most one start.
+  Explicit values win; no writable volume = unchanged behaviour. Needs image `2026-09c`.
+- `PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` passthrough (unset by default):
+  `0` skips vLLM's CUDA-graph memory profiling (~39 s on the 30B LLM) at the cost of
+  ~1 GB of graph memory outside the utilisation budget. Per-profile opt-in only.
 - **Stop/resume lifecycle** (`PODLINK_LIFECYCLE=stop`, default `terminate`; RunPod
   only — preflight fails it on a provider without `supports_stop`): POD DOWN stops the
   pod (verified) and keeps it; POD UP resumes it, retrying only "not enough free GPUs

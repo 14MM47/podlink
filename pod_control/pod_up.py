@@ -278,6 +278,8 @@ def _pod_env(bearer: str, hf: str) -> dict:
         ("PODLINK_RERANK_VLLM_EXTRA_ARGS", "RERANK_VLLM_EXTRA_ARGS"),   # flags for un-preset rerankers
         ("PODLINK_RERANK_MAX_MODEL_LEN", "RERANK_MAX_MODEL_LEN"),       # vllm reranker context cap
         ("PODLINK_RERANK_WAIT_FOR_EMBEDDER_S", "RERANK_WAIT_FOR_EMBEDDER_S"),  # vllm reranker start wait
+        ("PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
+         "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"),                  # "0" skips CUDA-graph profiling
     ):
         val = os.environ.get(src, "").strip()
         if val:

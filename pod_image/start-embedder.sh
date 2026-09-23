@@ -11,6 +11,14 @@ set -euo pipefail
 # via the RunPod web terminal). podlink injects TEI_API_KEY; unset => fail closed.
 export API_KEY="${TEI_API_KEY}"
 
+# Keep TEI's startup INFO line out of the logs: it prints its full argument list,
+# INCLUDING api_key in plain text (seen in RunPod container logs 2026-09-23; only
+# the HF token is masked). /health gates readiness, not log lines, so warn-level
+# logging loses nothing podlink uses. TEI reads LOG_LEVEL (NOT RUST_LOG — verified
+# against the TEI 1.9 router: RUST_LOG=warn still printed the key, LOG_LEVEL=warn
+# did not). An explicit LOG_LEVEL still wins.
+export LOG_LEVEL="${LOG_LEVEL:-warn}"
+
 # TEI warms up with a full --max-batch-tokens batch (default 16384) on top of the model
 # weights. Beside a vLLM that already holds its GPU share that warm-up OOMs (seen 16 Sept
 # 2026: 8.4 GiB weights loaded, then CUDA_ERROR_OUT_OF_MEMORY at warm-up with ~10 GB

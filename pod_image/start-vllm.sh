@@ -30,6 +30,20 @@ if [[ -n "${VLLM_EXTRA_ARGS:-}" ]]; then
   read -r -a EXTRA_ARGS <<< "${VLLM_EXTRA_ARGS}"
 fi
 
+# Never let a key reach vLLM's argv: vLLM logs every non-default CLI arg at INFO,
+# unredacted (v0.25.1 log_non_default_args), and argv shows in `ps`. The key comes
+# from VLLM_API_KEY in the env only.
+# (vLLM's parser accepts --api_key too, and --flag=value forms.)
+for arg in "${EXTRA_ARGS[@]}"; do
+  case "${arg}" in
+    --api-key|--api-key=*|--api_key|--api_key=*) api_key_on_argv=1 ;;
+  esac
+done
+if [[ -n "${api_key_on_argv:-}" ]]; then
+  echo "[start-vllm] ERROR: --api-key in the extra args would be logged in plain text; set VLLM_API_KEY instead" >&2
+  exit 1
+fi
+
 # Start order: the two TEI services take their VRAM first. vLLM sizes its KV cache from
 # what is free when it profiles; if the embedder is still allocating at that instant the
 # first EngineCore start OOMs (seen on the 122B: "Available KV cache memory: -0.34 GiB"),
@@ -65,6 +79,10 @@ if [[ "${wait_s}" != "0" ]]; then
     sleep 10
   done
 fi
+
+# Compile caches on the persistent volume (see vllm-cache-env.sh).
+source "$(dirname "$0")/vllm-cache-env.sh"
+podlink_vllm_cache_env start-vllm 18000
 
 exec vllm serve "${LLM_MODEL_ID}" \
   --served-model-name "${SERVED_NAME}" \

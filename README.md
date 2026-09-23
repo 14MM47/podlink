@@ -76,6 +76,10 @@ skips the image pull. The catch is the host-pinning above. With `PODLINK_LIFECYC
 - A stopped pod keeps its creation-time image and env, so POD UP only resumes it when
   they still match the active profile (secrets excluded); otherwise it recreates.
 
+**Rotating `pod_bearer_token` or `hf_token`:** safe under either lifecycle — a stopped
+pod carrying the old value is detected (digest comparison, never logged) and POD UP
+recreates it instead of resuming a pod that would reject the new key.
+
 Measured 2026-09-23 on an RTX PRO 6000 in EU-RO-1: the stopped pod's GPU was re-rented
 within ~20 s and 8/8 resume attempts over 2.5 min failed. When capacity is that tight
 most POD UPs will exhaust the retries and fall back, adding up to

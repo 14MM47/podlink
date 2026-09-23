@@ -19,6 +19,8 @@ is_retryable_resume_error, gpu_count, matches_stack.
 """
 from __future__ import annotations
 
+import hashlib    # compare secrets by digest, never by value in any output
+import hmac       # constant-time digest comparison
 import importlib  # re-bake pod_up's import-time constants after a profile switch
 import json       # read pod_state.json as a last-resort id source
 import re         # validate a client-supplied pod id
@@ -54,7 +56,39 @@ _CONFIG_ENV = frozenset({
     "MAX_MODEL_LEN", "GPU_MEMORY_UTILIZATION", "RERANK_BACKEND",
     "VLLM_EXTRA_ARGS", "PYTORCH_CUDA_ALLOC_CONF", "RERANK_GPU_MEMORY_UTILIZATION",
     "RERANK_VLLM_EXTRA_ARGS", "RERANK_MAX_MODEL_LEN", "RERANK_WAIT_FOR_EMBEDDER_S",
+    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
 })
+
+
+# (label, local secret reader, pod env keys that must carry that secret).
+_SECRET_CHECKS = (
+    ("bearer", _secrets.bearer_token, ("VLLM_API_KEY", "TEI_API_KEY")),
+    ("hf_token", _secrets.hf_token, ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")),
+)
+
+
+def _secret_diff(have: dict[str, str]) -> list[str]:
+    """Labels ("bearer", "hf_token") whose value in the stopped pod differs from
+    the local secret — e.g. after rotating pod_bearer_token, a resumed pod would
+    keep the old key and every client request would 401.
+
+    Compares SHA-256 digests with hmac.compare_digest, in memory only: no secret,
+    digest or prefix is ever returned or logged — callers see just the label. A
+    secret that can't be read locally is skipped (the create path fails loudly on
+    it anyway); a key missing from the pod counts as different.
+    """
+    out = []
+    for label, reader, keys in _SECRET_CHECKS:
+        try:
+            want = hashlib.sha256(read_secret(reader).encode()).digest()
+        except Exception:  # noqa: BLE001 — any unreadable secret: skip, never fail the check
+            continue
+        for key in keys:
+            value = have.get(key)
+            if value is None or not hmac.compare_digest(want, hashlib.sha256(value.encode()).digest()):
+                out.append(label)
+                break
+    return out
 
 
 def _env_dict(env) -> dict[str, str]:
@@ -199,8 +233,9 @@ class RunPodProvider:
         return bool(instance) and not self.stack_diff(instance)
 
     def stack_diff(self, instance: dict) -> list[str]:
-        """Setting names that differ: the image, plus podlink's own config keys
-        (_CONFIG_ENV) on either side. Keys RunPod adds (PUBLIC_KEY, …) are
+        """Setting names that differ: the image, podlink's own config keys
+        (_CONFIG_ENV) on either side, and the labels "bearer" / "hf_token" when a
+        secret changed (digest-compared, see _secret_diff). Keys RunPod adds (PUBLIC_KEY, …) are
         ignored, and an empty value equals a missing key, because RunPod drops
         empty env values when it stores the pod.
 
@@ -214,6 +249,10 @@ class RunPodProvider:
         want = {k: str(v) for k, v in pod_up._pod_env("", "").items() if k in _CONFIG_ENV}
         have = {k: v for k, v in _env_dict(instance.get("env")).items() if k in _CONFIG_ENV}
         diff += sorted(k for k in set(want) | set(have) if (want.get(k) or "") != (have.get(k) or ""))
+        # Only the secret keys reach _secret_diff — the rest of the pod env never
+        # travels with the plaintext values (smallest possible exposure).
+        secret_keys = {k for _, _, keys in _SECRET_CHECKS for k in keys}
+        diff += _secret_diff({k: v for k, v in _env_dict(instance.get("env")).items() if k in secret_keys})
         return diff
 
     def prepare_create(self, session) -> dict | None:
