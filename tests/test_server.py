@@ -187,6 +187,15 @@ def test_auto_deadline_wording_follows_lifecycle():
         _reset()
 
 
+def test_ui_files_are_never_cached_stale():
+    # After an update the browser must re-check the page and script, or an old
+    # UI drives the new server (seen live: a missing Terminate-instead button).
+    for path in ("/", "/app.js"):
+        r = client.get(path)
+        check(f"{path} -> 200 with Cache-Control: no-cache",
+              r.status_code == 200 and r.headers.get("cache-control") == "no-cache")
+
+
 def test_keepalive_clears_deadline():
     _reset()
     S.state = State.RUNNING
@@ -372,6 +381,7 @@ if __name__ == "__main__":
     test_pod_up_validation()
     test_down_guard()
     test_down_under_stop_lifecycle()
+    test_ui_files_are_never_cached_stale()
     test_auto_deadline_wording_follows_lifecycle()
     test_keepalive_clears_deadline()
     test_env_and_test_guards()

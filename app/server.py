@@ -154,14 +154,22 @@ def _snapshot() -> dict:
     return snap
 
 
+# The UI files must never be served from a stale browser cache: after a code
+# update (branch switch + console restart) an old page would drive the new
+# server and hide new controls. no-cache = the browser must re-check every load.
+# (FileResponse doesn't answer If-None-Match with 304, so each load refetches —
+# two small files over localhost, which costs nothing noticeable.)
+_NO_CACHE = {"Cache-Control": "no-cache"}
+
+
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")   # serve the two-button page
+    return FileResponse(STATIC_DIR / "index.html", headers=_NO_CACHE)   # serve the two-button page
 
 
 @app.get("/app.js")
 def app_js() -> FileResponse:
-    return FileResponse(STATIC_DIR / "app.js")       # serve the frontend script
+    return FileResponse(STATIC_DIR / "app.js", headers=_NO_CACHE)       # serve the frontend script
 
 
 @app.get("/config")
