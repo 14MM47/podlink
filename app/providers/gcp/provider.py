@@ -49,6 +49,12 @@ class GcpProvider:
 
     name = "gcp"
     create_error_types = (GcpApiError,)
+    #: The driver's stop lifecycle (PODLINK_LIFECYCLE=stop) is not wired for GCP:
+    #: this provider has its own PODLINK_GCP_DOWN_ACTION=stop (inside terminate(),
+    #: with create_once() restarting a stopped same-name VM). Preflight fails
+    #: PODLINK_LIFECYCLE=stop here and points at that setting instead.
+    supports_stop = False
+    resume_error_types = (GcpApiError,)
 
     def __init__(self, api: GcpApi | None = None, tunnel_factory=None) -> None:
         self.cfg: GcpConfig = from_env()
@@ -289,6 +295,26 @@ class GcpProvider:
         return (f"no capacity for {self.cfg.machine_type} in {', '.join(self.cfg.zones)} after {retries} "
                 f"attempts (~{retries * delay // 60} min). Check the quota page, try flex-start, or "
                 f"try again later — press POD UP to keep trying.")
+
+    # --- driver stop lifecycle: not supported (see supports_stop) -------------
+
+    def stop(self, instance_id: str) -> None:
+        raise NotImplementedError("use PODLINK_GCP_DOWN_ACTION=stop on GCP")
+
+    def is_stopped(self, instance: dict) -> bool:
+        return False                        # never offers a driver-level resume
+
+    def is_retryable_resume_error(self, exc: Exception) -> bool:
+        return False
+
+    def gpu_count(self, instance: dict) -> int | None:
+        return None
+
+    def matches_stack(self, instance: dict) -> bool:
+        return False
+
+    def stack_diff(self, instance: dict) -> list[str]:
+        return []
 
     def terminate(self, instance_id: str) -> None:
         zone, name = self._split(instance_id)

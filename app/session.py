@@ -62,6 +62,13 @@ class PodSession:
         self.events: list = []
         # Set by a Pod Down request; the start worker polls this and bails out.
         self.cancel = threading.Event()          # cross-thread "stop now" signal
+        # Stop lifecycle: True when this Pod Down must TERMINATE even though the
+        # configured lifecycle is stop ("Terminate instead"). Set atomically by
+        # try_begin_stop, read by the stop worker.
+        self.force_terminate: bool = False
+        # True when that Pod Down began from IDLE (Terminate instead on a pod left
+        # stopped): the worker may then only remove a STOPPED pod, never a running one.
+        self.stop_from_idle: bool = False
 
     # --- transition gates (atomic check-and-set) --------------------------
 
@@ -88,14 +95,24 @@ class PodSession:
             self.test_result = None                          # clear any prior stack-test result
             self.test_running = False
             self.cancel.clear()                             # ensure a fresh (un-cancelled) run
+            self.force_terminate = False                     # stop flags belong to one Down only
+            self.stop_from_idle = False
             return True                                     # caller may launch the worker
 
-    def try_begin_stop(self) -> bool:
-        """Move STARTING/RUNNING/ERROR -> STOPPING and raise the cancel flag."""
+    def try_begin_stop(self, terminate: bool = False) -> bool:
+        """Move STARTING/RUNNING/ERROR -> STOPPING and raise the cancel flag.
+
+        terminate=True ("Terminate instead") is also allowed from IDLE: with the
+        stop lifecycle a stopped pod sits on its host while the console is IDLE,
+        and this is how the user removes it for good.
+        """
         with self._lock:                                              # atomic transition
-            if self.state not in (State.STARTING, State.RUNNING, State.ERROR):
+            allowed = (State.STARTING, State.RUNNING, State.ERROR) + ((State.IDLE,) if terminate else ())
+            if self.state not in allowed:
                 return False                                          # nothing to stop
+            self.stop_from_idle = self.state == State.IDLE            # read by the stop worker
             self.state = State.STOPPING                               # both buttons grey now
+            self.force_terminate = terminate                          # read by the stop worker
             self.phase = "stopping — resolving pod"                  # progress text
             # Tell the start worker (if any) to stop polling and exit.
             self.cancel.set()                                        # raise the cancel signal

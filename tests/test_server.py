@@ -130,6 +130,63 @@ def test_down_guard():
     rp.pod_up.NETWORK_VOLUME_ID = ""
 
 
+def test_down_under_stop_lifecycle():
+    # Stop lifecycle: a plain POD DOWN stops (non-destructive), so the no-volume
+    # guard does not apply; "Terminate instead" is destructive and still guarded,
+    # and is accepted from IDLE to remove a pod left stopped.
+    launched = []
+    saved_launch = server._launch
+    server._launch = lambda target: launched.append(target.__name__)   # no background worker
+    os.environ["PODLINK_LIFECYCLE"] = "stop"
+    rp.pod_up.NETWORK_VOLUME_ID = ""            # no volume
+    try:
+        _reset()
+        snap = client.get("/status").json()
+        check("snapshot reports lifecycle=stop", snap["lifecycle"] == "stop")
+        check("terminate_enabled from IDLE under stop", snap["terminate_enabled"] is True)
+        S.state = State.RUNNING
+        S.pod_id = "podS"
+        r = client.post("/pod/down", headers=H, json={})
+        check("stop, no volume, no confirm -> 200 (stop is non-destructive)", r.status_code == 200)
+        check("plain down does not force terminate", S.force_terminate is False and launched == ["stop"])
+        _reset()
+        check("terminate-instead, no volume, no confirm -> 428",
+              client.post("/pod/down", headers=H, json={"terminate": True}).status_code == 428)
+        r = client.post("/pod/down", headers=H, json={"terminate": True, "confirm": True})
+        check("terminate-instead from IDLE -> 200", r.status_code == 200)
+        check("terminate-instead sets force_terminate", S.force_terminate is True)
+        _reset()
+        os.environ["PODLINK_LIFECYCLE"] = "terminate"
+        snap = client.get("/status").json()
+        check("terminate lifecycle: terminate_enabled False", snap["lifecycle"] == "terminate"
+              and snap["terminate_enabled"] is False)
+    finally:
+        server._launch = saved_launch
+        os.environ.pop("PODLINK_LIFECYCLE", None)
+        _reset()
+
+
+def test_auto_deadline_wording_follows_lifecycle():
+    # Under stop the watchdog stops the pod (GPU billing ends, fast resume kept);
+    # the feed must say so rather than claim a terminate.
+    launched = []
+    saved_launch = server._launch
+    server._launch = lambda target: launched.append(target.__name__)
+    os.environ["PODLINK_LIFECYCLE"] = "stop"
+    try:
+        _reset()
+        S.state = State.RUNNING
+        S.pod_id = "podA"
+        S.update(auto_terminate_at=__import__("time").time() - 1)
+        check("stop lifecycle: watchdog fired", server._auto_terminate_tick() is True and launched == ["stop"])
+        check("stop lifecycle: feed says auto-stop",
+              any("idle auto-stop" in e[2] for e in S.events))
+    finally:
+        server._launch = saved_launch
+        os.environ.pop("PODLINK_LIFECYCLE", None)
+        _reset()
+
+
 def test_keepalive_clears_deadline():
     _reset()
     S.state = State.RUNNING
@@ -314,6 +371,8 @@ if __name__ == "__main__":
     test_token_gate()
     test_pod_up_validation()
     test_down_guard()
+    test_down_under_stop_lifecycle()
+    test_auto_deadline_wording_follows_lifecycle()
     test_keepalive_clears_deadline()
     test_env_and_test_guards()
     test_profile_parsing_and_switching()

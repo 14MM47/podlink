@@ -61,6 +61,34 @@ def _auto_terminate_minutes() -> int:
         return 0
 
 
+def lifecycle(provider=None) -> str:
+    """The effective POD DOWN behaviour: "terminate" (default) or "stop".
+
+    PODLINK_LIFECYCLE=stop is honoured only when the provider supports it; an
+    unknown value, or stop on a provider without it, means terminate (preflight
+    reports both). Read live so a profile switch takes effect without a restart.
+    """
+    wanted = os.environ.get("PODLINK_LIFECYCLE", "").strip().lower() or "terminate"
+    provider = provider or active_provider()
+    return "stop" if (wanted == "stop" and getattr(provider, "supports_stop", False)) else "terminate"
+
+
+def _resume_retries() -> int:
+    """Resume attempts on a stopped pod's host before falling back (default 40)."""
+    try:
+        return max(1, int(os.environ.get("PODLINK_RESUME_RETRIES", "40")))
+    except ValueError:
+        return 40
+
+
+def _resume_retry_delay() -> int:
+    """Seconds between resume attempts (default 15, floor 5)."""
+    try:
+        return max(5, int(os.environ.get("PODLINK_RESUME_RETRY_DELAY", "15")))
+    except ValueError:
+        return 15
+
+
 def _arm_billing(session: PodSession) -> None:
     """Start the cost clock and (if configured) the auto-terminate deadline.
 
@@ -165,18 +193,33 @@ def start(session: PodSession) -> None:
             session.commit_running()                      # -> RUNNING (unless a stop won)
             return
 
-        # ---- Auto: adopt a RUNNING podlink instance, else create a fresh one ----
-        # The lifecycle is terminate/recreate (see stop()), so we never resume. A
-        # non-RUNNING instance with podlink's name here is a leftover — crashed, or
-        # still being reaped after a terminate. Resuming it would error (a
-        # terminating pod can't resume), and a quick DOWN->UP would then fail
-        # instead of just making a new one. So we adopt ONLY a running instance
-        # and otherwise create fresh; the cloud reaps the dead one.
+        # ---- Auto: adopt a RUNNING podlink instance, resume a STOPPED one (stop
+        # lifecycle only), else create a fresh one ----
+        # Under the default terminate lifecycle we never resume: a non-RUNNING
+        # instance with podlink's name is a leftover (crashed, or being reaped
+        # after a terminate) and resuming it would error, so we create fresh and
+        # the cloud reaps the dead one. Under the stop lifecycle a stopped
+        # instance is the one POD DOWN left on its host on purpose.
         existing = provider.find_existing()               # is one already named podlink?
+        resumed = False
         if existing is not None and provider.is_running(existing):
             pod_id = provider.instance_id(existing)       # adopt the live instance
             # Capture the id before anything can block — closes the billing race.
             session.update(pod_id=pod_id, phase="adopting running pod")
+        elif (existing is not None and lifecycle(provider) == "stop"
+              and provider.is_stopped(existing)):
+            pod_id = provider.instance_id(existing)       # capture before anything blocks
+            session.update(pod_id=pod_id, phase="stopped pod found")
+            outcome = _resume_or_fallback(session, provider, existing)
+            if outcome is None:                           # cancel arrived — stop worker owns state
+                return
+            resumed = outcome == "resumed"
+            if not resumed:                               # stopped pod terminated; create fresh
+                instance = _create_with_retries(session)
+                if instance is None:
+                    return
+                pod_id = provider.instance_id(instance)
+                session.update(pod_id=pod_id, phase="pod created")
         else:                                             # none, or a dead/reaping leftover
             instance = _create_with_retries(session)      # prepare + create (cancel-aware)
             if instance is None:                          # cancel arrived during create
@@ -280,6 +323,129 @@ def _create_with_retries(session: PodSession) -> dict | None:
             if attempt < retries and _sleep_or_cancel(session, delay):  # cancel-aware wait
                 return None
     raise RuntimeError(provider.create_exhausted_message(retries, delay))
+
+
+def _resume_or_fallback(session: PodSession, provider, instance) -> str | None:
+    """Stop lifecycle: bring a stopped instance back, or clear the way for a create.
+
+    Returns "resumed" (the instance is coming up — the caller waits for RUNNING as
+    for any start), "replaced" (it was terminated and is gone — the caller creates
+    a fresh one), or None when POD DOWN cancelled (the stop worker owns state).
+
+    Resume is tried only when the instance was created with the stack this launch
+    would create now; a stopped instance keeps its creation-time image and env, so
+    resuming a stale one would silently serve the old stack. Only "no free GPU on
+    the host" is retried (PODLINK_RESUME_RETRIES x PODLINK_RESUME_RETRY_DELAY); any
+    other resume error falls back at once. A resume that comes back with 0 GPUs is
+    stopped again and counts as a failed attempt.
+    """
+    pod_id = provider.instance_id(instance)
+    if not provider.matches_stack(instance):
+        # Name what differs (setting NAMES only, never values) so an unexpected
+        # always-recreate is diagnosable from the feed.
+        diff = provider.stack_diff(instance)
+        reason = ("the stack changed since this pod was stopped"
+                  + (f" ({', '.join(diff)})" if diff else ""))
+    else:
+        result = _resume_with_retries(session, provider, instance)
+        if result is None:                               # cancelled mid-retry
+            return None
+        if result is True:
+            return "resumed"
+        reason = result                                  # why every attempt failed
+    session.add_event(f"not resuming: {reason} — terminating the stopped pod and creating a "
+                      "fresh one (weights persist on the volume)", "lifecycle")
+    session.update(phase=f"terminating stopped pod {pod_id} before recreate")
+    provider.terminate(pod_id)
+    if not _wait_until_gone(session, provider, pod_id):  # cancelled while waiting
+        return None
+    provider.clear_state()                               # the state file named the dead pod
+    session.update(pod_id=None)                          # the old id is dead; create sets the new one
+    return "replaced"
+
+
+def _resume_with_retries(session: PodSession, provider, instance) -> bool | str | None:
+    """Resume on the original host, retrying only while its GPU is taken.
+
+    True = resume accepted with a GPU attached; a string = gave up (the reason);
+    None = cancelled. Each attempt and wait is reported and cancel-aware, like
+    the create lottery.
+    """
+    pod_id = provider.instance_id(instance)
+    retries, delay = _resume_retries(), _resume_retry_delay()
+    for attempt in range(1, retries + 1):
+        if session.cancel.is_set():
+            return None
+        session.update(phase=f"resuming stopped pod {pod_id} — attempt {attempt}/{retries}")
+        try:
+            provider.resume(instance)
+        except provider.resume_error_types as e:
+            if not provider.is_retryable_resume_error(e):
+                # Type only — never interpolate str(e) (may carry request context).
+                return f"resume failed ({type(e).__name__}, not a capacity error)"
+            session.add_event(f"host's GPU is taken — resume attempt {attempt}/{retries}; "
+                              f"retrying in {delay}s", "lifecycle")
+        else:
+            if session.cancel.is_set():
+                # POD DOWN arrived while resume() was in flight. The stop worker may
+                # already have seen the pod as stopped (the cloud flips status async)
+                # and settled IDLE — so stop what we just brought up ourselves.
+                session.add_event("POD DOWN during resume — stopping the resumed pod", "lifecycle")
+                provider.stop(pod_id)
+                return None
+            gpus = _settled_gpu_count(session, provider, pod_id)
+            if gpus is None and session.cancel.is_set():  # cancelled while settling
+                provider.stop(pod_id)
+                return None
+            if gpus == 0:                                # resumed without a GPU: useless
+                session.add_event(f"resume attempt {attempt}/{retries} came back with 0 GPUs — "
+                                  "stopping it again", "lifecycle")
+                provider.stop(pod_id)
+            else:
+                session.add_event(f"resumed on the original host (attempt {attempt}) — "
+                                  "no image pull", "lifecycle")
+                return True
+        if attempt < retries and _sleep_or_cancel(session, delay):
+            return None
+    return f"the host had no free GPU after {retries} attempts"
+
+
+GPU_SETTLE_CHECKS = 5      # re-reads of a resumed pod's GPU count before judging 0
+GPU_SETTLE_POLL_S = 2      # seconds between those re-reads
+
+
+def _settled_gpu_count(session: PodSession, provider, pod_id: str) -> int | None:
+    """The resumed pod's GPU count, re-read a few times while it reads 0 — the
+    count can lag the resume. None when the cloud doesn't say (treated as fine)
+    or when cancelled mid-wait (caller re-checks cancel)."""
+    gpus = provider.gpu_count(provider.get_instance(pod_id))
+    for _ in range(GPU_SETTLE_CHECKS):
+        if gpus != 0:
+            return gpus
+        if _sleep_or_cancel(session, GPU_SETTLE_POLL_S):
+            return None
+        gpus = provider.gpu_count(provider.get_instance(pod_id))
+    return gpus
+
+
+def _wait_until_gone(session: PodSession, provider, pod_id: str) -> bool:
+    """After a terminate, wait until the instance is gone (or at least not
+    running and not stopped), so the create that follows can't be confused with
+    it. True = gone; False = cancelled. Raises if it lingers past the verify
+    window — better a loud error than two instances billing."""
+    deadline = time.time() + STOP_VERIFY_TIMEOUT_S
+    while time.time() < deadline:
+        if session.cancel.is_set():
+            return False
+        try:
+            instance = provider.get_instance(pod_id)
+        except Exception:  # noqa: BLE001 — being deleted / not retrievable = gone
+            return True
+        if not instance or not (provider.is_running(instance) or provider.is_stopped(instance)):
+            return True
+        if _sleep_or_cancel(session, STOP_VERIFY_POLL_S):
+            return False
+    raise RuntimeError(f"stopped pod {pod_id} did not go away after terminate")
 
 
 def _wait_for_running(session: PodSession, pod_id: str) -> bool:
@@ -618,13 +784,16 @@ def adopt_running_on_startup(session: PodSession) -> None:
 # ---------------------------------------------------------------------------
 
 def stop(session: PodSession) -> None:
-    """Terminate the instance (GPU released) and VERIFY it actually left RUNNING.
+    """Release the GPU — terminate, or stop under PODLINK_LIFECYCLE=stop — and
+    VERIFY the instance actually left RUNNING.
 
-    Terminate, not stop: a stopped pod can be host-pinned and fail to resume when
-    that host has no free GPU. Works whether the instance is still provisioning or
-    fully RUNNING. Never trusts the on-disk state file alone — resolves the id from
-    live memory or by name, so an instance created before the file existed is still
-    caught.
+    Terminate by default: a stopped pod is host-pinned and may fail to resume
+    when that host has no free GPU. The stop lifecycle accepts that (POD UP
+    retries the resume, then recreates) in exchange for skipping the image pull.
+    "Terminate instead" (session.force_terminate) always terminates. Works whether
+    the instance is still provisioning or fully RUNNING. Never trusts the on-disk
+    state file alone — resolves the id from live memory or by name, so an
+    instance created before the file existed is still caught.
     """
     provider = None                                      # for the finally below
     try:
@@ -639,12 +808,38 @@ def stop(session: PodSession) -> None:
                            services={n: "unknown" for n in SERVICES})
             return
 
-        session.update(pod_id=pod_id, phase=f"terminating pod {pod_id}")  # progress text
-        provider.terminate(pod_id)                       # release the GPU
+        if session.stop_from_idle:
+            # Terminate instead, pressed while IDLE: the target is a pod left
+            # STOPPED. A RUNNING same-name pod is not ours to kill from here —
+            # the console isn't tracking it; adopt it with POD UP first.
+            instance = provider.get_instance(pod_id)
+            if instance is not None and not provider.is_stopped(instance):
+                session.update(state=State.IDLE, pod_id=None,
+                               phase="a podlink pod is running, not stopped — press POD UP to "
+                                     "adopt it, then POD DOWN")
+                return
+
+        keep = lifecycle(provider) == "stop" and not session.force_terminate
+        stopped = False
+        if keep:
+            try:
+                instance = provider.get_instance(pod_id)
+                if not provider.is_stopped(instance):    # already stopped => nothing to send
+                    session.update(pod_id=pod_id, phase=f"stopping pod {pod_id}")
+                    provider.stop(pod_id)                # GPU released, pod kept on its host
+                stopped = True
+            except Exception as e:  # noqa: BLE001 — a failed stop must never leave it billing
+                session.add_event(f"stop failed ({type(e).__name__}) — terminating instead", "system")
+        if not stopped:
+            session.update(pod_id=pod_id, phase=f"terminating pod {pod_id}")  # progress text
+            provider.terminate(pod_id)                   # release the GPU
 
         if _verify_terminated(session, pod_id):          # confirm it left RUNNING / vanished
-            provider.clear_state()                       # drop the state file so a stale id can't resurface
-            session.update(state=State.IDLE, phase="terminated — GPU released",
+            if not stopped:
+                provider.clear_state()                   # drop the state file so a stale id can't resurface
+            session.update(state=State.IDLE,
+                           phase=("stopped — GPU released; POD UP resumes it" if stopped
+                                  else "terminated — GPU released"),
                            pod_id=None, proxy_url=None,   # safe: back to IDLE
                            billing_started_at=None, cost_per_hr=None, auto_terminate_at=None,  # stop the meter
                            services={n: "unknown" for n in SERVICES},  # clear the health tiles

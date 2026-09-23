@@ -35,6 +35,15 @@ class Provider(Protocol):
     #: anything else propagates immediately, unretried.
     create_error_types: tuple[type[Exception], ...]
 
+    #: True when POD DOWN may *stop* (keep the instance on its host) instead of
+    #: destroying it, i.e. the stop/resume lifecycle (PODLINK_LIFECYCLE=stop) is
+    #: implemented below. False => the driver always terminates.
+    supports_stop: bool
+
+    #: Exception types resume() may raise for an *expected* resume failure; the
+    #: driver catches exactly these and asks is_retryable_resume_error().
+    resume_error_types: tuple[type[Exception], ...]
+
     # --- configuration -----------------------------------------------------
 
     def reload_config(self) -> None:
@@ -112,7 +121,34 @@ class Provider(Protocol):
     # --- lifecycle ---------------------------------------------------------
 
     def resume(self, instance: Any) -> None:
-        """Bring a stopped instance back. Only used on the adopt-a-selection path."""
+        """Bring a stopped instance back (adopt-a-selection path, and stop lifecycle)."""
+
+    def stop(self, instance_id: str) -> None:
+        """Stop the instance: release its GPU but keep it on its host so resume()
+        can bring it back without a fresh create. Only called when supports_stop."""
+
+    def is_stopped(self, instance: Any) -> bool:
+        """True when the instance is stopped and resumable — not running, not
+        being torn down. Only meaningful when supports_stop."""
+
+    def is_retryable_resume_error(self, exc: Exception) -> bool:
+        """True when a resume failed only because the host has no free GPU right
+        now, so trying again later may succeed. Anything else (instance gone,
+        bad state, auth) must return False so the driver falls back at once."""
+
+    def gpu_count(self, instance: Any) -> int | None:
+        """GPUs attached to the instance, or None when the cloud doesn't say. A
+        resumed instance with 0 GPUs is useless and is treated as a failed resume."""
+
+    def matches_stack(self, instance: Any) -> bool:
+        """True when a stopped instance was created with the stack this launch
+        would create now (image + model/sizing env, never secrets). A stopped
+        instance keeps its creation-time config, so resuming a mismatched one would
+        silently serve an old stack; the driver recreates instead."""
+
+    def stack_diff(self, instance: Any) -> list[str]:
+        """NAMES of the settings where the instance differs from the current stack
+        (e.g. ["image", "RERANK_MODEL_ID"]). Never values — shown in the feed."""
 
     def prepare_create(self, session) -> Any | None:
         """Do the pre-create lookups, returning an opaque context for create_once.

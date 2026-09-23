@@ -205,6 +205,8 @@
     }
     button.mini:disabled { opacity: .38; cursor: not-allowed; }
     .refresh { flex: 0 0 auto; }
+    button.mini.terminate { align-self: flex-end; color: var(--red-t); border-color: rgba(214,69,69,.42); background: rgba(214,69,69,.08); }
+    button.mini.terminate:hover:not(:disabled) { background: rgba(214,69,69,.18); color: #fff; box-shadow: var(--lift), 0 0 14px rgba(214,69,69,.4); }
 
     /* ===== POWER ACTUATORS — glass + chamfer ===== */
     .powerbtns { display: flex; flex-direction: column; gap: 10px; }
@@ -472,6 +474,9 @@
       <div class="powerbtns">
         <div class="framed"><button id="up" class="power">POD&nbsp;UP<span class="glass-sheen"></span></button></div>
         <div class="framed"><button id="down" class="power">POD&nbsp;DOWN<span class="glass-sheen"></span></button></div>
+        <!-- Stop lifecycle only: POD DOWN stops (pod kept on its host); this removes it for good. -->
+        <button id="terminate" class="mini terminate" hidden
+                title="Terminate the pod instead of stopping it (also removes a pod left stopped)">Terminate instead</button>
       </div>
 
       <div class="card statusblock-card">

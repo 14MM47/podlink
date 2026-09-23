@@ -6,6 +6,29 @@ All notable changes to podlink are documented here. The format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Stop/resume lifecycle** (`PODLINK_LIFECYCLE=stop`, default `terminate`; RunPod
+  only — preflight fails it on a provider without `supports_stop`): POD DOWN stops the
+  pod (verified) and keeps it; POD UP resumes it, retrying only "not enough free GPUs
+  on the host machine" (`PODLINK_RESUME_RETRIES` x `PODLINK_RESUME_RETRY_DELAY`,
+  default 40 x 15 s), then terminates it and creates fresh. A non-capacity resume
+  error falls back at once; a 0-GPU resume is re-stopped and retried; a stopped pod
+  whose image/non-secret env no longer matches the profile is recreated, never
+  resumed. POD DOWN cancels mid-retry. A failed stop terminates instead. New
+  **Terminate instead** button (`/pod/down {"terminate": true}`, also from IDLE);
+  the no-volume guard applies only when actually terminating. Snapshot gains
+  `lifecycle` / `terminate_enabled`. Provider contract gains `supports_stop`,
+  `resume_error_types`, `stop`, `is_stopped`, `is_retryable_resume_error`,
+  `gpu_count`, `matches_stack` (GCP opts out; it keeps `PODLINK_GCP_DOWN_ACTION`).
+  `pod_up.find_existing` prefers a RUNNING, then EXITED, pod among same-name pods.
+  Live probe 2026-09-23 (EU-RO-1, RTX PRO 6000): the stopped pod's GPU was re-rented
+  in ~20 s, 8/8 resumes failed — expect frequent fallbacks while capacity is tight.
+  Safety details (from review): POD DOWN landing while a resume *succeeds* makes the
+  start worker stop the pod it just resumed (the stop worker may already have seen it
+  stopped); a resumed pod's GPU count is re-read for ~10 s before a 0 counts as a failed
+  resume; Terminate instead from IDLE removes only a *stopped* pod (a running one must be
+  adopted first); a fingerprint mismatch names the differing settings (never values) in
+  the feed; the fallback clears pod_state.json; idle auto-terminate follows the lifecycle
+  (auto-stop under stop) and says which.
 - **vLLM reranker backend** (`PODLINK_RERANK_BACKEND=tei|vllm`, default `tei`):
   `start-reranker.sh` can run a second vLLM process (pooling runner) on :8081 for
   LLM-based rerankers TEI cannot serve. Built-in preset for `Qwen/Qwen3-Reranker-*`

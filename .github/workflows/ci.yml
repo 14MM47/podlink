@@ -32,3 +32,4 @@ jobs:
           python tests/test_server.py
           python tests/test_authproxy.py
           python tests/test_pod_scripts.py
+          python tests/test_lifecycle.py

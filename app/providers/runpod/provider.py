@@ -9,9 +9,13 @@ unchanged, only relocated. The vendored pod_control/pod_up.py stays the single
 source of truth for RunPod's shape (image, template, ports, sizing, volume), and
 this class is the adapter between it and app/driver.py.
 
-Lifecycle note carried over from that module: POD DOWN *terminates*. A stopped
-RunPod pod is host-pinned and fails to resume when its host has no free GPU, so
-the up/down cycle is terminate/recreate and the weights live on a Network Volume.
+Lifecycle: by default POD DOWN *terminates* and the weights live on a Network
+Volume. PODLINK_LIFECYCLE=stop (driver-owned) makes POD DOWN *stop* instead, so
+POD UP can resume the pod without re-pulling the image. A stopped RunPod pod is
+host-pinned: resume fails with "not enough free GPUs on the host machine" when
+someone else has rented that GPU, so the driver retries, then falls back to
+terminate + create. This provider supplies the pieces: stop, is_stopped,
+is_retryable_resume_error, gpu_count, matches_stack.
 """
 from __future__ import annotations
 
@@ -35,6 +39,25 @@ import pod_up  # noqa: E402  vendored: constants + find_existing/create_pod_once
 _POD_ID_RE = re.compile(r"^[a-z0-9]{6,40}$")
 
 
+# Env keys that carry secrets: excluded from the stack fingerprint (never compared,
+# never logged). Everything else in the pod env is config and must match.
+_SECRET_ENV = frozenset({"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "VLLM_API_KEY", "TEI_API_KEY"})
+
+
+def _env_dict(env) -> dict[str, str]:
+    """The pod record's env as a dict — the API returns ["K=V", ...] (or a dict)."""
+    if isinstance(env, dict):
+        return {str(k): str(v) for k, v in env.items()}
+    out: dict[str, str] = {}
+    for item in env or []:
+        if isinstance(item, str) and "=" in item:
+            k, v = item.split("=", 1)
+            out[k] = v
+        elif isinstance(item, dict) and "key" in item:      # {key, value} shape
+            out[str(item["key"])] = str(item.get("value", ""))
+    return out
+
+
 class RunPodProvider:
     """Drives RunPod Secure Cloud pods for app/driver.py."""
 
@@ -42,6 +65,11 @@ class RunPodProvider:
     #: create_pod_once raises QueryError both for the transient host-capacity
     #: lottery and for real errors; is_retryable_create_error tells them apart.
     create_error_types = (QueryError,)
+    #: RunPod pods can be stopped and resumed (host-pinned; see module docstring).
+    supports_stop = True
+    #: resume_pod raises QueryError for "no free GPU on the host" and real errors
+    #: alike; is_retryable_resume_error tells them apart.
+    resume_error_types = (QueryError,)
 
     # --- configuration -----------------------------------------------------
 
@@ -97,7 +125,8 @@ class RunPodProvider:
         return pods
 
     def find_existing(self) -> dict | None:
-        """The pod named POD_NAME, or None."""
+        """The pod named POD_NAME, or None (RUNNING preferred, then EXITED —
+        see pod_up.find_existing)."""
         return pod_up.find_existing()
 
     def get_instance(self, instance_id: str) -> dict | None:
@@ -129,6 +158,47 @@ class RunPodProvider:
 
     def resume(self, instance: dict) -> None:
         runpod.resume_pod(self.instance_id(instance), gpu_count=instance.get("gpuCount") or 1)
+
+    def stop(self, instance_id: str) -> None:
+        """Release the GPU but keep the pod (and its cached image) on its host."""
+        runpod.stop_pod(instance_id)
+
+    def is_stopped(self, instance: dict) -> bool:
+        """EXITED = stopped by us or by the user, resumable. A terminated pod
+        vanishes from the API instead of reporting a status."""
+        return bool(instance) and instance.get("desiredStatus") == "EXITED"
+
+    def is_retryable_resume_error(self, exc: Exception) -> bool:
+        """Only 'the host's GPU is taken' is worth retrying — verified live
+        2026-09-23: "There are not enough free GPUs on the host machine to start
+        this pod." Anything else (pod gone, bad state) falls back at once."""
+        return isinstance(exc, QueryError) and "not enough free gpus" in str(exc).lower()
+
+    def gpu_count(self, instance: dict) -> int | None:
+        count = (instance or {}).get("gpuCount")
+        return int(count) if isinstance(count, (int, float)) else None
+
+    def matches_stack(self, instance: dict) -> bool:
+        """Compare the stopped pod's image + non-secret env with what a create
+        would send now. Every non-secret key on EITHER side must agree, so an
+        optional passthrough present on only one side (e.g. RERANK_BACKEND) is a
+        mismatch too. The secret values are never read or compared."""
+        return bool(instance) and not self.stack_diff(instance)
+
+    def stack_diff(self, instance: dict) -> list[str]:
+        """Setting names that differ (image + non-secret env keys, either side).
+
+        RunPod stores env values as the GraphQL string literals parse, i.e. the
+        raw values _pod_env builds (the create path's _gql_escape_env escaping is
+        undone by the parser), so raw-vs-raw comparison is correct.
+        """
+        if not instance:
+            return ["instance"]
+        diff = [] if instance.get("imageName") == pod_up.IMAGE else ["image"]
+        want = {k: str(v) for k, v in pod_up._pod_env("", "").items() if k not in _SECRET_ENV}
+        have = {k: v for k, v in _env_dict(instance.get("env")).items() if k not in _SECRET_ENV}
+        diff += sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
+        return diff
 
     def prepare_create(self, session) -> dict | None:
         """Resolve the GPU type id and the registry-cred template.

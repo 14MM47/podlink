@@ -19,6 +19,8 @@ Local modifications:
   `RERANK_GPU_MEMORY_UTILIZATION` / `RERANK_VLLM_EXTRA_ARGS` / `RERANK_MAX_MODEL_LEN` /
   `RERANK_WAIT_FOR_EMBEDDER_S` passthroughs, mirroring
   `app/stack.py` (vLLM reranker backend, 2026-09).
+- `pod_up.py` `find_existing()` prefers a RUNNING pod, then an EXITED (stopped) one, when
+  several pods share POD_NAME (stop lifecycle fallback, 2026-09).
 
 | File | Role |
 |------|------|

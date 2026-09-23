@@ -26,7 +26,7 @@ particular stack.
 Beyond the two buttons, the UI is a live status console (dark "frosted tactical" skin;
 all motion respects `prefers-reduced-motion`):
 
-- **POD UP / POD DOWN** — POD DOWN **terminates** (see below), and is live from the
+- **POD UP / POD DOWN** — POD DOWN **terminates** by default, or stops with `PODLINK_LIFECYCLE=stop` (see below), and is live from the
   instant POD UP starts through the whole boot, so you can kill a pod cleanly anytime.
 - **Live cost meter** — uptime × the pod's `$/hr`, ticking every second.
 - **Idle auto-terminate** — an optional watchdog that terminates a forgotten pod after
@@ -41,7 +41,7 @@ all motion respects `prefers-reduced-motion`):
 - **Network Volume** line + a red banner if none is configured (POD DOWN would then
   destroy weights).
 
-## Terminate, not stop — and the Network Volume
+## Terminate (default) or stop — and the Network Volume
 
 POD DOWN **terminates** the pod rather than stopping it. A *stopped* pod is pinned to
 its original host and can fail to resume when that host has no free GPU
@@ -61,6 +61,25 @@ download** — the payoff of the volume.
 If no volume id is set, podlink falls back to a pod-scoped **Data Volume** that is
 **destroyed on terminate** (weights re-download next up). In that mode the UI shows a
 warning banner and POD DOWN requires an explicit confirmation.
+
+### Optional: stop/resume (`PODLINK_LIFECYCLE=stop`, RunPod only)
+
+Stopping keeps the pod — and its cached image — on its host, so a successful resume
+skips the image pull. The catch is the host-pinning above. With `PODLINK_LIFECYCLE=stop`:
+
+- **POD DOWN** stops the pod (GPU released, verified) and keeps it. A small
+  **Terminate instead** button removes it for good, including from IDLE.
+- **POD UP** resumes it, retrying *only* "not enough free GPUs on the host machine"
+  (`PODLINK_RESUME_RETRIES` × `PODLINK_RESUME_RETRY_DELAY`, default 40 × 15 s), then
+  terminates it and creates a fresh pod as usual. Any other resume error falls back
+  at once; a resume that comes back with 0 GPUs is stopped again and retried.
+- A stopped pod keeps its creation-time image and env, so POD UP only resumes it when
+  they still match the active profile (secrets excluded); otherwise it recreates.
+
+Measured 2026-09-23 on an RTX PRO 6000 in EU-RO-1: the stopped pod's GPU was re-rented
+within ~20 s and 8/8 resume attempts over 2.5 min failed. When capacity is that tight
+most POD UPs will exhaust the retries and fall back, adding up to
+`RETRIES × DELAY` to the boot — lower `PODLINK_RESUME_RETRIES` to cap that.
 
 ## Quick start
 
@@ -123,7 +142,9 @@ export PODLINK_NETWORK_VOLUME_ID=<volume-id>         # terminate-safe weight per
 | `PODLINK_PYTORCH_CUDA_ALLOC_CONF` | *(empty)* | Passed to the pod as `PYTORCH_CUDA_ALLOC_CONF` (e.g. `expandable_segments:True`). |
 | `PODLINK_VOLUME_GB` | `50` | Pod-scoped Data-Volume size when no Network Volume is set — size it to your weights. |
 | `PODLINK_POD_NAME` / `PODLINK_TEMPLATE_NAME` | `podlink` / `podlink-pod` | RunPod pod + template names. |
-| `PODLINK_AUTO_TERMINATE_MIN` | `0` (off) | Idle auto-terminate window, minutes. |
+| `PODLINK_AUTO_TERMINATE_MIN` | `0` (off) | Idle auto-terminate window, minutes (follows `PODLINK_LIFECYCLE`: stops under `stop`). |
+| `PODLINK_LIFECYCLE` | `terminate` | `stop` = POD DOWN stops and POD UP resumes, with fallback to terminate + create (RunPod only; see above). |
+| `PODLINK_RESUME_RETRIES` / `PODLINK_RESUME_RETRY_DELAY` | `40` / `15` | Stop lifecycle: resume attempts on the pod's host, and seconds between them, before falling back. |
 | `PODLINK_READY_WARN_S` / `PODLINK_READY_TIMEOUT_S` | `900` / `3600` | Readiness wait after the pod is RUNNING: warn in the feed every `WARN` seconds and keep waiting (the pod is billing either way); give up only after `TIMEOUT` seconds (`0` = never). Big volume-less boots can take 15–20 min. |
 | `PODLINK_ADOPT_ON_START` | `1` (on) | On console start, adopt a RUNNING pod with our name (e.g. after a console restart or a lost start) instead of showing IDLE. |
 | `PODLINK_CREATE_RETRIES` / `PODLINK_CREATE_RETRY_DELAY` | `40` / `15` | Host-capacity retry attempts and delay. |
@@ -234,6 +255,7 @@ your vector collection and re-ingest.
 ./.venv/bin/python tests/test_driver_smoke.py   # driver logic (stubbed SDK)
 ./.venv/bin/python tests/test_session.py        # state machine + snapshot
 ./.venv/bin/python tests/test_server.py         # routes + guards (FastAPI TestClient)
+./.venv/bin/python tests/test_lifecycle.py      # stop/resume lifecycle (stateful fake SDK)
 ```
 
 ## Layout

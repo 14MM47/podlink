@@ -131,10 +131,15 @@ TEMPLATE_STATE_PATH = Path(__file__).resolve().parents[1] / "template_state.json
 
 
 def find_existing() -> dict | None:
-    for p in runpod.get_pods():
-        if p.get("name") == POD_NAME:
-            return p
-    return None
+    # Pod names aren't unique on RunPod: after a stop-lifecycle fallback a fresh
+    # pod can briefly coexist with the terminating one it replaced. Prefer a
+    # RUNNING pod, then a stopped (EXITED) one, then anything with the name.
+    matches = [p for p in runpod.get_pods() if p.get("name") == POD_NAME]
+    for wanted in ("RUNNING", "EXITED"):
+        for p in matches:
+            if p.get("desiredStatus") == wanted:
+                return p
+    return matches[0] if matches else None
 
 
 def ensure_template() -> str:

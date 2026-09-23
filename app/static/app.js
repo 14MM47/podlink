@@ -3,6 +3,7 @@
 
 const upBtn = document.getElementById("up");       // the POD UP button element
 const downBtn = document.getElementById("down");   // the POD DOWN button element
+const terminateBtn = document.getElementById("terminate");  // "Terminate instead" (stop lifecycle)
 const badge = document.getElementById("badge");    // the state pill (IDLE/RUNNING/…)
 const phaseEl = document.getElementById("phase");  // the progress line
 const errorEl = document.getElementById("error");  // the error line
@@ -278,6 +279,12 @@ function render(s) {
   // Enablement flags — cheap, every frame.
   upBtn.disabled = !s.up_enabled;
   downBtn.disabled = !s.down_enabled;
+  // Stop lifecycle: POD DOWN stops; the secondary button terminates for good.
+  const stopMode = s.lifecycle === "stop";
+  terminateBtn.hidden = !stopMode;
+  terminateBtn.disabled = !s.terminate_enabled;
+  downBtn.title = stopMode ? "Stop the pod (kept on its host; POD UP resumes it without an image pull)"
+                           : "Terminate the pod (weights persist on the volume if configured)";
   podSelect.disabled = !s.up_enabled;
   refreshBtn.disabled = !s.up_enabled;
   // Mirrors the server's /profile/select guard: switchable only with no pod at all.
@@ -319,7 +326,8 @@ downBtn.addEventListener("click", () => {           // when POD DOWN is clicked
   // positively know persistent storage is set. Unknown (no snapshot yet, or the
   // field absent) is treated as unsafe so an early click can't slip through.
   const safe = lastSnap && lastSnap.persistence_configured === true;
-  if (!safe) {
+  const stopping = lastSnap && lastSnap.lifecycle === "stop";  // stop keeps the pod: non-destructive
+  if (!safe && !stopping) {
     const store = (lastSnap && lastSnap.persistence_label) || "Persistent storage";
     const ok = confirm(
       `No ${store} is confirmed configured.\n\n` +
@@ -330,6 +338,17 @@ downBtn.addEventListener("click", () => {           // when POD DOWN is clicked
   }
   downBtn.disabled = true;                          // optimistic; SSE will confirm
   send("/pod/down", { confirm: true });            // explicit confirmation for the server-side guard
+});
+terminateBtn.addEventListener("click", () => {     // stop lifecycle: remove the pod for good
+  const safe = lastSnap && lastSnap.persistence_configured === true;
+  const ok = confirm(
+    "TERMINATE the pod instead of stopping it?\n\n" +
+    "The next POD UP creates a fresh pod and re-pulls the image." +
+    (safe ? "" : "\n\nNo persistent storage is confirmed: the downloaded model weights may be DESTROYED.")
+  );
+  if (!ok) return;
+  terminateBtn.disabled = true;                     // optimistic; SSE will confirm
+  send("/pod/down", { confirm: true, terminate: true });
 });
 refreshBtn.addEventListener("click", loadPods);     // manual pod-list refresh
 profileSelect.addEventListener("change", async () => {  // switch the stack profile

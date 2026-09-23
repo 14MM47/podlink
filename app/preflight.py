@@ -70,6 +70,25 @@ def _stack_rows(stack: dict) -> list[tuple[str, str]]:
     return rows
 
 
+def _lifecycle_rows(provider) -> list[tuple[str, str]]:
+    """PODLINK_LIFECYCLE: what POD DOWN does, and whether this provider can do it."""
+    wanted = os.environ.get("PODLINK_LIFECYCLE", "").strip().lower() or "terminate"
+    if wanted not in ("terminate", "stop"):
+        return [("fail", f"PODLINK_LIFECYCLE={wanted!r}: must be terminate or stop")]
+    if wanted == "terminate":
+        return [("ok", "lifecycle: terminate (POD DOWN destroys the pod; POD UP creates fresh)")]
+    if not getattr(provider, "supports_stop", False):
+        # driver.lifecycle() would silently fall back to terminate — say so loudly.
+        return [("fail", f"PODLINK_LIFECYCLE=stop is not supported by provider {provider.name!r}")]
+    from .driver import _resume_retries, _resume_retry_delay
+    rows = [("ok", f"lifecycle: stop (POD DOWN stops; POD UP resumes, {_resume_retries()} tries "
+                   f"x {_resume_retry_delay()}s, then terminates + creates fresh)")]
+    if not provider.persistence_configured():
+        rows.append(("warn", "lifecycle stop without persistent storage: a fallback recreate "
+                             "re-downloads the weights"))
+    return rows
+
+
 def run(out=sys.stdout) -> int:
     """Print the report; return the exit status (1 on any hard failure)."""
     def line(s: str = "") -> None:
@@ -93,7 +112,7 @@ def run(out=sys.stdout) -> int:
     line(f"   max model len: {stack.get('max_model_len')} · gpu share: {stack.get('gpu_memory_utilization')}")
     line()
 
-    rows = _neutral_rows() + _stack_rows(stack) + list(provider.preflight())
+    rows = _neutral_rows() + _stack_rows(stack) + _lifecycle_rows(provider) + list(provider.preflight())
     line("Checks:")
     for level, msg in rows:
         line(f"{_MARK.get(level, '   ?')} {msg}")

@@ -111,9 +111,12 @@ def _auto_terminate_tick() -> bool:
         return False
     if not SESSION.try_begin_stop():                  # atomic: enter STOPPING + cancel
         return False
-    SESSION.add_event("idle auto-terminate — deadline reached", "system")
-    SESSION.update(phase="idle auto-terminate — deadline reached")
-    _launch(driver.stop)                              # terminate + verify in the background
+    # Follows the lifecycle: under stop the pod is stopped (GPU billing ends, the
+    # fast resume is kept); "Terminate instead" removes it for good.
+    verb = "stop" if driver.lifecycle() == "stop" else "terminate"
+    SESSION.add_event(f"idle auto-{verb} — deadline reached", "system")
+    SESSION.update(phase=f"idle auto-{verb} — deadline reached")
+    _launch(driver.stop)                              # stop/terminate + verify in the background
     return True
 
 
@@ -140,6 +143,11 @@ def _snapshot() -> dict:
     snap = SESSION.snapshot()                                 # base state + button flags
     snap.update(provider.snapshot_fields())                   # provider/persistence/model
     snap["active_profile"] = os.environ.get("PODLINK_PROFILE") or None  # start.sh --profile
+    # What POD DOWN does ("terminate" | "stop"). Under stop, "Terminate instead"
+    # is live whenever POD DOWN is, and also from IDLE (a pod may be left stopped).
+    snap["lifecycle"] = driver.lifecycle(provider)
+    snap["terminate_enabled"] = snap["lifecycle"] == "stop" and (
+        snap["down_enabled"] or snap["state"] == State.IDLE.value)
     # Service endpoints for the UI's link row — cheap, pure string building, and
     # no wider exposure than pod_id itself (this route is localhost-only).
     snap["service_urls"] = provider.service_urls(SESSION.pod_id) if SESSION.pod_id else None
@@ -257,22 +265,27 @@ def pod_up(target: str | None = Body(default=None, embed=True),
 
 @app.post("/pod/down")
 def pod_down(confirm: bool = Body(default=False, embed=True),
+             terminate: bool = Body(default=False, embed=True),
              x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
     _require_token(x_podlink_token)                   # CSRF/token gate
+    # Under the stop lifecycle a plain POD DOWN stops (non-destructive: the pod and
+    # its disk stay on the host); terminate=true ("Terminate instead") destroys it,
+    # and is also accepted from IDLE to remove a pod left stopped.
+    terminating = terminate or driver.lifecycle() == "terminate"
     # Server-side destructive-action guard. With no persistent storage, terminate
     # DESTROYS the downloaded weights. The browser shows a confirm dialog, but
     # that JS is bypassable (curl, a script, a stale tab), so the server itself
     # refuses to terminate unless the caller explicitly confirms. With storage
     # configured, terminate is non-destructive and no confirmation is required.
-    if not driver.persistence_configured() and not confirm:
+    if terminating and not driver.persistence_configured() and not confirm:
         raise HTTPException(
             status_code=428,                          # Precondition Required
             detail='no persistent storage configured — POD DOWN will destroy the '
                    'downloaded model weights; resend with {"confirm": true} to proceed',
         )
-    if not SESSION.try_begin_stop():                 # atomically enter STOPPING + cancel
+    if not SESSION.try_begin_stop(terminate=terminate):  # atomically enter STOPPING + cancel
         raise HTTPException(status_code=409, detail="pod down not available in current state")
-    _launch(driver.stop)                             # terminate + verify in the background
+    _launch(driver.stop)                             # stop/terminate + verify in the background
     return JSONResponse(_snapshot())                 # echo the new state
 
 
