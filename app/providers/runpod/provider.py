@@ -40,8 +40,21 @@ _POD_ID_RE = re.compile(r"^[a-z0-9]{6,40}$")
 
 
 # Env keys that carry secrets: excluded from the stack fingerprint (never compared,
-# never logged). Everything else in the pod env is config and must match.
+# never logged).
 _SECRET_ENV = frozenset({"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "VLLM_API_KEY", "TEI_API_KEY"})
+
+# Every NON-secret key pod_up._pod_env can send (base + optional passthroughs).
+# The stack fingerprint compares only these: RunPod adds keys of its own to a
+# pod's env (PUBLIC_KEY, the account SSH key — seen live 2026-09-23) and drops
+# keys whose value is empty (LLM_QUANT=""), so a whole-env comparison judged
+# every stopped pod stale and resume never ran. tests/test_lifecycle.py pins this
+# set to what _pod_env actually emits.
+_CONFIG_ENV = frozenset({
+    "LLM_MODEL_ID", "LLM_SERVED_NAME", "EMBED_MODEL_ID", "RERANK_MODEL_ID", "LLM_QUANT",
+    "MAX_MODEL_LEN", "GPU_MEMORY_UTILIZATION", "RERANK_BACKEND",
+    "VLLM_EXTRA_ARGS", "PYTORCH_CUDA_ALLOC_CONF", "RERANK_GPU_MEMORY_UTILIZATION",
+    "RERANK_VLLM_EXTRA_ARGS", "RERANK_MAX_MODEL_LEN", "RERANK_WAIT_FOR_EMBEDDER_S",
+})
 
 
 def _env_dict(env) -> dict[str, str]:
@@ -186,7 +199,10 @@ class RunPodProvider:
         return bool(instance) and not self.stack_diff(instance)
 
     def stack_diff(self, instance: dict) -> list[str]:
-        """Setting names that differ (image + non-secret env keys, either side).
+        """Setting names that differ: the image, plus podlink's own config keys
+        (_CONFIG_ENV) on either side. Keys RunPod adds (PUBLIC_KEY, …) are
+        ignored, and an empty value equals a missing key, because RunPod drops
+        empty env values when it stores the pod.
 
         RunPod stores env values as the GraphQL string literals parse, i.e. the
         raw values _pod_env builds (the create path's _gql_escape_env escaping is
@@ -195,9 +211,9 @@ class RunPodProvider:
         if not instance:
             return ["instance"]
         diff = [] if instance.get("imageName") == pod_up.IMAGE else ["image"]
-        want = {k: str(v) for k, v in pod_up._pod_env("", "").items() if k not in _SECRET_ENV}
-        have = {k: v for k, v in _env_dict(instance.get("env")).items() if k not in _SECRET_ENV}
-        diff += sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
+        want = {k: str(v) for k, v in pod_up._pod_env("", "").items() if k in _CONFIG_ENV}
+        have = {k: v for k, v in _env_dict(instance.get("env")).items() if k in _CONFIG_ENV}
+        diff += sorted(k for k in set(want) | set(have) if (want.get(k) or "") != (have.get(k) or ""))
         return diff
 
     def prepare_create(self, session) -> dict | None:

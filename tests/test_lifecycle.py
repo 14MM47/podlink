@@ -44,8 +44,10 @@ class Store:
         self.created = 0
 
     def add(self, pod_id, status, **extra):
+        # Env as RunPod really stores it (seen live 2026-09-23): empty values
+        # dropped, and the account's PUBLIC_KEY added.
         pod = {"id": pod_id, "name": rp.pod_up.POD_NAME, "desiredStatus": status, "gpuCount": 1,
-               "imageName": rp.pod_up.IMAGE, "env": _pod_env_list(), "costPerHr": 2.09, **extra}
+               "imageName": rp.pod_up.IMAGE, "env": _runpod_stored_env(), "costPerHr": 2.09, **extra}
         self.pods[pod_id] = pod
         return pod
 
@@ -95,6 +97,11 @@ def _pod_env_list(**overrides) -> list[str]:
     with made-up secrets — which matches_stack must ignore."""
     env = {**rp.pod_up._pod_env("real-bearer", "real-hf"), **overrides}
     return [f"{k}={v}" for k, v in env.items()]
+
+
+def _runpod_stored_env(**overrides) -> list[str]:
+    """_pod_env_list as RunPod echoes it back: empty values gone, PUBLIC_KEY added."""
+    return [e for e in _pod_env_list(**overrides) if not e.endswith("=")] + ["PUBLIC_KEY=ssh-ed25519 AAAA… me"]
 
 
 _SAVED = {}
@@ -344,6 +351,13 @@ def test_matches_stack_rules():
               not p.matches_stack({**base, "env": _pod_env_list(RERANK_MODEL_ID="other/model")}))
         check("fingerprint: extra key on the pod -> mismatch",
               not p.matches_stack({**base, "env": _pod_env_list() + ["RERANK_BACKEND=vllm"]}))
+        # Seen live 2026-09-23: RunPod drops empty values (LLM_QUANT="") and adds
+        # its own keys (PUBLIC_KEY) — neither may count as a stack change.
+        runpod_view = [e for e in _pod_env_list() if e != "LLM_QUANT="] + ["PUBLIC_KEY=ssh-ed25519 AAAA… me"]
+        check("fingerprint: RunPod's dropped-empty + added PUBLIC_KEY still match",
+              p.matches_stack({**base, "env": runpod_view}) and p.stack_diff({**base, "env": runpod_view}) == [])
+        check("fingerprint: a real quant change still mismatches",
+              p.stack_diff({**base, "env": _pod_env_list(LLM_QUANT="awq_marlin")}) == ["LLM_QUANT"])
         check("fingerprint: dict-shaped env accepted",
               p.matches_stack({**base, "env": dict(e.split("=", 1) for e in _pod_env_list())}))
         check("retryable only for the no-free-GPU error",
@@ -453,6 +467,26 @@ def test_stop_flags_reset_on_start():
     check("flags cleared by the next start", not s.force_terminate and not s.stop_from_idle)
 
 
+def test_config_key_set_covers_everything_pod_env_can_send():
+    # _CONFIG_ENV must list every non-secret key _pod_env can emit, or a changed
+    # optional setting would be invisible to the fingerprint. Set every optional
+    # passthrough (and a non-default reranker backend) and compare key sets.
+    from app.providers.runpod import provider as rpp
+    extra = {"PODLINK_VLLM_EXTRA_ARGS": "x", "PODLINK_PYTORCH_CUDA_ALLOC_CONF": "x",
+             "PODLINK_RERANK_GPU_MEMORY_UTILIZATION": "0.1", "PODLINK_RERANK_VLLM_EXTRA_ARGS": "x",
+             "PODLINK_RERANK_MAX_MODEL_LEN": "1", "PODLINK_RERANK_WAIT_FOR_EMBEDDER_S": "1"}
+    saved_backend = rp.pod_up.RERANK_BACKEND
+    os.environ.update(extra)
+    rp.pod_up.RERANK_BACKEND = "vllm"
+    try:
+        emitted = set(rp.pod_up._pod_env("b", "h")) - rpp._SECRET_ENV
+        check("_CONFIG_ENV == every non-secret key _pod_env can send", emitted == set(rpp._CONFIG_ENV))
+    finally:
+        for k in extra:
+            os.environ.pop(k, None)
+        rp.pod_up.RERANK_BACKEND = saved_backend
+
+
 if __name__ == "__main__":
     test_default_lifecycle_is_terminate()
     test_down_stops_and_keeps_state()
@@ -472,4 +506,5 @@ if __name__ == "__main__":
     test_transient_zero_gpu_count_is_not_a_failed_resume()
     test_terminate_from_idle_refuses_a_running_pod()
     test_stop_flags_reset_on_start()
+    test_config_key_set_covers_everything_pod_env_can_send()
     print("all lifecycle tests passed.")
