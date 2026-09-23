@@ -30,3 +30,5 @@ jobs:
           python tests/test_gcp_tunnel.py
           python tests/test_session.py
           python tests/test_server.py
+          python tests/test_authproxy.py
+          python tests/test_pod_scripts.py

@@ -3,9 +3,12 @@
 # podlink bundled pod image — ONE container running THREE co-resident services on
 # a single RTX Pro 6000 (96 GB, Blackwell / sm_120):
 #
-#   :8000  vLLM        — OpenAI-compatible LLM (chat + KG extraction)
+#   :8000  vLLM        — OpenAI-compatible LLM (chat + KG extraction); vLLM binds
+#                        127.0.0.1:18000 and nginx (authproxy.py) owns :8000
 #   :8080  TEI         — embedder  (/v1/embeddings, /health)
-#   :8081  TEI         — reranker  (/rerank, /health)
+#   :8081  TEI or vLLM — reranker  (TEI /rerank or vLLM /v1/rerank, /health;
+#                          RERANK_BACKEND=tei|vllm, see start-reranker.sh; a
+#                          vllm reranker binds 127.0.0.1:18081 behind nginx)
 #
 # supervisord keeps all three alive. Model weights are NOT baked in — they are
 # pulled on first boot into $HF_HOME (on the persistent /workspace volume), so the
@@ -44,12 +47,21 @@ COPY --from=tei /usr/local/bin/text-embeddings-router /usr/local/bin/text-embedd
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libssl3 ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
+# nginx = the authproxy in front of the vLLM ports (see authproxy.py): vLLM's
+# --api-key leaves its root routes unauthenticated on the public proxy. The
+# default site is removed — authproxy.py renders the only config nginx loads.
+RUN apt-get update && apt-get install -y --no-install-recommends nginx \
+      && rm -f /etc/nginx/sites-enabled/default && rm -rf /var/lib/apt/lists/*
+
 # supervisor runs the three long-lived services inside the one container.
 RUN pip install --no-cache-dir supervisor==4.2.5
 
 # Service launch wrappers + supervisor config.
-COPY start-vllm.sh start-embedder.sh start-reranker.sh /opt/podlink/
+COPY start-vllm.sh start-embedder.sh start-reranker.sh authproxy.py /opt/podlink/
 COPY supervisord.conf /etc/podlink/supervisord.conf
+# Chat template for the vLLM reranker backend's Qwen3-Reranker preset (the vLLM
+# image ships no examples/ tree). See templates/PROVENANCE.md.
+COPY templates/ /opt/podlink/templates/
 RUN chmod +x /opt/podlink/*.sh
 
 # Keep the HF cache on the persistent /workspace volume (podlink mounts it there),

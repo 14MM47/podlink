@@ -114,6 +114,9 @@ VOLUME_MOUNT = "/workspace"
 # Int4 MoE + a 4B embedder) wants ~0.85.
 MAX_MODEL_LEN = int(os.environ.get("PODLINK_MAX_MODEL_LEN", "32768"))
 GPU_MEMORY_UTILIZATION = float(os.environ.get("PODLINK_GPU_MEMORY_UTILIZATION", "0.70"))
+# Reranker server on :8081 — "tei" (image default) or "vllm" (pooling runner for
+# LLM-based rerankers). Mirrors app/stack.py's default; tests assert they agree.
+RERANK_BACKEND = os.environ.get("PODLINK_RERANK_BACKEND", "").strip().lower() or "tei"
 # SSH is handy for first-boot debug / pre-warm but opens an extra surface on every
 # pod. On by default (preserves debugging during bring-up); set PODLINK_START_SSH=0
 # to deploy without it once the image is trusted.
@@ -266,10 +269,18 @@ def _pod_env(bearer: str, hf: str) -> dict:
     for src, dst in (
         ("PODLINK_VLLM_EXTRA_ARGS", "VLLM_EXTRA_ARGS"),          # extra vllm serve flags
         ("PODLINK_PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"),  # allocator tuning
+        ("PODLINK_RERANK_GPU_MEMORY_UTILIZATION", "RERANK_GPU_MEMORY_UTILIZATION"),  # vllm reranker share
+        ("PODLINK_RERANK_VLLM_EXTRA_ARGS", "RERANK_VLLM_EXTRA_ARGS"),   # flags for un-preset rerankers
+        ("PODLINK_RERANK_MAX_MODEL_LEN", "RERANK_MAX_MODEL_LEN"),       # vllm reranker context cap
+        ("PODLINK_RERANK_WAIT_FOR_EMBEDDER_S", "RERANK_WAIT_FOR_EMBEDDER_S"),  # vllm reranker start wait
     ):
         val = os.environ.get(src, "").strip()
         if val:
             env[dst] = val
+    # Reranker backend: sent only when not the image default, so a tei stack's
+    # env is unchanged (same rule as app/stack.container_env).
+    if RERANK_BACKEND != "tei":
+        env["RERANK_BACKEND"] = RERANK_BACKEND
     return env
 
 

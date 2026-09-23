@@ -6,6 +6,26 @@ All notable changes to podlink are documented here. The format loosely follows
 ## [Unreleased]
 
 ### Added
+- **vLLM reranker backend** (`PODLINK_RERANK_BACKEND=tei|vllm`, default `tei`):
+  `start-reranker.sh` can run a second vLLM process (pooling runner) on :8081 for
+  LLM-based rerankers TEI cannot serve. Built-in preset for `Qwen/Qwen3-Reranker-*`
+  (hf-overrides + vendored `pod_image/templates/qwen3_reranker.jinja`); other models
+  via `PODLINK_RERANK_VLLM_EXTRA_ARGS`; sized by `PODLINK_RERANK_GPU_MEMORY_UTILIZATION`
+  (image default 0.12 — lower the LLM share to match). The stack test calls
+  `/v1/rerank` for it and the client `.env` block adds `RERANKER_API_FORMAT=cohere`;
+  preflight fails an unknown backend and warns on an un-preset model. Needs an image
+  built from this tree.
+- **In-pod auth proxy** (`pod_image/authproxy.py`, nginx, supervisord priority 5):
+  vLLM's `--api-key` guards only `/v1`, `/v2`, `/inference`, leaving root routes
+  (`/tokenize`, `/detokenize`, and on a pooling server `/rerank`, `/score`,
+  `/pooling`, `/classify`) open on the public proxy. vLLM now binds 127.0.0.1
+  (`:18000`, vLLM reranker `:18081`) and nginx owns public `:8000` (and `:8081` for
+  a vllm reranker), requiring the exact bearer (case-sensitive regex match) on every
+  path but `/health`. Fails closed on an empty/odd-shaped key; preflight fails a
+  bearer outside `[A-Za-z0-9._~+/=-]{16,}`. Verified live against nginx: root routes,
+  wrong/case-flipped/prefixed/suffixed bearers and `/health/../` traversal all 401;
+  SSE streams unbuffered.
+
 - **Profile switching from the console**: a profile dropdown above the pod
   selector (`GET /profiles`, `POST /profile/select`) switches the active stack
   for the NEXT POD UP without relaunching start.sh. Confs are parsed (shlex,
@@ -13,6 +33,14 @@ All notable changes to podlink are documented here. The format loosely follows
   while no pod exists, and pod_up's constants are re-baked via module reload.
 - `PODLINK_ADOPT_ON_START` (default on): a console start adopts a RUNNING pod with
   our name, so a restarted console shows the real state.
+
+### Changed
+- The RunPod provider's client `.env` block now delegates to the shared
+  `stack.client_env_block` (as GCP does) — output byte-identical, now pinned by test.
+- `start-vllm.sh` / `start-reranker.sh`: a non-integer wait (`VLLM_WAIT_FOR_TEI_S`,
+  `RERANK_WAIT_FOR_EMBEDDER_S`) falls back to 1200 s with a warning instead of
+  silently skipping the wait. New passthroughs `PODLINK_RERANK_MAX_MODEL_LEN`,
+  `PODLINK_RERANK_WAIT_FOR_EMBEDDER_S`.
 
 ### Fixed
 - **Pod image start order** (`pod_image/`): the two TEI services now start before

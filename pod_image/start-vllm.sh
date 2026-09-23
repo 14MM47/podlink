@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Launch vLLM (the LLM service) on :8000, OpenAI-compatible /v1.
+# Launch vLLM (the LLM service), OpenAI-compatible /v1. It binds 127.0.0.1:18000;
+# the public :8000 is the authproxy (nginx), which requires the bearer on every
+# path but /health — vLLM's own --api-key leaves root routes like /tokenize open.
 #
 # The vLLM API key is read by vLLM natively from $VLLM_API_KEY — we deliberately
 # do NOT pass --api-key on argv, so the token never shows up in `ps aux` inside
@@ -35,6 +37,12 @@ fi
 # So wait for both /health endpoints on localhost, bounded by VLLM_WAIT_FOR_TEI_S
 # (default 20 min, 0 = don't wait); after that start anyway and say so in the log.
 wait_s="${VLLM_WAIT_FOR_TEI_S:-1200}"
+# Integer seconds only: a typo like "off" would otherwise compare as 0 and skip
+# the wait this exists for. Fall back to the default and say so.
+if ! [[ "${wait_s}" =~ ^[0-9]+$ ]]; then
+  echo "[start-vllm] WARNING: VLLM_WAIT_FOR_TEI_S='${wait_s}' is not integer seconds; using 1200" >&2
+  wait_s=1200
+fi
 if [[ "${wait_s}" != "0" ]]; then
   auth=()
   if [[ -n "${TEI_API_KEY:-}" ]]; then auth=(-H "Authorization: Bearer ${TEI_API_KEY}"); fi
@@ -63,6 +71,6 @@ exec vllm serve "${LLM_MODEL_ID}" \
   "${QUANT_FLAG[@]}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.70}" \
   --max-model-len "${MAX_MODEL_LEN:-32768}" \
-  --host 0.0.0.0 \
-  --port 8000 \
+  --host 127.0.0.1 \
+  --port 18000 \
   "${EXTRA_ARGS[@]}"

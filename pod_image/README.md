@@ -5,9 +5,9 @@ One Docker image that runs **three co-resident services** on a single RTX Pro 60
 
 | Port | Service | Endpoints podlink gates on |
 |------|---------|----------------------------|
-| 8000 | vLLM (LLM), served as `$LLM_SERVED_NAME` (default `llm`) | `GET /v1/models` → 200 |
+| 8000 | vLLM (LLM), served as `$LLM_SERVED_NAME` (default `llm`), behind the authproxy | `GET /v1/models` → 200 |
 | 8080 | TEI embedder | `GET /health` → 200 |
-| 8081 | TEI reranker | `GET /health` → 200 |
+| 8081 | reranker — TEI (default) or vLLM pooling (`RERANK_BACKEND=vllm`, behind the authproxy) | `GET /health` → 200 |
 
 `supervisord` supervises all three, starting the two TEI services first; `start-vllm.sh`
 waits for both `/health` endpoints (up to `VLLM_WAIT_FOR_TEI_S`, default 1200 s, `0` to
@@ -61,6 +61,22 @@ podlink's `create_pod` passes these as env — you don't set them here:
 | `VLLM_API_KEY` | vLLM bearer (read natively by vLLM; never on argv) |
 | `TEI_API_KEY` | gates both TEI services; the wrappers `export API_KEY=$TEI_API_KEY` so TEI reads it from env (not argv). Same value as the vLLM bearer. |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | weight-pull token, seen by all three services |
+| `RERANK_BACKEND` | `tei` (default) or `vllm` — which server `start-reranker.sh` runs on :8081 |
+| `RERANK_GPU_MEMORY_UTILIZATION`, `RERANK_MAX_MODEL_LEN` | vLLM reranker sizing (defaults 0.12 / 4096); `vllm` backend only. Lower the LLM's `GPU_MEMORY_UTILIZATION` to make room |
+| `RERANK_VLLM_EXTRA_ARGS` | extra `vllm serve` flags for rerankers without a built-in preset (space-split). `Qwen/Qwen3-Reranker-*` has a preset (hf-overrides + `templates/qwen3_reranker.jinja`) |
+| `RERANK_WAIT_FOR_EMBEDDER_S` | how long the vLLM reranker waits for the embedder's `/health` before profiling memory (default 1200, `0` = don't wait) |
+
+**Auth proxy (nginx, `authproxy.py`):** vLLM's `--api-key` guards only `/v1`,
+`/v2` and `/inference` paths (v0.25.1 `serve/utils/server_utils.py`); its root
+`/tokenize`, `/detokenize`, `/rerank`, `/score`, `/pooling`, `/classify` answer
+without the bearer. So every vLLM process binds `127.0.0.1` (LLM `:18000`, vLLM
+reranker `:18081`) and nginx owns the public port, returning **401** on every path
+except `/health` unless `Authorization: Bearer <VLLM_API_KEY>` matches exactly
+(case-sensitive). It runs first under supervisord, renders its config from
+`VLLM_API_KEY` into `/run/podlink/nginx.conf` (0600), and **fails closed**: an empty
+key, or one that is not >=16 chars of `[A-Za-z0-9._~+/=-]`, means no proxy and so
+no public LLM port (podlink's preflight checks the same rule). TEI ports are not
+fronted — TEI gates all of its own routes. Responses stream through unbuffered.
 
 `--served-model-name` comes from `LLM_SERVED_NAME` (podlink passes it from
 `PODLINK_LLM_SERVED_NAME`); a client's `LLM_MODEL` must match it.

@@ -15,6 +15,10 @@ Local modifications:
   terminate releases the GPU cleanly and the Network Volume keeps the weights.
   `pod_up.py` reads the volume id from `PODLINK_NETWORK_VOLUME_ID` (empty => a
   pod-scoped Data Volume that is destroyed on terminate).
+- `pod_up.py` gained `RERANK_BACKEND` (`PODLINK_RERANK_BACKEND`, tei|vllm) and the
+  `RERANK_GPU_MEMORY_UTILIZATION` / `RERANK_VLLM_EXTRA_ARGS` / `RERANK_MAX_MODEL_LEN` /
+  `RERANK_WAIT_FOR_EMBEDDER_S` passthroughs, mirroring
+  `app/stack.py` (vLLM reranker backend, 2026-09).
 
 | File | Role |
 |------|------|

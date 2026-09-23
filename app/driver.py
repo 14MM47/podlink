@@ -376,7 +376,8 @@ def test_stack(session: PodSession) -> None:
     pass/fail + latency (and the embedding dimension) into session.test_result.
 
     Uses the same endpoints a RAG client will: vLLM OpenAI-compat
-    /v1/chat/completions, TEI OpenAI-compat /v1/embeddings, and TEI native /rerank.
+    /v1/chat/completions, TEI OpenAI-compat /v1/embeddings, and the reranker (TEI
+    native /rerank, or vLLM /v1/rerank when the stack's rerank_backend is vllm).
     Runs in a background thread (launched by /pod/test)."""
     try:
         pod_id = session.pod_id
@@ -384,7 +385,7 @@ def test_stack(session: PodSession) -> None:
             session.update(test_running=False, test_result={"error": "no pod running"})
             return
         provider = active_provider()
-        stack = provider.stack_config()                  # served name + embed model id
+        stack = provider.stack_config()                  # served name + rerank backend
         bearer = read_secret(_secrets.bearer_token)      # gates all three services
         auth = {"Authorization": f"Bearer {bearer}"}
         urls = provider.service_urls(pod_id)
@@ -417,14 +418,26 @@ def test_stack(session: PodSession) -> None:
             f"stack test — embedder {'ok' if ok else 'FAIL'} {ms}ms"
             f"{f' ({dim}-dim)' if dim else ''}", "health")
 
-        # 3) Reranker — TEI native /rerank (query + candidate texts).
-        ok, ms, status, data = _timed_post(
-            f"{urls['reranker']}/rerank", auth,
-            {"query": "what does podlink do",
-             "texts": ["podlink controls a GPU pod", "an unrelated sentence"]})
+        # 3) Reranker — TEI native /rerank {query, texts}, or for the vllm backend
+        #    Cohere-style /v1/rerank {query, documents} (the /v1 path is the one
+        #    vLLM's bearer check covers — its root /rerank is unauthenticated).
+        rerank_query = "what does podlink do"
+        rerank_docs = ["podlink controls a GPU pod", "an unrelated sentence"]
+        vllm_rerank = stack.get("rerank_backend") == "vllm"
+        if vllm_rerank:
+            ok, ms, status, data = _timed_post(
+                f"{urls['reranker']}/v1/rerank", auth,
+                {"query": rerank_query, "documents": rerank_docs})
+        else:
+            ok, ms, status, data = _timed_post(
+                f"{urls['reranker']}/rerank", auth,
+                {"query": rerank_query, "texts": rerank_docs})
         top = None
         try:
-            top = round(max(x["score"] for x in data), 3)  # TEI returns [{index, score}, ...]
+            if vllm_rerank:                                  # {results: [{index, relevance_score}]}
+                top = round(max(x["relevance_score"] for x in data["results"]), 3)
+            else:                                            # TEI returns [{index, score}, ...]
+                top = round(max(x["score"] for x in data), 3)
         except Exception:  # noqa: BLE001
             pass
         services["reranker"] = {"ok": ok, "latency_ms": ms,

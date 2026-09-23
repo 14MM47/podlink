@@ -889,6 +889,144 @@ def test_create_non_retryable_error_surfaces():
         (rp.pod_up.create_pod_once, rp.pod_up.ensure_template, rp.pod_up.resolve_gpu_id) = saved
 
 
+# --- reranker backend (tei | vllm on :8081) ---------------------------------
+
+
+def test_rerank_backend_default_agrees_with_pod_up():
+    # The tei default is duplicated in pod_up (minimal-edit vendored copy); pin it.
+    from app import stack
+    import os as _os
+    assert "PODLINK_RERANK_BACKEND" not in _os.environ, "backend set in the test env"
+    check("rerank backend default == pod_up's", stack.DEFAULT_RERANK_BACKEND == rp.pod_up.RERANK_BACKEND)
+    check("stack.from_env() reports tei by default", stack.from_env()["rerank_backend"] == "tei")
+
+
+def test_tei_backend_env_and_client_block_unchanged():
+    # A tei stack must produce exactly the pre-option env + client block: no
+    # RERANK_* keys in the container, no RERANKER_API_FORMAT line for the client.
+    from app import stack
+    st = stack.from_env()
+    env = stack.container_env(st, "B", "H")
+    check("tei: no RERANK_* passthroughs in container env",
+          not any(k.startswith("RERANK_") and k != "RERANK_MODEL_ID" for k in env))
+    urls = {"llm": "L", "embedder": "E", "reranker": "R"}
+    check("tei: client block has no RERANKER_API_FORMAT",
+          "RERANKER_API_FORMAT" not in stack.client_env_block(urls, st, 4096))
+    check("tei: runpod client block has no RERANKER_API_FORMAT",
+          "RERANKER_API_FORMAT" not in rp.PROVIDER().client_env("podX", 4096))
+
+
+def test_vllm_backend_env_passthroughs_and_client_format():
+    # vllm backend: RERANK_BACKEND + the optional sizing/flag passthroughs reach
+    # the container (both the neutral contract and pod_up), and the client block
+    # tells the RAG app to speak the Cohere-style format.
+    import os as _os
+    from app import stack
+    keys = {"PODLINK_RERANK_BACKEND": "VLLM",               # case-insensitive
+            "PODLINK_RERANK_GPU_MEMORY_UTILIZATION": "0.12",
+            "PODLINK_RERANK_VLLM_EXTRA_ARGS": "--foo=1",
+            "PODLINK_RERANK_MAX_MODEL_LEN": "8192",
+            "PODLINK_RERANK_WAIT_FOR_EMBEDDER_S": "600"}
+    saved_backend = rp.pod_up.RERANK_BACKEND
+    _os.environ.update(keys)
+    rp.pod_up.RERANK_BACKEND = "vllm"                      # import-time constant in pod_up
+    try:
+        st = stack.from_env()
+        env = stack.container_env(st, "B", "H")
+        check("vllm: backend normalised to lower case", st["rerank_backend"] == "vllm")
+        check("vllm: RERANK_BACKEND sent", env.get("RERANK_BACKEND") == "vllm")
+        check("vllm: reranker gpu share sent", env.get("RERANK_GPU_MEMORY_UTILIZATION") == "0.12")
+        check("vllm: reranker extra args sent", env.get("RERANK_VLLM_EXTRA_ARGS") == "--foo=1")
+        check("vllm: reranker max len sent", env.get("RERANK_MAX_MODEL_LEN") == "8192")
+        check("vllm: reranker embedder wait sent", env.get("RERANK_WAIT_FOR_EMBEDDER_S") == "600")
+        check("vllm: container env keys == pod_up's", set(env) == set(rp.pod_up._pod_env("B", "H")))
+        urls = {"llm": "L", "embedder": "E", "reranker": "R"}
+        check("vllm: client block says cohere",
+              "RERANKER_API_FORMAT=cohere" in stack.client_env_block(urls, st, 4096))
+        check("vllm: runpod client block says cohere",
+              "RERANKER_API_FORMAT=cohere" in rp.PROVIDER().client_env("podX", 4096))
+        check("vllm: runpod stack_config reports the backend",
+              rp.PROVIDER().stack_config()["rerank_backend"] == "vllm")
+    finally:
+        for k in keys:
+            _os.environ.pop(k, None)
+        rp.pod_up.RERANK_BACKEND = saved_backend
+
+
+def test_stack_test_uses_v1_rerank_for_vllm_backend():
+    # With the vllm backend the stack test must hit the bearer-guarded /v1/rerank
+    # with a `documents` body and parse results[].relevance_score.
+    seen = {}
+    def responder(url, body):
+        if "chat/completions" in url:
+            return (200, {"choices": [{"message": {"content": "pong"}}]})
+        if "embeddings" in url:
+            return (200, {"data": [{"embedding": [0.0] * 4096}]})
+        if "rerank" in url:
+            seen["url"], seen["body"] = url, body
+            return (200, {"results": [{"index": 0, "relevance_score": 0.87},
+                                      {"index": 1, "relevance_score": 0.01}]})
+        return (404, None)
+    install_fake_post(responder)
+    saved_backend = rp.pod_up.RERANK_BACKEND
+    rp.pod_up.RERANK_BACKEND = "vllm"
+    try:
+        s = PodSession(); s.try_begin_start(None); s.state = State.RUNNING; s.pod_id = "podABC"
+        rd.test_stack(s)
+    finally:
+        rp.pod_up.RERANK_BACKEND = saved_backend
+    check("vllm stack test posts to /v1/rerank", seen.get("url", "").endswith("/v1/rerank"))
+    check("vllm stack test sends documents, not texts",
+          "documents" in seen.get("body", {}) and "texts" not in seen.get("body", {}))
+    check("vllm stack test parses relevance_score", "0.87" in s.test_result["services"]["reranker"]["detail"])
+    check("vllm stack test all_ok", s.test_result["all_ok"] is True)
+
+
+def test_preflight_stack_rows():
+    # Bad backend = hard fail; vllm + preset model = ok; vllm + unknown model with
+    # no extra args = warn; tei = ok.
+    from app import preflight
+    levels = lambda st: [lvl for lvl, _ in preflight._stack_rows(st)]  # noqa: E731
+    check("preflight fails an unknown backend", levels({"rerank_backend": "onnx"}) == ["fail"])
+    check("preflight ok for tei", levels({"rerank_backend": "tei"}) == ["ok"])
+    check("preflight ok for vllm + Qwen3-Reranker preset",
+          levels({"rerank_backend": "vllm", "rerank_model_id": "Qwen/Qwen3-Reranker-4B"}) == ["ok"])
+    check("preflight warns vllm + un-preset model without extra args",
+          levels({"rerank_backend": "vllm", "rerank_model_id": "zeroentropy/zerank-2"}) == ["ok", "warn"])
+    check("preflight ok vllm + un-preset model WITH extra args",
+          levels({"rerank_backend": "vllm", "rerank_model_id": "zeroentropy/zerank-2",
+                  "rerank_vllm_extra_args": "--convert=classify"}) == ["ok"])
+
+
+def test_runpod_client_block_pinned():
+    # The RunPod provider now delegates to stack.client_env_block; pin the exact
+    # text a user copies so neither path can drift (tei, then vllm).
+    base = "\n".join([
+        "LLM_BASE_URL=https://podX-8000.proxy.runpod.net/v1",
+        "LLM_MODEL=llm",
+        "LLM_API_KEY=<your pod_bearer_token>",
+        "EMBEDDING_BASE_URL=https://podX-8080.proxy.runpod.net/v1",
+        "EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B",
+        "EMBEDDING_DIMENSIONS=4096",
+        "EMBEDDING_API_KEY=<your pod_bearer_token>",
+        "RERANKER_PROVIDER=api",
+        "RERANKER_BASE_URL=https://podX-8081.proxy.runpod.net",
+        "RERANKER_API_KEY=<your pod_bearer_token>",
+    ])
+    tail = "\nKG_EXTRACTION_CONCURRENCY=10"
+    saved_backend = rp.pod_up.RERANK_BACKEND
+    try:
+        rp.pod_up.RERANK_BACKEND = "tei"
+        check("runpod tei block exact", rp.PROVIDER().client_env("podX", 4096) == base + tail)
+        rp.pod_up.RERANK_BACKEND = "vllm"
+        check("runpod vllm block exact",
+              rp.PROVIDER().client_env("podX", 4096) == base + "\nRERANKER_API_FORMAT=cohere" + tail)
+        check("runpod block without dim keeps the detect hint",
+              "# EMBEDDING_DIMENSIONS=  <- run 'Test stack'" in rp.PROVIDER().client_env("podX", None))
+    finally:
+        rp.pod_up.RERANK_BACKEND = saved_backend
+
+
 if __name__ == "__main__":
     print("driver smoke tests:")
     test_gql_escape_env_makes_json_values_safe()
@@ -933,4 +1071,10 @@ if __name__ == "__main__":
     test_stack_probes_all_three_and_detects_dim()
     test_stack_flags_service_failure()
     test_create_non_retryable_error_surfaces()
+    test_rerank_backend_default_agrees_with_pod_up()
+    test_tei_backend_env_and_client_block_unchanged()
+    test_vllm_backend_env_passthroughs_and_client_format()
+    test_stack_test_uses_v1_rerank_for_vllm_backend()
+    test_preflight_stack_rows()
+    test_runpod_client_block_pinned()
     print("all driver smoke tests passed.")

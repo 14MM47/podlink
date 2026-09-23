@@ -23,6 +23,7 @@ import sys        # reach the already-imported pod_up module for reload
 # Importing vendored puts pod_control/ on sys.path, which `import pod_up` below
 # relies on — so it must come first.
 from ...vendored import _secrets, read_secret
+from ... import stack as stack_contract  # cloud-neutral image env contract + client .env block
 
 import runpod                        # noqa: E402  RunPod SDK
 from runpod.error import QueryError  # noqa: E402  raised by create_pod on the capacity lottery
@@ -205,6 +206,7 @@ class RunPodProvider:
             "rerank_model_id": pod_up.RERANK_MODEL_ID,
             "max_model_len": pod_up.MAX_MODEL_LEN,
             "gpu_memory_utilization": pod_up.GPU_MEMORY_UTILIZATION,
+            "rerank_backend": pod_up.RERANK_BACKEND,     # decides the stack test's rerank call
         }
 
     def client_env(self, instance_id: str, embedding_dim: int | None) -> str:
@@ -212,22 +214,10 @@ class RunPodProvider:
         bearer left as a PLACEHOLDER (never the real secret — it must not reach the
         browser). Paste your pod_bearer_token where marked. EMBEDDING_DIMENSIONS is
         left for 'Test stack' to detect, since it depends on what the embedder serves."""
-        urls = self.service_urls(instance_id)
-        dim_line = (f"EMBEDDING_DIMENSIONS={embedding_dim}" if embedding_dim
-                    else "# EMBEDDING_DIMENSIONS=  <- run 'Test stack' to detect the served dimension")
-        return "\n".join([
-            f"LLM_BASE_URL={urls['llm']}/v1",
-            f"LLM_MODEL={pod_up.LLM_SERVED_NAME}",
-            "LLM_API_KEY=<your pod_bearer_token>",
-            f"EMBEDDING_BASE_URL={urls['embedder']}/v1",
-            f"EMBEDDING_MODEL={pod_up.EMBED_MODEL_ID}",
-            dim_line,
-            "EMBEDDING_API_KEY=<your pod_bearer_token>",
-            "RERANKER_PROVIDER=api",
-            f"RERANKER_BASE_URL={urls['reranker']}",
-            "RERANKER_API_KEY=<your pod_bearer_token>",
-            "KG_EXTRACTION_CONCURRENCY=10",
-        ])
+        # Delegates to the shared block (as the GCP provider does) so the two
+        # clouds can never emit different client configs.
+        return stack_contract.client_env_block(
+            self.service_urls(instance_id), self.stack_config(), embedding_dim)
 
     def preflight(self) -> list[tuple[str, str]]:
         """RunPod-specific launch checks: the API key, the image, the volume mode.

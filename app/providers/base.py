@@ -190,7 +190,8 @@ class Provider(Protocol):
         """Base URLs keyed llm / embedder / reranker. Cheap and pure."""
 
     def stack_config(self) -> dict:
-        """{"llm_served_name": …, "embed_model_id": …} for the stack test."""
+        """{"llm_served_name": …, "embed_model_id": …, "rerank_backend": …} for the
+        stack test and preflight. A missing rerank_backend means "tei"."""
 
     def client_env(self, instance_id: str, embedding_dim: int | None) -> str:
         """The RAG-client .env block for this instance.

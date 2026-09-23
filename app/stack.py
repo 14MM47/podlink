@@ -24,6 +24,10 @@ DEFAULT_RERANK_MODEL_ID = "BAAI/bge-reranker-v2-m3"
 DEFAULT_LLM_SERVED_NAME = "llm"
 DEFAULT_MAX_MODEL_LEN = 32768
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.70
+# Which server runs on the reranker port: "tei" (native /rerank) or "vllm"
+# (pooling runner, Cohere-style /v1/rerank — needed for LLM-based rerankers).
+DEFAULT_RERANK_BACKEND = "tei"
+RERANK_BACKENDS = ("tei", "vllm")
 
 
 def from_env() -> dict:
@@ -40,6 +44,13 @@ def from_env() -> dict:
             os.environ.get("PODLINK_GPU_MEMORY_UTILIZATION", str(DEFAULT_GPU_MEMORY_UTILIZATION))),
         "vllm_extra_args": os.environ.get("PODLINK_VLLM_EXTRA_ARGS", "").strip(),
         "pytorch_cuda_alloc_conf": os.environ.get("PODLINK_PYTORCH_CUDA_ALLOC_CONF", "").strip(),
+        # Lower-cased so "VLLM" works; validity is a preflight row, not a crash here.
+        "rerank_backend": (os.environ.get("PODLINK_RERANK_BACKEND", "").strip().lower()
+                           or DEFAULT_RERANK_BACKEND),
+        "rerank_gpu_memory_utilization": os.environ.get("PODLINK_RERANK_GPU_MEMORY_UTILIZATION", "").strip(),
+        "rerank_vllm_extra_args": os.environ.get("PODLINK_RERANK_VLLM_EXTRA_ARGS", "").strip(),
+        "rerank_max_model_len": os.environ.get("PODLINK_RERANK_MAX_MODEL_LEN", "").strip(),
+        "rerank_wait_for_embedder_s": os.environ.get("PODLINK_RERANK_WAIT_FOR_EMBEDDER_S", "").strip(),
     }
 
 
@@ -67,7 +78,24 @@ def container_env(stack: dict, bearer: str, hf: str) -> dict[str, str]:
         env["VLLM_EXTRA_ARGS"] = stack["vllm_extra_args"]
     if stack["pytorch_cuda_alloc_conf"]:
         env["PYTORCH_CUDA_ALLOC_CONF"] = stack["pytorch_cuda_alloc_conf"]
+    # Reranker backend: only sent when it differs from the image default (tei),
+    # so a tei stack's env is byte-identical to before the option existed.
+    if stack["rerank_backend"] != DEFAULT_RERANK_BACKEND:
+        env["RERANK_BACKEND"] = stack["rerank_backend"]
+    if stack["rerank_gpu_memory_utilization"]:
+        env["RERANK_GPU_MEMORY_UTILIZATION"] = stack["rerank_gpu_memory_utilization"]
+    if stack["rerank_vllm_extra_args"]:
+        env["RERANK_VLLM_EXTRA_ARGS"] = stack["rerank_vllm_extra_args"]
+    if stack["rerank_max_model_len"]:
+        env["RERANK_MAX_MODEL_LEN"] = stack["rerank_max_model_len"]
+    if stack["rerank_wait_for_embedder_s"]:
+        env["RERANK_WAIT_FOR_EMBEDDER_S"] = stack["rerank_wait_for_embedder_s"]
     return env
+
+
+def rerank_api_format(backend: str) -> str:
+    """The client-side wire format for a reranker backend: TEI native or Cohere-style."""
+    return "cohere" if backend == "vllm" else "tei"
 
 
 def client_env_block(urls: dict[str, str], stack: dict, embedding_dim: int | None) -> str:
@@ -90,5 +118,8 @@ def client_env_block(urls: dict[str, str], stack: dict, embedding_dim: int | Non
         "RERANKER_PROVIDER=api",
         f"RERANKER_BASE_URL={urls['reranker']}",
         "RERANKER_API_KEY=<your pod_bearer_token>",
+        # Only a vllm backend changes the wire format; tei blocks stay as before.
+        *([f"RERANKER_API_FORMAT={rerank_api_format(stack['rerank_backend'])}"]
+          if stack.get("rerank_backend", DEFAULT_RERANK_BACKEND) != DEFAULT_RERANK_BACKEND else []),
         "KG_EXTRACTION_CONCURRENCY=10",
     ])
