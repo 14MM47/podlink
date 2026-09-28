@@ -14,7 +14,13 @@
 VOL_FILE="${CONFIG_DIR}/network_volume_id"     # the id is infra, not a secret
 
 volume=""
-if [[ "${PODLINK_NETWORK_VOLUME_ID:-}" =~ ^[Nn][Oo][Nn][Ee]$ ]]; then
+if [[ -n "${PODLINK_GPU_LADDER:-}" ]]; then
+  # A ladder names its volume per rung (match|min_vram|count|volume…); the
+  # single-card variable is irrelevant, so never prompt for it.
+  say "Network volume: per ladder rung (PODLINK_GPU_LADDER) — see the preflight's rung rows."
+  export PODLINK_NETWORK_VOLUME_ID=""
+  return 0 2>/dev/null || true
+elif [[ "${PODLINK_NETWORK_VOLUME_ID:-}" =~ ^[Nn][Oo][Nn][Ee]$ ]]; then
   say "Network volume: none (explicit) — Data-Volume mode, weights re-download each POD UP."
 elif [[ -n "${PODLINK_NETWORK_VOLUME_ID:-}" ]]; then
   volume="${PODLINK_NETWORK_VOLUME_ID}"

@@ -34,6 +34,7 @@ export PODLINK_GPU_LADDER="RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|8q3v00u8os|1
 #   rung 1: one look for 3090s · rung 2: one look for PRO 4500s in EU-RO-1, on the existing
 #   ragline-weights volume (US-KS-2, the DC that has them, has NO network-volume support) ·
 #   rung 3: PRO 4500s anywhere, pod-scoped scratch, the 40 x 15 s loop
+export PODLINK_NETWORK_VOLUME_ID=none                  # volumes are per rung (above); skips the launcher prompt
 export PODLINK_VOLUME_GB=80                            # pod-scoped scratch for volume-less rungs
 export PODLINK_POD_NAME=podlink-ragline-3090          # its own pod: never adopts the prod pod
 

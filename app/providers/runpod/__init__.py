@@ -37,6 +37,11 @@ def normalise_env(env: dict[str, str]) -> dict[str, str]:
     unset with no file is empty. Mirrors app/providers/runpod/launch.sh, so the
     console's profile switch and a fresh launch agree on the volume.
     """
+    if env.get("PODLINK_GPU_LADDER", "").strip():
+        # Volumes are per rung; the single-card variable must not inherit the
+        # saved id (launch.sh does the same).
+        env["PODLINK_NETWORK_VOLUME_ID"] = ""
+        return env
     vol = env.get("PODLINK_NETWORK_VOLUME_ID")
     if vol is None and VOL_FILE.is_file():
         vol = VOL_FILE.read_text()
