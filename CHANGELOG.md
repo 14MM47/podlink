@@ -92,6 +92,8 @@ All notable changes to podlink are documented here. The format loosely follows
   `PODLINK_RERANK_WAIT_FOR_EMBEDDER_S`.
 
 ### Fixed
+- The resume event no longer says "no image pull": a pod stopped before its first
+  image pull finished resumes that pull (seen live), so the claim could be false.
 - **Pod image start order** (`pod_image/`): the two TEI services now start before
   vLLM, and `start-vllm.sh` waits for both `/health` endpoints (bounded by
   `VLLM_WAIT_FOR_TEI_S`, default 20 min) before vLLM profiles its KV cache. This

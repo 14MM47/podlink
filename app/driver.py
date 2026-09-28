@@ -402,8 +402,9 @@ def _resume_with_retries(session: PodSession, provider, instance) -> bool | str 
                                   "stopping it again", "lifecycle")
                 provider.stop(pod_id)
             else:
-                session.add_event(f"resumed on the original host (attempt {attempt}) — "
-                                  "no image pull", "lifecycle")
+                # No "no image pull" claim: a pod stopped before its first image
+                # pull finished resumes the pull (seen live 2026-09-24).
+                session.add_event(f"resumed on the original host (attempt {attempt})", "lifecycle")
                 return True
         if attempt < retries and _sleep_or_cancel(session, delay):
             return None

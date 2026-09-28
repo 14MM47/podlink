@@ -202,7 +202,8 @@ def test_up_resumes_first_try():
         check("resume: RUNNING", s.snapshot()["state"] == "RUNNING")
         check("resume: same pod, no create", s.pod_id == "pod1" and store.created == 0)
         check("resume: one resume call", store.verbs() == ["resume"])
-        check("resume: feed says no image pull", "no image pull" in _events(s))
+        check("resume: feed says resumed on the original host", "resumed on the original host" in _events(s))
+        check("resume: feed makes no image-pull promise", "image pull" not in _events(s))
     finally:
         teardown()
 
