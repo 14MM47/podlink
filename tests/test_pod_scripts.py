@@ -35,7 +35,11 @@ IMAGE = ROOT / "pod_image"
 _STUB = ('#!/bin/bash\necho "{name} ARGV:"\nfor a in "$@"; do printf "[%s]\\n" "$a"; done\n'
          'echo "ENV LOG_LEVEL=${{LOG_LEVEL-<unset>}}"\n'
          'echo "ENV VLLM_CACHE_ROOT=${{VLLM_CACHE_ROOT-<unset>}}"\n'
-         'echo "ENV TRITON_CACHE_DIR=${{TRITON_CACHE_DIR-<unset>}}"\n')
+         'echo "ENV TRITON_CACHE_DIR=${{TRITON_CACHE_DIR-<unset>}}"\n'
+         'echo "ENV CUDA_VISIBLE_DEVICES=${{CUDA_VISIBLE_DEVICES-<unset>}}"\n')
+# Stub nvidia-smi: reports FAKE_COMPUTE_CAP (nothing when unset, like a host
+# without a GPU), so the arch-dependent paths are exercised deterministically.
+_NVSMI = '#!/bin/bash\n[[ -n "${FAKE_COMPUTE_CAP:-}" ]] && echo "$FAKE_COMPUTE_CAP"\nexit 0\n'
 
 
 def check(name, cond):
@@ -55,6 +59,9 @@ def _run(script: str, env: dict[str, str]) -> subprocess.CompletedProcess:
         curl = Path(d, "curl")
         curl.write_text("#!/bin/bash\nexit 0\n")
         curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
+        nvsmi = Path(d, "nvidia-smi")
+        nvsmi.write_text(_NVSMI)
+        nvsmi.chmod(nvsmi.stat().st_mode | stat.S_IEXEC)
         # One /health probe at most, so the cache helper's detached watcher can't
         # outlive the test by long (the real default is an hour of probes).
         full = {"PATH": f"{d}:{os.environ['PATH']}", "PODLINK_CACHE_HEALTH_TRIES": "1", **env}
@@ -169,6 +176,77 @@ def test_cache_self_heals_after_a_start_that_never_became_healthy():
         check("marker cleared once /health answers", not (root / ".start-in-progress").exists())
 
 
+def test_gpu_pinning_exports_cuda_visible_devices():
+    # *_GPUS from the pod env becomes CUDA_VISIBLE_DEVICES for that service only;
+    # unset leaves it alone (single-GPU pods behave exactly as before).
+    r = _run("start-vllm.sh", {"LLM_MODEL_ID": "m", "VLLM_WAIT_FOR_TEI_S": "0"})
+    check("start-vllm: no LLM_GPUS -> CUDA_VISIBLE_DEVICES untouched", "ENV CUDA_VISIBLE_DEVICES=<unset>" in r.stdout)
+    r = _run("start-vllm.sh", {"LLM_MODEL_ID": "m", "VLLM_WAIT_FOR_TEI_S": "0", "LLM_GPUS": "0"})
+    check("start-vllm: LLM_GPUS=0 -> CUDA_VISIBLE_DEVICES=0", "ENV CUDA_VISIBLE_DEVICES=0" in r.stdout
+          and "pinned to GPU(s) 0" in r.stdout)
+    r = _run("start-embedder.sh", {"EMBED_MODEL_ID": "m", "TEI_API_KEY": "k", "EMBED_GPUS": "1"})
+    check("start-embedder: EMBED_GPUS=1 -> CUDA_VISIBLE_DEVICES=1", "ENV CUDA_VISIBLE_DEVICES=1" in r.stdout)
+    r = _run("start-reranker.sh", {"RERANK_MODEL_ID": "m", "TEI_API_KEY": "k", "RERANK_GPUS": "1"})
+    check("start-reranker(tei): RERANK_GPUS=1 -> CUDA_VISIBLE_DEVICES=1", "ENV CUDA_VISIBLE_DEVICES=1" in r.stdout)
+    r = _run("start-reranker.sh", {"RERANK_BACKEND": "vllm", "RERANK_MODEL_ID": "x", "VLLM_API_KEY": "k",
+                                   "RERANK_WAIT_FOR_EMBEDDER_S": "0", "RERANK_GPUS": "1"})
+    check("start-reranker(vllm): RERANK_GPUS=1 -> CUDA_VISIBLE_DEVICES=1", "ENV CUDA_VISIBLE_DEVICES=1" in r.stdout)
+
+
+def _tei_bin_dir(d: str, arches=("sm120", "sm86")) -> str:
+    """A fake /usr/local/bin holding one stub router per arch, each naming itself."""
+    for arch in arches:
+        p = Path(d, f"text-embeddings-router-{arch}")
+        p.write_text(f'#!/bin/bash\necho "tei-{arch} ARGV:"\nfor a in "$@"; do printf "[%s]\\n" "$a"; done\n')
+        p.chmod(p.stat().st_mode | stat.S_IEXEC)
+    return d
+
+
+def test_tei_router_chosen_by_compute_capability():
+    # The image bundles one TEI build per arch; the wrappers pick by nvidia-smi's
+    # compute_cap, TEI_ARCH forces one, an unbundled card is a loud error, and a
+    # single-arch image (no -<arch> binaries) keeps using the PATH router.
+    base = {"EMBED_MODEL_ID": "m", "TEI_API_KEY": "k"}
+    with tempfile.TemporaryDirectory() as bins:
+        _tei_bin_dir(bins)
+        r = _run("start-embedder.sh", {**base, "PODLINK_TEI_BIN_DIR": bins, "FAKE_COMPUTE_CAP": "8.6"})
+        check("embedder: cap 8.6 -> sm86 router", "tei-sm86 ARGV:" in r.stdout and "TEI build: sm86" in r.stderr)
+        r = _run("start-embedder.sh", {**base, "PODLINK_TEI_BIN_DIR": bins, "FAKE_COMPUTE_CAP": "12.0"})
+        check("embedder: cap 12.0 -> sm120 router", "tei-sm120 ARGV:" in r.stdout)
+        r = _run("start-embedder.sh", {**base, "PODLINK_TEI_BIN_DIR": bins, "FAKE_COMPUTE_CAP": "8.9"})
+        check("embedder: cap 8.9 (Ada) -> sm86 router", "tei-sm86 ARGV:" in r.stdout)
+        r = _run("start-embedder.sh", {**base, "PODLINK_TEI_BIN_DIR": bins, "FAKE_COMPUTE_CAP": "8.6",
+                                       "TEI_ARCH": "sm120"})
+        check("embedder: TEI_ARCH overrides detection", "tei-sm120 ARGV:" in r.stdout)
+        r = _run("start-embedder.sh", {**base, "PODLINK_TEI_BIN_DIR": bins, "FAKE_COMPUTE_CAP": "7.5"})
+        check("embedder: unbundled cap -> exit 1, no exec",
+              r.returncode != 0 and "ARGV:" not in r.stdout and "no bundled TEI build" in r.stderr)
+        r = _run("start-reranker.sh", {"RERANK_MODEL_ID": "m", "TEI_API_KEY": "k",
+                                       "PODLINK_TEI_BIN_DIR": bins, "FAKE_COMPUTE_CAP": "8.6"})
+        check("reranker(tei): cap 8.6 -> sm86 router", "tei-sm86 ARGV:" in r.stdout and "[--port]\n[8081]" in r.stdout)
+    with tempfile.TemporaryDirectory() as empty:
+        r = _run("start-embedder.sh", {**base, "PODLINK_TEI_BIN_DIR": empty, "FAKE_COMPUTE_CAP": "8.6"})
+        check("embedder: no per-arch binary -> PATH router + warning",
+              "text-embeddings-router ARGV:" in r.stdout and "using text-embeddings-router from PATH" in r.stderr)
+        r = _run("start-embedder.sh", {**base, "PODLINK_TEI_BIN_DIR": empty})
+        check("embedder: no GPU info -> PATH router, silently",
+              "text-embeddings-router ARGV:" in r.stdout and "WARNING" not in r.stderr)
+
+
+def test_compile_cache_path_carries_the_compute_capability():
+    # A volume shared by pods of different arches must never hand one the
+    # other's compiled graphs: the cache dir carries -sm<cap> when known.
+    with tempfile.TemporaryDirectory() as base:
+        env = {"LLM_MODEL_ID": "m", "VLLM_WAIT_FOR_TEI_S": "0", "PODLINK_CACHE_BASE": base}
+        r = _run("start-vllm.sh", {**env, "FAKE_COMPUTE_CAP": "8.6"})
+        check("cache dir carries -sm86", f"ENV VLLM_CACHE_ROOT={base}/start-vllm/vllm-" in r.stdout
+              and "-sm86\n" in r.stdout and f"TRITON_CACHE_DIR={base}/start-vllm/triton-" in r.stdout)
+        r = _run("start-vllm.sh", {**env, "FAKE_COMPUTE_CAP": "12.0"})
+        check("cache dir carries -sm120", "-sm120\n" in r.stdout)
+        r = _run("start-vllm.sh", env)
+        check("no GPU info -> no suffix (unchanged layout)", "-sm" not in r.stdout)
+
+
 def test_api_key_in_extra_args_is_refused():
     # vLLM logs non-default CLI args unredacted, so a key must never be on argv.
     r = _run("start-vllm.sh", {"LLM_MODEL_ID": "m", "VLLM_WAIT_FOR_TEI_S": "0",
@@ -196,5 +274,8 @@ if __name__ == "__main__":
     test_tei_logs_at_warn_so_the_key_never_prints()
     test_vllm_compile_caches_on_the_volume()
     test_cache_self_heals_after_a_start_that_never_became_healthy()
+    test_gpu_pinning_exports_cuda_visible_devices()
+    test_tei_router_chosen_by_compute_capability()
+    test_compile_cache_path_carries_the_compute_capability()
     test_api_key_in_extra_args_is_refused()
     print("all pod script tests passed.")

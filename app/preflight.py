@@ -15,7 +15,7 @@ import os
 import re
 import sys
 
-from . import providers
+from . import clientenv, providers
 from . import stack as stack_contract
 from .vendored import _secrets, read_secret
 
@@ -49,6 +49,52 @@ def _neutral_rows() -> list[tuple[str, str]]:
 
 # Rerankers start-reranker.sh has a built-in vllm preset for (hf-overrides + template).
 _VLLM_RERANK_PRESETS = ("Qwen/Qwen3-Reranker-",)
+
+# `--tensor-parallel-size N` / `--tensor-parallel-size=N` / `-tp N` in the extra vLLM args.
+_TP_RE = re.compile(r"(?:--tensor-parallel-size|-tp)(?:=|\s+)(\d+)")
+_PIN_KEYS = (("llm_gpus", "PODLINK_LLM_GPUS", "LLM"),
+             ("embed_gpus", "PODLINK_EMBED_GPUS", "embedder"),
+             ("rerank_gpus", "PODLINK_RERANK_GPUS", "reranker"))
+
+
+def _gpu_rows(stack: dict) -> list[tuple[str, str]]:
+    """Multi-GPU sanity: every pinned GPU index and any tensor-parallel size must
+    fit the instance's GPU count, or the service dies at boot on a billing pod
+    (CUDA_VISIBLE_DEVICES=1 on a one-GPU pod = no device). Only when the provider
+    reports a gpu_count; a multi-GPU pod with neither pinning nor TP gets a warning,
+    since every service would then land on GPU 0 and the others sit idle.
+    """
+    count = stack.get("gpu_count")
+    if not isinstance(count, int) or count < 1:
+        return []
+    rows: list[tuple[str, str]] = []
+    pinned = False
+    for key, var, label in _PIN_KEYS:
+        val = (stack.get(key) or "").strip()
+        if not val:
+            continue
+        pinned = True
+        try:
+            idx = [int(x) for x in val.split(",")]
+        except ValueError:
+            rows.append(("fail", f"{var}={val!r}: must be comma-separated GPU indices"))
+            continue
+        bad = [i for i in idx if i < 0 or i >= count]
+        if bad:
+            rows.append(("fail", f"{var}={val!r}: GPU index {bad[0]} does not exist on a "
+                                 f"{count}-GPU instance (indices 0..{count - 1})"))
+        else:
+            rows.append(("ok", f"{label} pinned to GPU {val}"))
+    tp = _TP_RE.search(stack.get("vllm_extra_args") or "")
+    if tp and int(tp.group(1)) > count:
+        rows.append(("fail", f"--tensor-parallel-size {tp.group(1)} needs more GPUs than the "
+                             f"instance has ({count})"))
+    elif tp:
+        rows.append(("ok", f"LLM tensor-parallel across {tp.group(1)} GPUs"))
+    if count > 1 and not pinned and not tp:
+        rows.append(("warn", f"{count}-GPU instance with no per-service pinning (PODLINK_*_GPUS) "
+                             "and no --tensor-parallel-size: every service lands on GPU 0"))
+    return rows
 
 
 def _stack_rows(stack: dict) -> list[tuple[str, str]]:
@@ -110,9 +156,13 @@ def run(out=sys.stdout) -> int:
     line(f"   reranker: {stack.get('rerank_model_id')}  "
          f"({stack.get('rerank_backend') or stack_contract.DEFAULT_RERANK_BACKEND})")
     line(f"   max model len: {stack.get('max_model_len')} · gpu share: {stack.get('gpu_memory_utilization')}")
+    if stack.get("gpu_count"):
+        line(f"   gpu:      {stack['gpu_count']} x {stack.get('gpu_match') or '<provider default>'}"
+             f" (>= {stack.get('gpu_min_vram_gb')} GB)")
     line()
 
-    rows = _neutral_rows() + _stack_rows(stack) + _lifecycle_rows(provider) + list(provider.preflight())
+    rows = (_neutral_rows() + _stack_rows(stack) + _gpu_rows(stack) + _lifecycle_rows(provider)
+            + clientenv.preflight_rows() + list(provider.preflight()))
     line("Checks:")
     for level, msg in rows:
         line(f"{_MARK.get(level, '   ?')} {msg}")

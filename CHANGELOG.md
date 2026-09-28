@@ -21,6 +21,33 @@ All notable changes to podlink are documented here. The format loosely follows
   and POD UP recreates instead of resuming a pod that would 401 every request.
 
 ### Added
+- **One image for Blackwell and Ampere pods, multi-GPU aware** (image `2026-09d`,
+  `pod_image/gpu-env.sh`): the Dockerfile bundles both TEI router builds
+  (`text-embeddings-router-sm120` / `-sm86`, both 1.9.4 on the same CUDA 12.9.1 base) and
+  the TEI wrappers pick one at boot from the card's compute capability (12.x → sm120,
+  8.6/8.7/8.9 → sm86; `TEI_ARCH` forces, an unbundled card is a loud error). The three
+  wrappers export `LLM_GPUS` / `EMBED_GPUS` / `RERANK_GPUS` as `CUDA_VISIBLE_DEVICES` (unset
+  = unchanged). vLLM compile caches on the volume gain a `-sm<cap>` suffix so pods of
+  different arches sharing a volume never load each other's graphs.
+- **Automatic client-env handoff** (`app/clientenv.py`): with `PODLINK_CLIENT_ENV_FILE`
+  set, every start (and recovery) that reaches all-healthy runs the stack test and, only
+  if it passes, writes the client `.env` block — real bearer, detected embedding
+  dimension, `PODLINK_CLIENT_ENV_EXTRA` `KEY=VALUE;…` lines applied — to that file
+  (0600, atomic) and runs `PODLINK_CLIENT_ENV_HOOK` as `[hook, file]` (absolute,
+  user-owned, executable, not group/other-writable; exit code only is reported, output
+  is discarded because it may echo the secrets). A profile switch is then just POD DOWN →
+  pick profile → POD UP. The browser's `/pod/env` keeps its bearer placeholder. Outcome in
+  the snapshot (`client_env`), a status line in the UI and the System feed; preflight
+  validates the file location, the extra lines and the hook.
+- **Profiles can target another GPU, and more than one.** `PODLINK_GPU_MATCH` /
+  `PODLINK_GPU_MIN_VRAM_GB` pick the card `resolve_gpu_id` looks for (defaults unchanged:
+  `RTX PRO 6000`, 90 GB) and `PODLINK_GPU_COUNT` (default 1) is the pod's GPU count.
+  `PODLINK_LLM_GPUS` / `PODLINK_EMBED_GPUS` / `PODLINK_RERANK_GPUS` reach the container as
+  `LLM_GPUS` / `EMBED_GPUS` / `RERANK_GPUS` (per-service `CUDA_VISIBLE_DEVICES` in the image
+  wrappers — needs an image that reads them; unset = unchanged single-GPU behaviour) and
+  are part of the stop/resume stack fingerprint. Preflight prints the GPU line and fails
+  a pinned index or `--tensor-parallel-size` that exceeds the GPU count, and warns on a
+  multi-GPU pod with neither (every service would land on GPU 0).
 - **vLLM compile caches on the volume** (`pod_image/vllm-cache-env.sh`, sourced by
   both vLLM wrappers): `VLLM_CACHE_ROOT` / `TRITON_CACHE_DIR` under
   `/workspace/cache/<service>/{vllm,triton}-<vllm version>/` (one tree per service, so

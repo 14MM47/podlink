@@ -5,6 +5,12 @@
 # container env ($HF_TOKEN / $HUGGING_FACE_HUB_TOKEN), injected by pod_up.
 set -euo pipefail
 
+# Multi-GPU pods: EMBED_GPUS pins TEI to its GPU index(es); the router binary is
+# chosen for this card's compute capability (see gpu-env.sh).
+source "$(dirname "$0")/gpu-env.sh"
+podlink_pin_gpu start-embedder "${EMBED_GPUS:-}"
+ROUTER="$(podlink_tei_router start-embedder)"
+
 # Gate the endpoint: this port is reachable over RunPod's PUBLIC HTTPS proxy, so
 # it must NOT be keyless. TEI reads API_KEY from env natively, so we export it
 # here rather than passing --api-key on argv (which would be visible in `ps aux`
@@ -24,7 +30,7 @@ export LOG_LEVEL="${LOG_LEVEL:-warn}"
 # 2026: 8.4 GiB weights loaded, then CUDA_ERROR_OUT_OF_MEMORY at warm-up with ~10 GB
 # free). RAG chunks are far shorter, so a 4096-token ceiling costs nothing and warms up in
 # a quarter of the activation memory. Override with EMBED_MAX_BATCH_TOKENS.
-exec text-embeddings-router \
+exec "${ROUTER}" \
   --model-id "${EMBED_MODEL_ID}" \
   --hostname 0.0.0.0 \
   --port 8080 \

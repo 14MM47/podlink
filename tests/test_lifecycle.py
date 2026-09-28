@@ -516,7 +516,8 @@ def test_config_key_set_covers_everything_pod_env_can_send():
     extra = {"PODLINK_VLLM_EXTRA_ARGS": "x", "PODLINK_PYTORCH_CUDA_ALLOC_CONF": "x",
              "PODLINK_RERANK_GPU_MEMORY_UTILIZATION": "0.1", "PODLINK_RERANK_VLLM_EXTRA_ARGS": "x",
              "PODLINK_RERANK_MAX_MODEL_LEN": "1", "PODLINK_RERANK_WAIT_FOR_EMBEDDER_S": "1",
-             "PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0"}
+             "PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0",
+             "PODLINK_LLM_GPUS": "0", "PODLINK_EMBED_GPUS": "1", "PODLINK_RERANK_GPUS": "1"}
     saved_backend = rp.pod_up.RERANK_BACKEND
     os.environ.update(extra)
     rp.pod_up.RERANK_BACKEND = "vllm"

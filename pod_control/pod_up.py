@@ -1,8 +1,9 @@
 """Provision (or resume) the podlink RunPod pod. Idempotent.
 
 If a pod named POD_NAME already exists, prints its state and exits 0.
-Otherwise creates a new Secure Cloud pod on a single RTX Pro 6000 (96 GB,
-Blackwell) running a bundled RAG inference stack from ONE image:
+Otherwise creates a new Secure Cloud pod — by default a single RTX Pro 6000 (96 GB,
+Blackwell); PODLINK_GPU_MATCH / _GPU_MIN_VRAM_GB / _GPU_COUNT pick another card or
+a multi-GPU pod — running a bundled RAG inference stack from ONE image:
 
     :8000  vLLM        LLM (OpenAI-compatible /v1)
     :8080  TEI         embedder  (/v1/embeddings, /health)
@@ -122,9 +123,16 @@ RERANK_BACKEND = os.environ.get("PODLINK_RERANK_BACKEND", "").strip().lower() or
 # to deploy without it once the image is trusted.
 START_SSH = os.environ.get("PODLINK_START_SSH", "1").strip().lower() not in ("0", "false", "no", "")
 
-# The specs never publish RunPod's exact GPU type id for the RTX Pro 6000, so we
-# resolve it live (resolve_gpu_id) by matching this substring against the catalog.
-GPU_MATCH = "RTX PRO 6000"
+# The GPU is resolved live (resolve_gpu_id) by matching this substring against the
+# RunPod catalog, keeping only full cards with at least GPU_MIN_VRAM_GB. The defaults
+# are the RTX Pro 6000 (96 GB) the stock image is sized for; a profile can target
+# another card (e.g. PODLINK_GPU_MATCH="RTX 3090", PODLINK_GPU_MIN_VRAM_GB=24) — the
+# vLLM fractions and models in that profile must be sized for it. GPU_COUNT is how
+# many of that card the pod gets (a multi-GPU pod needs the image's per-service
+# pinning env, LLM_GPUS / EMBED_GPUS / RERANK_GPUS, or a tensor-parallel LLM).
+GPU_MATCH = os.environ.get("PODLINK_GPU_MATCH", "").strip() or "RTX PRO 6000"
+GPU_MIN_VRAM_GB = int(os.environ.get("PODLINK_GPU_MIN_VRAM_GB", "90"))
+GPU_COUNT = int(os.environ.get("PODLINK_GPU_COUNT", "1"))
 
 STATE_PATH = Path(__file__).resolve().parents[1] / "pod_state.json"
 TEMPLATE_STATE_PATH = Path(__file__).resolve().parents[1] / "template_state.json"
@@ -205,19 +213,26 @@ def ensure_template() -> str:
     return template_id
 
 
-def resolve_gpu_id(match: str = GPU_MATCH) -> str:
-    """Resolve the RunPod gpu_type_id for a FULL 96 GB RTX PRO 6000.
+def resolve_gpu_id(match: str | None = None, min_vram_gb: int | None = None) -> str:
+    """Resolve the RunPod gpu_type_id for a FULL card matching GPU_MATCH.
 
-    RunPod lists several RTX PRO 6000 SKUs and the naive "first substring match"
-    picked the wrong one: the *Max-Q Workstation Edition* (a desktop variant
-    rarely stocked in Secure Cloud) → deploys hit "no instances available". The
-    catalog also has 24/48 GB **MIG slices** (too small for our stack) and a
-    *Workstation Edition*. The datacenter SKU that Secure Cloud actually stocks is
-    the **Server Edition** (displayName "RTX PRO 6000").
+    Defaults (None) read the module constants at call time, so a profile switch
+    that re-bakes GPU_MATCH / GPU_MIN_VRAM_GB is honoured without re-importing.
 
-    So among entries matching `match`, we drop MIG slices and anything under a
-    full 96 GB card, then prefer the Server Edition, and return its gpu_type_id.
+    RunPod lists several SKUs per card and the naive "first substring match"
+    picked the wrong one for the RTX Pro 6000: the *Max-Q Workstation Edition* (a
+    desktop variant rarely stocked in Secure Cloud) → deploys hit "no instances
+    available". The catalog also has 24/48 GB **MIG slices** (too small for the
+    stack) and a *Workstation Edition*. The datacenter SKU that Secure Cloud
+    actually stocks is the **Server Edition** (displayName "RTX PRO 6000").
+
+    So among entries matching `match`, we drop MIG slices and anything under
+    `min_vram_gb`, then prefer a Server Edition, and return its gpu_type_id.
     """
+    if match is None:
+        match = GPU_MATCH
+    if min_vram_gb is None:
+        min_vram_gb = GPU_MIN_VRAM_GB
     needle = match.upper().replace(" ", "")
     candidates = []
     for g in runpod.get_gpus():                              # live GPU catalog
@@ -227,13 +242,14 @@ def resolve_gpu_id(match: str = GPU_MATCH) -> str:
             continue
         if "MIG" in gid.upper():                             # skip 24/48 GB MIG slices
             continue
-        if (g.get("memoryInGb") or 0) < 90:                  # require a full 96 GB card
+        if (g.get("memoryInGb") or 0) < min_vram_gb:         # require the full card
             continue
         candidates.append(gid)
     if not candidates:
         raise RuntimeError(
-            f"No full-96GB GPU type matched {match!r}. Inspect the catalog with "
-            f"runpod.get_gpus()."
+            f"No GPU type with >= {min_vram_gb} GB matched {match!r}. Inspect the "
+            f"catalog with runpod.get_gpus(), or adjust PODLINK_GPU_MATCH / "
+            f"PODLINK_GPU_MIN_VRAM_GB."
         )
     # Prefer the Secure-stocked datacenter SKU (Server Edition) over the
     # workstation variants; stable tiebreak by id.
@@ -280,6 +296,11 @@ def _pod_env(bearer: str, hf: str) -> dict:
         ("PODLINK_RERANK_WAIT_FOR_EMBEDDER_S", "RERANK_WAIT_FOR_EMBEDDER_S"),  # vllm reranker start wait
         ("PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
          "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"),                  # "0" skips CUDA-graph profiling
+        # Multi-GPU pods: which GPU index(es) each service sees (CUDA_VISIBLE_DEVICES
+        # in the image wrappers). Unset = every service sees every GPU, as before.
+        ("PODLINK_LLM_GPUS", "LLM_GPUS"),
+        ("PODLINK_EMBED_GPUS", "EMBED_GPUS"),
+        ("PODLINK_RERANK_GPUS", "RERANK_GPUS"),
     ):
         val = os.environ.get(src, "").strip()
         if val:
@@ -318,7 +339,7 @@ def create_pod_once(gpu_type_id: str, bearer: str, hf: str, template_id: str) ->
         template_id=template_id,          # carries the ghcr pull credential
         gpu_type_id=gpu_type_id,
         cloud_type="SECURE",
-        gpu_count=1,
+        gpu_count=GPU_COUNT,
         container_disk_in_gb=CONTAINER_DISK_GB,
         volume_mount_path=VOLUME_MOUNT,
         ports=EXPOSED_PORT,               # "8000/http,8080/http,8081/http"
@@ -364,8 +385,8 @@ def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None =
 
 
 def try_create() -> dict:
-    """CLI helper: resolve the RTX Pro 6000 id and create the pod (no GPU fallback
-    — the image + models are sized for the 96 GB card; a smaller GPU would OOM)."""
+    """CLI helper: resolve the GPU_MATCH card's id and create the pod (no GPU
+    fallback — the profile's models are sized for that card; a smaller one would OOM)."""
     bearer = _secrets.bearer_token()
     hf = _secrets.hf_token()
     gpu_id = resolve_gpu_id()

@@ -14,9 +14,15 @@
 #          /inference — its root /rerank, /score, /pooling would be open.
 set -euo pipefail
 
+# Multi-GPU pods: RERANK_GPUS pins this service (either backend) to its GPU
+# index(es); a TEI reranker's router binary is chosen for the card (gpu-env.sh).
+source "$(dirname "$0")/gpu-env.sh"
+podlink_pin_gpu start-reranker "${RERANK_GPUS:-}"
+
 BACKEND="${RERANK_BACKEND:-tei}"
 
 if [[ "${BACKEND}" == "tei" ]]; then
+  ROUTER="$(podlink_tei_router start-reranker)"
   # Gate the endpoint: this port is reachable over RunPod's PUBLIC HTTPS proxy, so
   # it must NOT be keyless. TEI reads API_KEY from env natively, so we export it
   # here rather than passing --api-key on argv (visible in `ps aux`). podlink
@@ -30,7 +36,7 @@ if [[ "${BACKEND}" == "tei" ]]; then
   # did not). An explicit LOG_LEVEL still wins.
   export LOG_LEVEL="${LOG_LEVEL:-warn}"
 
-  exec text-embeddings-router \
+  exec "${ROUTER}" \
     --model-id "${RERANK_MODEL_ID}" \
     --hostname 0.0.0.0 \
     --port 8081

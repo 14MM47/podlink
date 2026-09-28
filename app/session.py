@@ -54,6 +54,9 @@ class PodSession:
         # embedding + rerank probes), and whether one is currently running.
         self.test_result: dict | None = None
         self.test_running: bool = False
+        # Automatic client-env handoff (app/clientenv.py): the last outcome for the
+        # UI — {status: written|skipped|error, at, path?, hook?, detail?} or None.
+        self.client_env: dict | None = None
         # Streamed status feed: a ring buffer of (epoch, category, message).
         # Categories split the feed into UI panels by source/function:
         #   lifecycle — provisioning/teardown (phase changes, create retries)
@@ -94,6 +97,7 @@ class PodSession:
             self.services = _default_services()              # fresh health tiles for the new pod
             self.test_result = None                          # clear any prior stack-test result
             self.test_running = False
+            self.client_env = None                           # a new pod means a new handoff
             self.cancel.clear()                             # ensure a fresh (un-cancelled) run
             self.force_terminate = False                     # stop flags belong to one Down only
             self.stop_from_idle = False
@@ -217,6 +221,7 @@ class PodSession:
                 "services": dict(self.services),          # llm/embedder/reranker -> status
                 "test_result": self.test_result,          # last stack-test result, or None
                 "test_running": self.test_running,        # a stack test is in flight
+                "client_env": self.client_env,            # last automatic handoff outcome, or None
                 "events": [{"t": t, "cat": c, "msg": m}   # recent feed, split by category in the UI
                            for t, c, m in self.events[-40:]],
             }

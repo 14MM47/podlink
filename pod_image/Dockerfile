@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
 #
-# podlink bundled pod image — ONE container running THREE co-resident services on
-# a single RTX Pro 6000 (96 GB, Blackwell / sm_120):
+# podlink bundled pod image — ONE container running THREE co-resident services,
+# on one RTX Pro 6000 (96 GB, Blackwell / sm_120) or on Ampere cards such as a
+# 2x RTX 3090 pod (sm_86): the vLLM base carries both arches' kernels and the
+# image bundles a TEI router per arch, chosen at boot (gpu-env.sh). On a
+# multi-GPU pod LLM_GPUS / EMBED_GPUS / RERANK_GPUS pin each service to a card.
 #
 #   :8000  vLLM        — OpenAI-compatible LLM (chat + KG extraction); vLLM binds
 #                        127.0.0.1:18000 and nginx (authproxy.py) owns :8000
@@ -16,15 +19,20 @@
 #
 # See README.md in this folder for build/push and Blackwell validation notes.
 
-# ---- stage A: source the sm_120 TEI router binary --------------------------
-# The 120-* tag is the Blackwell (compute capability 12.0) build of TEI.
-# BOTH base-image ARGs are declared here, BEFORE the first FROM, so they are in
+# ---- stage A: source one TEI router binary per GPU arch ---------------------
+# TEI publishes one build per compute capability: 120-* is Blackwell (12.0),
+# 86-* is Ampere GA102-class (8.6; also runs on 8.7/8.9). Both 1.9.4 builds share
+# the same CUDA 12.9.1 / Ubuntu 24.04 runtime base (verified from the image
+# configs), so both binaries run on the vLLM base below.
+# ALL base-image ARGs are declared here, BEFORE the first FROM, so they are in
 # scope for every FROM below. (An ARG declared after a FROM is stage-scoped and a
 # later FROM can't see it — that is why the earlier layout failed to build with
 # "base name (${VLLM_IMAGE}) should not be blank".)
 ARG TEI_IMAGE=ghcr.io/huggingface/text-embeddings-inference:120-1.9
+ARG TEI_IMAGE_SM86=ghcr.io/huggingface/text-embeddings-inference:86-1.9
 ARG VLLM_IMAGE=vllm/vllm-openai:v0.25.1-cu129-ubuntu2404
 FROM ${TEI_IMAGE} AS tei
+FROM ${TEI_IMAGE_SM86} AS tei86
 
 # ---- stage B: vLLM base + TEI binary + supervisor --------------------------
 # VLLM_IMAGE = v0.25.1-cu129-ubuntu2404: the Ubuntu 24.04 / CUDA 12.9.1 variant of
@@ -40,8 +48,12 @@ FROM ${TEI_IMAGE} AS tei
 # already loads successfully.
 FROM ${VLLM_IMAGE}
 
-# TEI router binary — built for sm_120 / glibc 2.39 / CUDA 12.9, matching this base.
-COPY --from=tei /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router
+# TEI router binaries — one per arch, glibc 2.39 / CUDA 12.9, matching this base.
+# The wrappers exec the one for the card they boot on (gpu-env.sh); the plain
+# name stays as the sm_120 build for manual use from the web terminal.
+COPY --from=tei   /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router-sm120
+COPY --from=tei86 /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router-sm86
+RUN ln -s text-embeddings-router-sm120 /usr/local/bin/text-embeddings-router
 # TEI runtime deps the vLLM image may not ship (libssl for HTTPS weight pulls, CA
 # certs). Without them the router can fail to start or fail to reach the HF hub.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -57,7 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nginx \
 RUN pip install --no-cache-dir supervisor==4.2.5
 
 # Service launch wrappers + supervisor config.
-COPY start-vllm.sh start-embedder.sh start-reranker.sh authproxy.py vllm-cache-env.sh /opt/podlink/
+COPY start-vllm.sh start-embedder.sh start-reranker.sh authproxy.py vllm-cache-env.sh gpu-env.sh /opt/podlink/
 COPY supervisord.conf /etc/podlink/supervisord.conf
 # Chat template for the vLLM reranker backend's Qwen3-Reranker preset (the vLLM
 # image ships no examples/ tree). See templates/PROVENANCE.md.

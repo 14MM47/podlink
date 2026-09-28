@@ -8,13 +8,15 @@
 # so every boot recompiled (~14 s reranker + ~17 s LLM, measured 2026-09-23). On
 # the volume they survive, and later boots load the compiled graphs instead.
 #
-# Layout: <base>/<service>/{vllm,triton}-<vllm version>/ — one tree per service
-# (the LLM and the vLLM reranker never share a directory, so they can't race on
-# the same kernel file over the FUSE volume) and per vLLM version (an upgraded
-# image never loads an incompatible cache). Explicit VLLM_CACHE_ROOT /
-# TRITON_CACHE_DIR always win; if the base isn't writable (no volume mounted)
-# the container-disk defaults are kept unchanged. PODLINK_CACHE_BASE overrides
-# the base (tests).
+# Layout: <base>/<service>/{vllm,triton}-<vllm version>[-sm<cap>]/ — one tree
+# per service (the LLM and the vLLM reranker never share a directory, so they
+# can't race on the same kernel file over the FUSE volume), per vLLM version (an
+# upgraded image never loads an incompatible cache) and per GPU compute
+# capability when known (compiled graphs are device-specific: a volume shared
+# by a Blackwell pod and an Ampere pod must never hand one the other's cache).
+# Explicit VLLM_CACHE_ROOT / TRITON_CACHE_DIR always win; if the base isn't
+# writable (no volume mounted) the container-disk defaults are kept unchanged.
+# PODLINK_CACHE_BASE overrides the base (tests).
 #
 # Self-heal: a cache on the volume outlives a crashed start, so a half-written
 # artifact could fail every later boot. Each start drops a marker that a small
@@ -31,6 +33,11 @@ podlink_vllm_cache_env() {
   # Package metadata, not `import vllm` (that import takes ~10 s).
   ver="$(python3 -c 'import importlib.metadata as m; print(m.version("vllm"))' 2>/dev/null || true)"
   [[ -n "${ver}" ]] || ver="unknown"
+  # Device suffix (gpu-env.sh); none when the capability can't be read.
+  declare -F podlink_compute_cap >/dev/null 2>&1 || source "$(dirname "${BASH_SOURCE[0]}")/gpu-env.sh"
+  local cap
+  cap="$(podlink_compute_cap 2>/dev/null || true)"
+  [[ -n "${cap}" ]] && ver="${ver}-sm${cap//./}"
   local root="${base}/${who}"
   if ! { mkdir -p "${root}" 2>/dev/null && [[ -w "${root}" ]]; }; then
     echo "[${who}] ${base} not writable; keeping the container-disk compile caches" >&2

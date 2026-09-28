@@ -1,7 +1,11 @@
 # podlink bundled pod image
 
-One Docker image that runs **three co-resident services** on a single RTX Pro 6000
-(96 GB, Blackwell) — a bundled LLM + embedder + reranker stack for a RAG pipeline:
+One Docker image that runs **three co-resident services** — a bundled LLM + embedder +
+reranker stack for a RAG pipeline — on a single RTX Pro 6000 (96 GB, Blackwell / sm_120)
+**or** on Ampere cards such as a 2× RTX 3090 pod (sm_86). One tag serves both: the vLLM
+base carries every arch's kernels, and the image bundles one TEI router build per arch,
+picked at boot by `gpu-env.sh` from the card's compute capability. On a multi-GPU pod each
+service is pinned to its GPU(s) by `LLM_GPUS` / `EMBED_GPUS` / `RERANK_GPUS`.
 
 | Port | Service | Endpoints podlink gates on |
 |------|---------|----------------------------|
@@ -18,15 +22,22 @@ the download is a one-time cost and later resumes are fast.
 
 ## Base images (already pinned)
 
-The two `ARG`s at the top of `Dockerfile` are pinned to Blackwell-capable builds —
-override them only to bump versions:
+The three `ARG`s at the top of `Dockerfile` are pinned — override them only to bump
+versions:
 
 - `VLLM_IMAGE` — `vllm/vllm-openai:v0.25.1-cu129-ubuntu2404` (CUDA 12.9, Ubuntu
-  24.04, `sm_120`). Use the `-cu129-ubuntu2404` variant, **not** the bare
-  `v0.25.1` tag (Ubuntu 22.04 / glibc 2.35, which the copied TEI binary needs 24.04
-  to satisfy). podlink's older `v0.9.2` (CUDA 12.4) does **not** support `sm_120`.
+  24.04; kernels for `sm_80`…`sm_120`). Use the `-cu129-ubuntu2404` variant, **not** the
+  bare `v0.25.1` tag (Ubuntu 22.04 / glibc 2.35, which the copied TEI binaries need
+  24.04 to satisfy). podlink's older `v0.9.2` (CUDA 12.4) does **not** support `sm_120`.
 - `TEI_IMAGE` — `ghcr.io/huggingface/text-embeddings-inference:120-1.9` (the sm_120
-  build). Bump the version as needed.
+  build) → `/usr/local/bin/text-embeddings-router-sm120` (also the plain name).
+- `TEI_IMAGE_SM86` — `…:86-1.9` (the sm_86 build; runs on 8.6/8.7/8.9) →
+  `/usr/local/bin/text-embeddings-router-sm86`. Both 1.9.4 builds share the same
+  CUDA 12.9.1 / Ubuntu 24.04 runtime base. Bump both together.
+
+`gpu-env.sh` maps the compute capability nvidia-smi reports to a build (12.x → sm120,
+8.6/8.7/8.9 → sm86); any other card is a loud error unless `TEI_ARCH` forces a build.
+To add an arch: one more `ARG` + `FROM` + `COPY` and one `case` line.
 
 ## Build & push
 
@@ -66,7 +77,9 @@ podlink's `create_pod` passes these as env — you don't set them here:
 | `RERANK_VLLM_EXTRA_ARGS` | extra `vllm serve` flags for rerankers without a built-in preset (space-split). `Qwen/Qwen3-Reranker-*` has a preset (hf-overrides + `templates/qwen3_reranker.jinja`) |
 | `RERANK_WAIT_FOR_EMBEDDER_S` | how long the vLLM reranker waits for the embedder's `/health` before profiling memory (default 1200, `0` = don't wait) |
 | `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` | vLLM's own switch, passed through from `PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`. `0` skips CUDA-graph memory profiling (~39 s on the 30B LLM) in **every** vLLM process in the container (the LLM and a vLLM reranker), so their graphs (~0.65 + ~0.3 GB) sit outside each `--gpu-memory-utilization` budget — only for stacks with GPU headroom. Unset by default |
-| `PODLINK_CACHE_BASE` | where the vLLM processes keep their compile caches (default `/workspace/cache`, the persistent volume): `<base>/<service>/{vllm,triton}-<vllm version>/`, one tree per service so they never share files. An explicit `VLLM_CACHE_ROOT` / `TRITON_CACHE_DIR` wins; unwritable base = container-disk defaults. A start that never reached `/health` leaves a marker, and the next start clears that service's cache (self-heal). Old-version trees are not pruned — after an image upgrade, `rm -rf /workspace/cache/*/*-<old version>` from the web terminal reclaims the space |
+| `LLM_GPUS` / `EMBED_GPUS` / `RERANK_GPUS` | multi-GPU pods: the GPU index(es) each service sees, exported as its `CUDA_VISIBLE_DEVICES` (podlink passes them from `PODLINK_*_GPUS`). Unset = every service sees every GPU (single-GPU behaviour). A tensor-parallel LLM (`--tensor-parallel-size 2` in `VLLM_EXTRA_ARGS`) leaves `LLM_GPUS` unset and pins the TEI/reranker beside its ranks |
+| `TEI_ARCH` / `PODLINK_COMPUTE_CAP` | force the TEI build (`sm120` / `sm86`) or the detected compute capability; normally unset — `gpu-env.sh` reads nvidia-smi |
+| `PODLINK_CACHE_BASE` | where the vLLM processes keep their compile caches (default `/workspace/cache`, the persistent volume): `<base>/<service>/{vllm,triton}-<vllm version>-sm<cap>/`, one tree per service and per GPU arch so they never share files (a volume shared by a Blackwell and an Ampere pod keeps separate caches). An explicit `VLLM_CACHE_ROOT` / `TRITON_CACHE_DIR` wins; unwritable base = container-disk defaults. A start that never reached `/health` leaves a marker, and the next start clears that service's cache (self-heal). Old-version trees are not pruned — after an image upgrade, `rm -rf /workspace/cache/*/*-<old version>` from the web terminal reclaims the space |
 | `LOG_LEVEL` | TEI log level, default `warn` in both TEI wrappers: TEI's INFO startup line prints its args **including `api_key`**. (TEI reads `LOG_LEVEL`, not `RUST_LOG`.) |
 
 **Auth proxy (nginx, `authproxy.py`):** vLLM's `--api-key` guards only `/v1`,
@@ -86,7 +99,9 @@ fronted — TEI gates all of its own routes. Responses stream through unbuffered
 
 ## Validate on the real card before locking `IMAGE`
 
-The build can succeed and still fail at runtime on Blackwell. On a live RTX Pro 6000:
+The build can succeed and still fail at runtime. On each card the tag will serve (the
+RTX Pro 6000, and a 2× RTX 3090 pod — where `nvidia-smi` should show the LLM on GPU 0
+and TEI + reranker on GPU 1, and the embedder log line `TEI build: sm86`):
 
 1. `curl -H "Authorization: Bearer $VLLM_API_KEY" :8000/v1/models` lists your served model.
 2. `curl -H "Authorization: Bearer $TEI_API_KEY" :8080/health` and `:8081/health`

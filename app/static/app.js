@@ -268,6 +268,10 @@ function render(s) {
     envviewEl.innerHTML = '<span class="muted">— start a pod to generate the client config —</span>';
   }
 
+  // Automatic client-env handoff (server-side file + hook): one status line.
+  const ceKey = JSON.stringify(s.client_env);
+  if (ceKey !== mClientEnv) { renderClientEnv(s.client_env); mClientEnv = ceKey; }
+
   // Expensive panels (glass, many rows) — rebuild ONLY when their data changed.
   const testKey = JSON.stringify(s.test_result) + "|" + s.test_running;
   if (testKey !== mTest) { renderTest(s); mTest = testKey; }
@@ -293,6 +297,24 @@ function render(s) {
     if (s.up_enabled) { loadPods(); loadProfiles(); }  // IDLE or ERROR -> lists may have changed
     lastState = s.state;
   }
+}
+
+// The automatic handoff's status: when the client env file was written and what the hook did.
+let mClientEnv = null;
+function renderClientEnv(ce) {
+  const el = document.getElementById("clientenv");
+  if (!el) return;
+  if (!ce) { el.textContent = ""; return; }
+  const at = ce.at ? new Date(ce.at * 1000).toLocaleTimeString() : "";
+  let text;
+  if (ce.status === "written") {
+    text = `client env written ${at}` + (ce.hook ? ` · hook ${ce.hook}` : " · no hook");
+  } else if (ce.status === "skipped") {
+    text = `client env not written ${at} · ${ce.detail || ""}`;
+  } else {
+    text = `client env error ${at} · ${ce.detail || ""}`;
+  }
+  el.textContent = text;
 }
 
 // Fetch the client config block for the running pod and show it in the outputs rail.

@@ -138,6 +138,10 @@ export PODLINK_NETWORK_VOLUME_ID=<volume-id>         # terminate-safe weight per
 | `PODLINK_IMAGE` | *(required)* | The pushed image tag podlink deploys. |
 | `PODLINK_REGISTRY_AUTH_ID` | *(empty)* | RunPod Container-Registry-Auth id for a **private** image; empty ⇒ public. |
 | `PODLINK_LLM_MODEL_ID` / `PODLINK_EMBED_MODEL_ID` / `PODLINK_RERANK_MODEL_ID` | balanced 96 GB defaults | HF repos the image serves. |
+| `PODLINK_GPU_MATCH` / `PODLINK_GPU_MIN_VRAM_GB` | `RTX PRO 6000` / `90` | Which card the RunPod catalog lookup accepts (substring match, full cards of at least this VRAM; MIG slices skipped). |
+| `PODLINK_GPU_COUNT` | `1` | GPUs per pod. A multi-GPU pod needs per-service pinning or a tensor-parallel LLM (`PODLINK_VLLM_EXTRA_ARGS="--tensor-parallel-size 2"`); preflight checks both against the count. |
+| `PODLINK_LLM_GPUS` / `PODLINK_EMBED_GPUS` / `PODLINK_RERANK_GPUS` | *(empty)* | GPU index(es) each service sees (the image exports them as `CUDA_VISIBLE_DEVICES`; needs an image that reads them). Unset = every service sees every GPU. Part of the stop/resume stack fingerprint. |
+| `PODLINK_CLIENT_ENV_FILE` / `_EXTRA` / `_HOOK` | *(empty)* | Automatic client-env handoff — see [Wiring a client](#automatic-handoff-podlink_client_env_file). |
 | `PODLINK_LLM_SERVED_NAME` | `llm` | vLLM `--served-model-name`; a client's model field must match. |
 | `PODLINK_LLM_QUANT` | *(empty)* | vLLM `--quantization` (empty auto-detects). |
 | `PODLINK_NETWORK_VOLUME_ID` | *(empty)* | Network Volume id. Empty ⇒ Data-Volume fallback (weights destroyed on terminate). `start.sh` prompts/saves this. `none` ⇒ **explicitly** volume-less: skips the saved-id/prompt fallback. |
@@ -214,8 +218,11 @@ DOWN first. `--profile` at launch simply sets the initial selection.
 ## Pod image (build once)
 
 POD UP pulls one bundled image running all three services under `supervisord`. Build
-and push it, then set `PODLINK_IMAGE`. Full instructions (including the Blackwell
-`sm_120` base-image pins) are in [`pod_image/README.md`](pod_image/README.md).
+and push it, then set `PODLINK_IMAGE`. One tag serves both Blackwell (`sm_120`, e.g.
+the RTX PRO 6000) and Ampere (`sm_86`, e.g. a 2× RTX 3090 pod): the image bundles a TEI
+router per arch and picks at boot, and on a multi-GPU pod `PODLINK_*_GPUS` pins each
+service to a card. Full instructions (base-image pins, per-arch builds) are in
+[`pod_image/README.md`](pod_image/README.md).
 
 ## Wiring a client
 
@@ -240,6 +247,27 @@ The pod id (and URLs) **changes on every POD UP** (terminate/recreate), so this 
 per-session block. All three services need the bearer — blank keys → 401 on
 embedder/reranker. Switching the embedder changes the vector dimension, so recreate
 your vector collection and re-ingest.
+
+### Automatic handoff (`PODLINK_CLIENT_ENV_FILE`)
+
+To make a profile switch nothing more than POD DOWN → pick profile → POD UP, let podlink
+hand the client its config itself. Per profile:
+
+```bash
+export PODLINK_CLIENT_ENV_FILE=~/.config/podlink/myapp.env       # written 0600, WITH the bearer
+export PODLINK_CLIENT_ENV_EXTRA="KG_EXTRACTION_CONCURRENCY=2"    # KEY=VALUE;KEY2=VALUE2 appended/overriding
+export PODLINK_CLIENT_ENV_HOOK=/home/me/myapp/scripts/apply_pod_env.sh   # run as [hook, env_file]
+```
+
+Once every service is healthy (on a normal start and on a recovery), podlink first runs
+the **stack test** — a real completion, embedding and rerank — and only if it passes
+writes the block (real bearer filled in, `EMBEDDING_DIMENSIONS` detected, your extra
+lines applied) to the file and runs the hook. The hook is the client's own "merge into
+`.env` and restart" script; it must be an absolute path to a regular file owned by you,
+executable, and not writable by group/others, and only its **exit code** is reported (its
+output may echo the secrets). A failing stack test leaves the file and the client
+untouched. The browser's Copy .env block keeps the bearer placeholder as before; the
+outcome shows as a status line under the buttons and in the System feed.
 
 ## Security
 

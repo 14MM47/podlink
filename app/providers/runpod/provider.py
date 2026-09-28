@@ -23,6 +23,7 @@ import hashlib    # compare secrets by digest, never by value in any output
 import hmac       # constant-time digest comparison
 import importlib  # re-bake pod_up's import-time constants after a profile switch
 import json       # read pod_state.json as a last-resort id source
+import os         # the multi-GPU pinning / extra-args env the preflight guard reports
 import re         # validate a client-supplied pod id
 import sys        # reach the already-imported pod_up module for reload
 
@@ -57,6 +58,7 @@ _CONFIG_ENV = frozenset({
     "VLLM_EXTRA_ARGS", "PYTORCH_CUDA_ALLOC_CONF", "RERANK_GPU_MEMORY_UTILIZATION",
     "RERANK_VLLM_EXTRA_ARGS", "RERANK_MAX_MODEL_LEN", "RERANK_WAIT_FOR_EMBEDDER_S",
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
+    "LLM_GPUS", "EMBED_GPUS", "RERANK_GPUS",       # per-service GPU pinning (multi-GPU pods)
 })
 
 
@@ -264,7 +266,7 @@ class RunPodProvider:
         """
         if session.cancel.is_set():                      # Down pressed before we resolve
             return None
-        session.update(phase="resolving RTX Pro 6000 GPU id")   # live catalog lookup
+        session.update(phase=f"resolving {pod_up.GPU_MATCH} GPU id")   # live catalog lookup
         gpu_id = pod_up.resolve_gpu_id()                 # exact RunPod gpu_type_id
         if session.cancel.is_set():
             return None
@@ -286,14 +288,15 @@ class RunPodProvider:
         return pod_up.is_retryable_create_error(exc)
 
     def create_phase(self, ctx: dict, attempt: int, retries: int) -> str:
-        return f"creating pod on {ctx['gpu_id']} — attempt {attempt}/{retries}"
+        gpus = f"{pod_up.GPU_COUNT}x " if pod_up.GPU_COUNT > 1 else ""
+        return f"creating pod on {gpus}{ctx['gpu_id']} — attempt {attempt}/{retries}"
 
     def capacity_note(self, attempt: int, retries: int, delay: int) -> str:
         return f"no host with capacity yet — attempt {attempt}/{retries}; retrying in {delay}s"
 
     def create_exhausted_message(self, retries: int, delay: int) -> str:
         return (f"no Secure host in the volume's region accepted the pod after {retries} "
-                f"attempts (~{retries * delay // 60} min). RTX PRO 6000 capacity is transient — "
+                f"attempts (~{retries * delay // 60} min). {pod_up.GPU_MATCH} capacity is transient — "
                 f"press POD UP to keep trying, or try again later.")
 
     def terminate(self, instance_id: str) -> None:
@@ -332,6 +335,15 @@ class RunPodProvider:
             "max_model_len": pod_up.MAX_MODEL_LEN,
             "gpu_memory_utilization": pod_up.GPU_MEMORY_UTILIZATION,
             "rerank_backend": pod_up.RERANK_BACKEND,     # decides the stack test's rerank call
+            # The GPU the create asks for, and what the preflight's pinning guard checks
+            # the per-service GPU indices / tensor-parallel size against.
+            "gpu_match": pod_up.GPU_MATCH,
+            "gpu_min_vram_gb": pod_up.GPU_MIN_VRAM_GB,
+            "gpu_count": pod_up.GPU_COUNT,
+            "vllm_extra_args": os.environ.get("PODLINK_VLLM_EXTRA_ARGS", "").strip(),
+            "llm_gpus": os.environ.get("PODLINK_LLM_GPUS", "").strip(),
+            "embed_gpus": os.environ.get("PODLINK_EMBED_GPUS", "").strip(),
+            "rerank_gpus": os.environ.get("PODLINK_RERANK_GPUS", "").strip(),
         }
 
     def client_env(self, instance_id: str, embedding_dim: int | None) -> str:

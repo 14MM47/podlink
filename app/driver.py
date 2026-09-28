@@ -22,6 +22,7 @@ from __future__ import annotations  # allow `dict | None` etc. annotations
 import os            # read the auto-terminate window from the environment
 import time          # wall-clock deadlines and inter-poll sleeps
 
+from . import clientenv                             # hand the client its live config once up
 from .providers import active as active_provider   # the configured cloud
 from .session import PodSession, State, SERVICES   # our state machine types + service names
 from .vendored import _secrets, egress_logger, read_secret  # local secrets + audited client
@@ -249,6 +250,8 @@ def start(session: PodSession) -> None:
 
         if not session.commit_running():                 # flip to RUNNING unless a stop won
             return                                        # a stop overtook us at the finish line
+        # Hand the client its live config (stack test → file → hook); no-op unless configured.
+        clientenv.handoff(session, provider, pod_id, test_stack)
     except Exception as e:  # noqa: BLE001 — surface any failure to the UI
         # A failed launch owns its own teardown: no stop worker is coming, so
         # anything ensure_access opened would leak. (The cancel returns above
@@ -751,6 +754,7 @@ def recover_if_healthy(session: PodSession, pod_id: str) -> bool:
         provider.write_state(pod_id)
     except Exception:  # noqa: BLE001
         pass
+    clientenv.handoff(session, provider, pod_id, test_stack)   # same handoff as a normal start
     return True
 
 

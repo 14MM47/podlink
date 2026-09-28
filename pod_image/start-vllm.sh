@@ -8,6 +8,10 @@
 # the pod (the RunPod web terminal cannot be disabled).
 set -euo pipefail
 
+# Multi-GPU pods: LLM_GPUS pins this process to its GPU index(es) (see gpu-env.sh).
+source "$(dirname "$0")/gpu-env.sh"
+podlink_pin_gpu start-vllm "${LLM_GPUS:-}"
+
 # --served-model-name comes from the pod env (podlink passes LLM_SERVED_NAME, from
 # PODLINK_LLM_SERVED_NAME). A client's model field must match it exactly or requests
 # 404. Defaults to "llm".

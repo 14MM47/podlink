@@ -32,6 +32,8 @@ fake_runpod._gpus = [                              # what resolve_gpu_id sees
     # resolve_gpu_id requires memoryInGb >= 90 and skips MIG slices, so entries
     # carry a realistic memoryInGb (the 96 GB card qualifies; the 5090 does not).
     {"id": "NVIDIA GeForce RTX 5090", "displayName": "RTX 5090", "memoryInGb": 32},
+    {"id": "NVIDIA GeForce RTX 3090", "displayName": "RTX 3090", "memoryInGb": 24},
+    {"id": "NVIDIA GeForce RTX 3090 Ti", "displayName": "RTX 3090 Ti", "memoryInGb": 24},
     {"id": "NVIDIA RTX PRO 6000 Blackwell WE", "displayName": "RTX PRO 6000 Blackwell Workstation Edition", "memoryInGb": 96},
 ]
 fake_runpod.get_gpus = lambda: fake_runpod._gpus
@@ -138,6 +140,86 @@ def test_resolve_gpu_id_matches_rtx_pro_6000():
     gid = rp.pod_up.resolve_gpu_id()
     check("resolve_gpu_id -> RTX Pro 6000 id",
           gid == "NVIDIA RTX PRO 6000 Blackwell WE")
+
+
+def test_resolve_gpu_id_honours_match_and_min_vram():
+    # A profile can target another card: explicit args, and the module constants
+    # re-baked from PODLINK_GPU_MATCH / _GPU_MIN_VRAM_GB on a provider reload.
+    import importlib
+    import os as _os
+    check("explicit match + min vram -> the 24 GB card, plain SKU before Ti",
+          rp.pod_up.resolve_gpu_id("RTX 3090", 24) == "NVIDIA GeForce RTX 3090")
+    check("default min vram (90) rejects the 3090 even when matched",
+          _raises(lambda: rp.pod_up.resolve_gpu_id("RTX 3090")))
+    _os.environ.update({"PODLINK_GPU_MATCH": "RTX 3090", "PODLINK_GPU_MIN_VRAM_GB": "24",
+                        "PODLINK_GPU_COUNT": "2"})
+    try:
+        importlib.reload(rp.pod_up)
+        check("env re-bakes GPU_MATCH/GPU_MIN_VRAM_GB/GPU_COUNT",
+              (rp.pod_up.GPU_MATCH, rp.pod_up.GPU_MIN_VRAM_GB, rp.pod_up.GPU_COUNT) == ("RTX 3090", 24, 2))
+        check("resolve_gpu_id() reads the re-baked constants",
+              rp.pod_up.resolve_gpu_id() == "NVIDIA GeForce RTX 3090")
+        pod = rp.pod_up.create_pod_once("gpu-id", "bearer", "hf", "tmpl-id")
+        check("create_pod asks for GPU_COUNT gpus", pod["gpu_count"] == 2)
+        check("create phase names the gpu count",
+              rp.PROVIDER().create_phase({"gpu_id": "g"}, 1, 3).startswith("creating pod on 2x g"))
+    finally:
+        for k in ("PODLINK_GPU_MATCH", "PODLINK_GPU_MIN_VRAM_GB", "PODLINK_GPU_COUNT"):
+            _os.environ.pop(k, None)
+        importlib.reload(rp.pod_up)
+    check("defaults restored: RTX Pro 6000, 90 GB, 1 gpu",
+          (rp.pod_up.GPU_MATCH, rp.pod_up.GPU_MIN_VRAM_GB, rp.pod_up.GPU_COUNT) == ("RTX PRO 6000", 90, 1))
+    pod = rp.pod_up.create_pod_once("gpu-id", "bearer", "hf", "tmpl-id")
+    check("create_pod default gpu_count is 1", pod["gpu_count"] == 1)
+
+
+def _raises(fn) -> bool:
+    try:
+        fn()
+    except RuntimeError:
+        return True
+    return False
+
+
+def test_gpu_pinning_passthrough_and_fingerprint():
+    # PODLINK_{LLM,EMBED,RERANK}_GPUS reach the container as LLM_GPUS/EMBED_GPUS/
+    # RERANK_GPUS (both the neutral contract and pod_up), only when set, and a
+    # changed pinning is a stack-fingerprint mismatch (resume would boot the
+    # wrong layout).
+    import os as _os
+    from app import stack
+    from app.providers.runpod import provider as rpp
+    base_env = stack.container_env(stack.from_env(), "B", "H")
+    check("no pinning env when unset", not {"LLM_GPUS", "EMBED_GPUS", "RERANK_GPUS"} & set(base_env))
+    _os.environ.update({"PODLINK_LLM_GPUS": "0", "PODLINK_EMBED_GPUS": "1", "PODLINK_RERANK_GPUS": "1"})
+    try:
+        env = stack.container_env(stack.from_env(), "B", "H")
+        check("pinning sent", (env.get("LLM_GPUS"), env.get("EMBED_GPUS"), env.get("RERANK_GPUS")) == ("0", "1", "1"))
+        check("pinning: container env keys == pod_up's", set(env) == set(rp.pod_up._pod_env("B", "H")))
+        check("pinning keys are fingerprinted", {"LLM_GPUS", "EMBED_GPUS", "RERANK_GPUS"} <= rpp._CONFIG_ENV)
+        have = rp.pod_up._pod_env("B", "H")
+        inst = {"imageName": rp.pod_up.IMAGE, "env": [{"key": k, "value": v} for k, v in have.items()]}
+        _os.environ["PODLINK_LLM_GPUS"] = "1"                      # switch the LLM to the other GPU
+        check("changed pinning shows in the stack diff", "LLM_GPUS" in rp.PROVIDER().stack_diff(inst))
+    finally:
+        for k in ("PODLINK_LLM_GPUS", "PODLINK_EMBED_GPUS", "PODLINK_RERANK_GPUS"):
+            _os.environ.pop(k, None)
+
+
+def test_preflight_gpu_rows():
+    # Pinned GPU indices and any --tensor-parallel-size must fit gpu_count; a
+    # multi-GPU instance with neither gets a warning; no gpu_count = no rows.
+    from app import preflight
+    levels = lambda st: [lvl for lvl, _ in preflight._gpu_rows(st)]  # noqa: E731
+    check("no gpu_count -> no rows", levels({"llm_gpus": "7"}) == [])
+    check("single gpu, nothing pinned -> no rows", levels({"gpu_count": 1}) == [])
+    check("pinned within range -> ok", levels({"gpu_count": 2, "llm_gpus": "0", "embed_gpus": "1"}) == ["ok", "ok"])
+    check("index beyond the instance -> fail", levels({"gpu_count": 1, "embed_gpus": "1"}) == ["fail"])
+    check("non-integer index -> fail", levels({"gpu_count": 2, "llm_gpus": "zero"}) == ["fail"])
+    check("tp fits -> ok", levels({"gpu_count": 2, "vllm_extra_args": "--tensor-parallel-size 2 --x"}) == ["ok"])
+    check("tp= form parsed", levels({"gpu_count": 2, "vllm_extra_args": "--tensor-parallel-size=2"}) == ["ok"])
+    check("tp too big -> fail", levels({"gpu_count": 1, "vllm_extra_args": "--tensor-parallel-size 2"}) == ["fail"])
+    check("multi-gpu, nothing pinned, no tp -> warn", levels({"gpu_count": 2}) == ["warn"])
 
 
 def test_resolve_gpu_id_raises_when_absent():
@@ -541,6 +623,39 @@ def test_start_opens_access_on_the_create_path():
          rp.pod_up.resolve_gpu_id, rp.pod_up.STATE_PATH) = saved
         scratch.unlink(missing_ok=True)
         rec.restore()
+
+
+def test_start_and_recovery_hand_off_the_client_env():
+    # Both "all healthy" paths call clientenv.handoff(session, provider, pod_id,
+    # test_stack) after the session is RUNNING — the create path and the
+    # ERROR->RUNNING recovery. The handoff itself is unit-tested in test_clientenv.
+    calls = []
+    saved_handoff = rd.clientenv.handoff
+    rd.clientenv.handoff = lambda s, p, pod_id, ts: calls.append((pod_id, s.state, ts is rd.test_stack))
+    saved = (rp.pod_up.find_existing, rp.pod_up.create_pod_once, rp.pod_up.ensure_template,
+             rp.pod_up.resolve_gpu_id, rp.pod_up.STATE_PATH)
+    scratch = Path("/tmp/podlink_handoff_state.json")
+    rp.pod_up.find_existing = lambda: None
+    rp.pod_up.resolve_gpu_id = lambda: "gpuX"
+    rp.pod_up.ensure_template = lambda: "tmpl1"
+    rp.pod_up.create_pod_once = lambda *a, **k: {"id": "createdH"}
+    _healthy_pod_fixture(scratch)
+    try:
+        s = PodSession()
+        s.try_begin_start(None)
+        rd.start(s)
+        check("create path hands off once RUNNING, with the real stack test",
+              calls == [("createdH", State.RUNNING, True)])
+        s2 = PodSession()
+        s2.try_begin_start(None)
+        s2.update(pod_id="podLostH", state=State.ERROR, error="x")
+        rd.recover_if_healthy(s2, "podLostH")
+        check("recovery path hands off too", calls[-1] == ("podLostH", State.RUNNING, True))
+    finally:
+        rd.clientenv.handoff = saved_handoff
+        (rp.pod_up.find_existing, rp.pod_up.create_pod_once, rp.pod_up.ensure_template,
+         rp.pod_up.resolve_gpu_id, rp.pod_up.STATE_PATH) = saved
+        scratch.unlink(missing_ok=True)
 
 
 def test_failed_start_before_an_instance_closes_the_access_path():
@@ -1034,6 +1149,9 @@ if __name__ == "__main__":
     test_gql_escape_env_makes_json_values_safe()
     test_create_pod_once_sends_escaped_env()
     test_resolve_gpu_id_matches_rtx_pro_6000()
+    test_resolve_gpu_id_honours_match_and_min_vram()
+    test_gpu_pinning_passthrough_and_fingerprint()
+    test_preflight_gpu_rows()
     test_resolve_gpu_id_raises_when_absent()
     test_all_ready_true_when_all_200()
     test_all_ready_waits_for_stragglers_then_times_out()
@@ -1056,6 +1174,7 @@ if __name__ == "__main__":
     test_verify_terminated_keeps_polling_on_unknown_status()
     test_start_opens_access_on_the_adopt_path()
     test_start_opens_access_on_the_create_path()
+    test_start_and_recovery_hand_off_the_client_env()
     test_failed_start_before_an_instance_closes_the_access_path()
     test_failed_start_with_an_instance_keeps_the_access_path()
     test_recover_if_healthy_reopens_the_access_path_before_probing()

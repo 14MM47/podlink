@@ -56,6 +56,12 @@ def from_env() -> dict:
         # (unset) by default: only for profiles with GPU headroom to spare.
         "vllm_memory_profiler_estimate_cudagraphs":
             os.environ.get("PODLINK_VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "").strip(),
+        # Multi-GPU instances: the GPU index(es) each service sees (the image
+        # wrappers export them as CUDA_VISIBLE_DEVICES). Unset = every service
+        # sees every GPU, so a single-GPU stack's env is unchanged.
+        "llm_gpus": os.environ.get("PODLINK_LLM_GPUS", "").strip(),
+        "embed_gpus": os.environ.get("PODLINK_EMBED_GPUS", "").strip(),
+        "rerank_gpus": os.environ.get("PODLINK_RERANK_GPUS", "").strip(),
     }
 
 
@@ -97,6 +103,9 @@ def container_env(stack: dict, bearer: str, hf: str) -> dict[str, str]:
         env["RERANK_WAIT_FOR_EMBEDDER_S"] = stack["rerank_wait_for_embedder_s"]
     if stack["vllm_memory_profiler_estimate_cudagraphs"]:
         env["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = stack["vllm_memory_profiler_estimate_cudagraphs"]
+    for key, dst in (("llm_gpus", "LLM_GPUS"), ("embed_gpus", "EMBED_GPUS"), ("rerank_gpus", "RERANK_GPUS")):
+        if stack.get(key):
+            env[dst] = stack[key]
     return env
 
 
