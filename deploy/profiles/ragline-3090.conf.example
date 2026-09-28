@@ -30,8 +30,13 @@
 
 # --- image + ladder -------------------------------------------------------------
 export PODLINK_IMAGE=ghcr.io/14mm47/ragline-pod:2026-09d
-export PODLINK_GPU_LADDER="RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|8q3v00u8os|1 ; RTX PRO 4500|30|2|none"
+export PODLINK_GPU_LADDER="RTX 3090|24|2|none|1 ; RTX A6000|40|2|none|1 ; RTX PRO 4500|30|2|8q3v00u8os|1 ; RTX PRO 4500|30|2|none"
 #   rung 1: one look for 3090s · rung 2: one look for PRO 4500s in EU-RO-1, on the existing
+#   rung 2: one look for 2x RTX A6000 — the SAME Ampere sm_86 silicon family as the 3090
+#   (48 GB, 768 GB/s = 0.82x a 3090's bandwidth: multiply decode tok/s by ~1.22); the one
+#   test that proves the Ampere kernel path (sm_86 TEI router, FlashInfer fp8 KV, Marlin
+#   INT4). Seen in Secure stock in EU-SE-1 / US-TX-1 on 2026-09-28 ($1.06/hr the pair);
+#   neither DC supports network volumes, so volume-less.
 #   ragline-weights volume (US-KS-2, the DC that has them, has NO network-volume support) ·
 #   rung 3: PRO 4500s anywhere, pod-scoped scratch, the 40 x 15 s loop
 export PODLINK_NETWORK_VOLUME_ID=none                  # volumes are per rung (above); skips the launcher prompt
