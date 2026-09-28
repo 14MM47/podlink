@@ -391,6 +391,22 @@ teststackBtn.addEventListener("click", () => {      // run a real completion+emb
   teststackBtn.disabled = true;                     // optimistic; SSE reflects test_running
   send("/pod/test");
 });
+// Manual GPU-stock probe: live Secure stock per ladder rung, so you can decide
+// whether a stopped pod on a lower rung is worth terminating for a fresh walk.
+document.getElementById("probestock").addEventListener("click", async () => {
+  const el = document.getElementById("stockresult");
+  el.textContent = "probing GPU stock…";
+  if (!token) await loadToken();
+  try {
+    const r = await fetch("/pod/stock", { headers: { "X-Podlink-Token": token } });
+    if (!r.ok) { el.textContent = `stock probe failed (${r.status})`; return; }
+    const d = await r.json();
+    if (!d.rungs || !d.rungs.length) { el.textContent = d.note || "no ladder configured"; return; }
+    const at = d.at ? new Date(d.at * 1000).toLocaleTimeString() : "";
+    el.textContent = `stock ${at}: ` + d.rungs.map(x => `${x.label} — ${x.stock}${x.detail ? " (" + x.detail + ")" : ""}`).join(" · ");
+  } catch { el.textContent = "stock probe failed"; }
+});
+
 copyenvBtn.addEventListener("click", async () => {  // copy the shown client config block
   await fetchEnv();                                 // ensure it's current (fills envview)
   const env = envviewEl.textContent || "";

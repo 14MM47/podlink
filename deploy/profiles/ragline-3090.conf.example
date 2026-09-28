@@ -1,40 +1,54 @@
 # Example profile — copy to ~/.config/podlink/profiles/<name>.conf and fill in the TODOs.
-# ragline stack on a 2x RTX 3090 pod (2 x 24 GB, Ampere / sm_86) — PINNED layout:
+# ragline stack sized for a purchased 2x RTX 3090 box (2 x 24 GB) — PINNED layout:
 #   GPU0  LLM      RedHatAI/Qwen3.8-27B-INT4 (16.5 GiB text weights, vision + MTP skipped)
 #   GPU1  embedder Qwen/Qwen3-Embedding-8B (~16 GB, 4096-dim = SAME Qdrant index as prod)
-#         reranker Qwen/Qwen3-Reranker-0.6B via vLLM (0.12 x 24 GB ~ 2.9 GB, cohere format)
+#         reranker Qwen/Qwen3-Reranker-0.6B via vLLM (~2.9 GB, cohere format)
 # Same image, ports, bearer, served name and client contract as `ragline` — only the
 # URLs and KG_EXTRACTION_CONCURRENCY differ, and the handoff below applies both.
 #
-# Launch: ./start.sh --check --profile ragline-3090   (preflight, spends nothing)
+# GPU LADDER (fresh creates only; a stopped pod is resumed wherever it sits):
+#   rung 1  2x RTX 3090       — the exact target; one stock probe, no waiting (2x Secure
+#                                stock was nil in every sample on 2026-09-28)
+#   rung 2  2x RTX PRO 4500   — Blackwell 32 GB, the one 2-GPU Secure pod reliably in
+#                                stock; same sm_120 arch as prod
+# The memory budgets below make rung 2 EMULATE rung 1: the LLM's KV cache is the same
+# number of bytes on either card and the reranker gets the same GB, so context capacity
+# and queueing behaviour are identical — only tok/s differs (PRO 4500 SE ~0.85x of a
+# 3090; multiply measured decode speed by ~1.17 for the 3090 estimate). The spare ~8 GB
+# per PRO 4500 is deliberately left unused.
+# "Probe GPU stock" in the console shows both rungs live; "Terminate instead" on a
+# stopped rung-2 pod forces a fresh walk of the ladder when 3090s appear.
+#
+# Launch: ./start.sh --check --profile ragline-3090   (preflight + live stock, spends nothing)
 #         ./start.sh --profile ragline-3090           (or pick it in the console dropdown)
 #
-# NOT LAUNCHABLE until all three are true (a POD UP before that bills a stuck pod):
-#   1. image ghcr.io/14mm47/ragline-pod:2026-09d is built + pushed
-#      (podlink branch feature/profile-3090, pod_image/ — dual-arch TEI + GPU pinning);
-#   2. the console runs feature/profile-3090 (GPU_MATCH/COUNT/pinning + client handoff);
-#   3. a Network Volume (~80 GB) exists in a DC with 2x3090 Secure stock — replace
-#      PODLINK_NETWORK_VOLUME_ID=none below with its id (shared with agentic-3090).
+# NOT LAUNCHABLE until: (1) image ghcr.io/14mm47/ragline-pod:2026-09d is built + pushed;
+# (2) the console runs feature/profile-3090; (3) rung 2's Network Volume exists in
+# US-KS-2 (where the PRO 4500 SE lives) — replace `none` in rung 2 with its id (shared
+# with agentic-3090). Rung 1 stays volume-less: 3090s are in other data centers, and a
+# rare 3090 pod re-downloading ~35 GB beats paying for a volume it never uses.
 
-# --- image + hardware ----------------------------------------------------------
+# --- image + ladder -------------------------------------------------------------
 export PODLINK_IMAGE=ghcr.io/14mm47/ragline-pod:2026-09d
-export PODLINK_GPU_MATCH="RTX 3090"
-export PODLINK_GPU_MIN_VRAM_GB=24
-export PODLINK_GPU_COUNT=2
+export PODLINK_GPU_LADDER="RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|none"
+#                          match   |minGB|count|volume|attempts   (rung 2: default 40 x 15 s)
+export PODLINK_VOLUME_GB=80                            # pod-scoped scratch for volume-less rungs
 export PODLINK_POD_NAME=podlink-ragline-3090          # its own pod: never adopts the prod pod
 
 # --- GPU0: LLM ----------------------------------------------------------------
-# 0.95 x 24 GB = 22.8 GiB: ~16.5 GiB weights + ~1.3 GiB graphs/activations leaves
-# ~4-5 GiB KV = ~64k tokens at fp8 (32 KB/token: 16 full-attention layers x 4 KV
-# heads x 256 dims; the 48 Gated-DeltaNet layers hold fixed-size state).
+# KV budget = what a 3090 has left: 24 GB x 0.95 - 16.5 GiB weights - ~1.3 GiB graphs
+# ≈ 4.5 GiB = ~145k fp8 KV tokens (32 KB/token: 16 full-attention layers x 4 KV heads
+# x 256 dims; the 48 Gated-DeltaNet layers hold fixed-size state) — plenty for 65k.
 # --max-num-seqs 1: one request at a time (vLLM queues the rest) — single-user by design.
 # enable_thinking=false: Qwen3.8 is hybrid-thinking; ragline wants plain completions.
-# Fallback ladder if it does not boot on sm_86: drop --kv-cache-dtype fp8 (bf16 KV, 32k),
-# add --enforce-eager, then cyankiwi/Qwen3.6-27B-AWQ-INT4, then the prod 30B-A3B AWQ.
+# Fallback ladder if it does not boot on a rung: drop --kv-cache-dtype fp8 (bf16 KV, halve
+# LLM_KV tokens), add --enforce-eager, then cyankiwi/Qwen3.6-27B-AWQ-INT4, then the prod
+# 30B-A3B AWQ.
 export PODLINK_LLM_SERVED_NAME=ragline-llm
 export PODLINK_LLM_MODEL_ID=RedHatAI/Qwen3.8-27B-INT4
 export PODLINK_LLM_GPUS=0
-export PODLINK_GPU_MEMORY_UTILIZATION=0.95
+export PODLINK_LLM_KV_GB=4.5                          # exact KV bytes on every rung
+export PODLINK_GPU_MEMORY_UTILIZATION=0.95            # ignored by vLLM once KV bytes are set; kept for clarity
 export PODLINK_MAX_MODEL_LEN=65536
 export PODLINK_VLLM_EXTRA_ARGS='--language-model-only --max-num-seqs 1 --kv-cache-dtype fp8 --attention-backend FLASHINFER --block-size 16 --enable-prefix-caching --safetensors-load-strategy=prefetch --default-chat-template-kwargs {"enable_thinking":false}'
 
@@ -44,15 +58,12 @@ export PODLINK_EMBED_GPUS=1
 export PODLINK_RERANK_BACKEND=vllm
 export PODLINK_RERANK_MODEL_ID=Qwen/Qwen3-Reranker-0.6B
 export PODLINK_RERANK_GPUS=1
-export PODLINK_RERANK_GPU_MEMORY_UTILIZATION=0.12
+export PODLINK_RERANK_MEMORY_GB=2.9                   # -> 0.12 of a 24 GB card, 0.09 of 32 GB
 export PODLINK_RERANK_VLLM_EXTRA_ARGS="--safetensors-load-strategy=prefetch"
 
-# --- storage + lifecycle ----------------------------------------------------------
-# Weights: 18 (LLM) + 14 (8B embedder) + 7.5 (4B embedder, agentic profile) + 1 GB + caches.
-export PODLINK_NETWORK_VOLUME_ID=none                  # TODO: the 3090 volume id (Phase F)
-export PODLINK_VOLUME_GB=80
-# Resume needs TWO free 3090s on the pinned host — busier than one; give up fast and
-# let the terminate + recreate fallback find another host (weights stay on the volume).
+# --- lifecycle --------------------------------------------------------------------
+# Resume needs TWO free GPUs on the pinned host — busier than one; give up fast and
+# let the terminate + recreate fallback walk the ladder (weights stay on rung 2's volume).
 export PODLINK_LIFECYCLE=stop
 export PODLINK_RESUME_RETRIES=4
 export PODLINK_RESUME_RETRY_DELAY=15

@@ -312,19 +312,43 @@ def _create_with_retries(session: PodSession) -> dict | None:
     if ctx is None:                                      # cancelled during preparation
         return None
     secrets = {"bearer": bearer, "hf": hf}
-    retries, delay = _create_retries(), _create_retry_delay()
-    for attempt in range(1, retries + 1):
-        if session.cancel.is_set():                      # Down pressed between attempts
-            return None
-        session.update(phase=provider.create_phase(ctx, attempt, retries))
-        try:
-            return provider.create_once(ctx, secrets, attempt)   # one attempt
-        except provider.create_error_types as e:
-            if not provider.is_retryable_create_error(e):  # real error — surface it
-                raise
-            session.add_event(provider.capacity_note(attempt, retries, delay))  # UI feed
-            if attempt < retries and _sleep_or_cancel(session, delay):  # cancel-aware wait
+    default_retries, delay = _create_retries(), _create_retry_delay()
+    # A provider with a placement ladder hands back several steps (rungs), tried
+    # in order; a plain provider is one step. Each step may be probed first —
+    # a rung the catalog says is empty is skipped without a create call, so a
+    # 1-attempt rung costs seconds, not a lottery of doomed creates.
+    steps = provider.create_plan(ctx) if hasattr(provider, "create_plan") else [ctx]
+    probe = getattr(provider, "probe", None)
+    retries = default_retries
+    for index, step in enumerate(steps, 1):
+        retries = (provider.step_retries(step) if hasattr(provider, "step_retries") else None) or default_retries
+        label = provider.step_label(step) if hasattr(provider, "step_label") else ""
+        for attempt in range(1, retries + 1):
+            if session.cancel.is_set():                  # Down pressed between attempts
                 return None
+            if probe is not None and probe(step) is False:
+                # Say so on the first, every fifth and the last probe — not forty times.
+                if attempt == 1 or attempt == retries or attempt % 5 == 0:
+                    session.add_event(f"{label}: no Secure stock in the catalog (probe {attempt}/{retries})"
+                                      .lstrip(": "), "lifecycle")
+                if attempt < retries and _sleep_or_cancel(session, delay):
+                    return None
+                continue
+            session.update(phase=provider.create_phase(step, attempt, retries))
+            try:
+                instance = provider.create_once(step, secrets, attempt)   # one attempt
+            except provider.create_error_types as e:
+                if not provider.is_retryable_create_error(e):  # real error — surface it
+                    raise
+                session.add_event(provider.capacity_note(attempt, retries, delay))  # UI feed
+                if attempt < retries and _sleep_or_cancel(session, delay):  # cancel-aware wait
+                    return None
+                continue
+            if label:
+                session.add_event(f"pod created on {label}", "lifecycle")
+            return instance
+        if index < len(steps):
+            session.add_event(f"{label}: nothing after {retries} attempt(s) — trying the next rung", "lifecycle")
     raise RuntimeError(provider.create_exhausted_message(retries, delay))
 
 

@@ -156,12 +156,26 @@ def run(out=sys.stdout) -> int:
     line(f"   reranker: {stack.get('rerank_model_id')}  "
          f"({stack.get('rerank_backend') or stack_contract.DEFAULT_RERANK_BACKEND})")
     line(f"   max model len: {stack.get('max_model_len')} · gpu share: {stack.get('gpu_memory_utilization')}")
-    if stack.get("gpu_count"):
+    ladder = stack.get("ladder") or []
+    if len(ladder) > 1:
+        for i, rung in enumerate(ladder, 1):
+            line(f"   gpu rung {i}/{len(ladder)}: {rung['label']} (>= {rung['min_vram_gb']} GB) · "
+                 f"volume {rung['volume'] or 'none'} · attempts {rung['retries'] or 'default'}")
+    elif stack.get("gpu_count"):
         line(f"   gpu:      {stack['gpu_count']} x {stack.get('gpu_match') or '<provider default>'}"
              f" (>= {stack.get('gpu_min_vram_gb')} GB)")
+    budgets = {k: v for k, v in (stack.get("memory_budgets") or {}).items() if v}
+    if budgets:
+        line("   memory budgets: " + " · ".join(f"{k.removesuffix('_gb')} {v} GB" for k, v in budgets.items()))
     line()
 
-    rows = (_neutral_rows() + _stack_rows(stack) + _gpu_rows(stack) + _lifecycle_rows(provider)
+    gpu_rows: list[tuple[str, str]] = []
+    if len(ladder) > 1:
+        for i, rung in enumerate(ladder, 1):
+            gpu_rows += [(lvl, f"rung {i}: {msg}") for lvl, msg in _gpu_rows({**stack, "gpu_count": rung["count"]})]
+    else:
+        gpu_rows = _gpu_rows(stack)
+    rows = (_neutral_rows() + _stack_rows(stack) + gpu_rows + _lifecycle_rows(provider)
             + clientenv.preflight_rows() + list(provider.preflight()))
     line("Checks:")
     for level, msg in rows:

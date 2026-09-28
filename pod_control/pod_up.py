@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import runpod
@@ -133,6 +134,112 @@ START_SSH = os.environ.get("PODLINK_START_SSH", "1").strip().lower() not in ("0"
 GPU_MATCH = os.environ.get("PODLINK_GPU_MATCH", "").strip() or "RTX PRO 6000"
 GPU_MIN_VRAM_GB = int(os.environ.get("PODLINK_GPU_MIN_VRAM_GB", "90"))
 GPU_COUNT = int(os.environ.get("PODLINK_GPU_COUNT", "1"))
+
+# --- GPU ladder: ordered fallbacks for a FRESH create ---------------------------
+# PODLINK_GPU_LADDER = "match|min_vram_gb|count|volume[|retries] ; match|…" — each
+# rung is a card the profile can run on, tried in order: the catalog is probed for
+# Secure stock (and, when the rung names a Network Volume, stock in that volume's
+# data center), a rung with none is skipped after `retries` probes (default: the
+# create-retry budget), a rung with stock gets the usual create attempts. `volume`
+# is a Network Volume id or `none` (pod-scoped scratch of VOLUME_GB). Unset = one
+# rung from GPU_MATCH / GPU_MIN_VRAM_GB / GPU_COUNT / NETWORK_VOLUME_ID, i.e. the
+# single-card behaviour above, unchanged. A stopped pod is resumed on whatever
+# rung it sits — the ladder is only walked when a pod has to be created.
+GPU_LADDER = os.environ.get("PODLINK_GPU_LADDER", "").strip()
+
+
+@dataclass(frozen=True)
+class Rung:
+    index: int            # 1-based position in the ladder
+    match: str            # catalog substring, as GPU_MATCH
+    min_vram_gb: int      # as GPU_MIN_VRAM_GB
+    count: int            # GPUs per pod
+    volume_id: str        # Network Volume id, or "" for a pod-scoped Data Volume
+    retries: int | None   # probe/create attempts for this rung; None = the default
+
+    @property
+    def label(self) -> str:
+        return f"{self.count}x {self.match}" if self.count > 1 else self.match
+
+
+def parse_ladder(spec: str) -> list[Rung]:
+    """Parse PODLINK_GPU_LADDER; raises ValueError on a malformed rung."""
+    rungs: list[Rung] = []
+    for i, item in enumerate(s.strip() for s in spec.split(";")):
+        if not item:
+            continue
+        parts = [p.strip() for p in item.split("|")]
+        if len(parts) not in (4, 5) or not parts[0]:
+            raise ValueError(f"PODLINK_GPU_LADDER rung {item!r}: expected match|min_vram_gb|count|volume[|retries]")
+        try:
+            min_vram, count = int(parts[1]), int(parts[2])
+            retries = int(parts[4]) if len(parts) == 5 and parts[4] else None
+        except ValueError as e:
+            raise ValueError(f"PODLINK_GPU_LADDER rung {item!r}: {e}") from None
+        if count < 1 or min_vram < 1 or (retries is not None and retries < 1):
+            raise ValueError(f"PODLINK_GPU_LADDER rung {item!r}: count, min_vram_gb and retries must be >= 1")
+        volume = "" if parts[3].lower() in ("", "none") else parts[3]
+        rungs.append(Rung(len(rungs) + 1, parts[0], min_vram, count, volume, retries))
+    if not rungs:
+        raise ValueError("PODLINK_GPU_LADDER is set but names no rungs")
+    return rungs
+
+
+def ladder() -> list[Rung]:
+    """The rungs this launch may create on — the ladder, or the single configured card."""
+    if GPU_LADDER:
+        return parse_ladder(GPU_LADDER)
+    return [Rung(1, GPU_MATCH, GPU_MIN_VRAM_GB, GPU_COUNT, NETWORK_VOLUME_ID, None)]
+
+
+def gpu_memory_gb(gpu_type_id: str) -> int | None:
+    """The card's memory from the live catalog (None when the id isn't listed)."""
+    for g in runpod.get_gpus():
+        if g.get("id") == gpu_type_id:
+            mem = g.get("memoryInGb")
+            return int(mem) if isinstance(mem, (int, float)) else None
+    return None
+
+
+def _volume_data_center(volume_id: str) -> str | None:
+    """Which data center a Network Volume lives in (pods must be created there)."""
+    for vol in (runpod.get_user() or {}).get("networkVolumes") or []:
+        if vol.get("id") == volume_id:
+            return vol.get("dataCenterId")
+    return None
+
+
+def probe_stock(gpu_type_id: str, count: int, volume_id: str = "", min_vram_gb: int = 1) -> bool | None:
+    """Is a Secure pod of `count` x this card creatable right now, per the catalog?
+
+    True/False from RunPod's stock status (and, when the pod must land in a
+    Network Volume's data center, that center's per-type availability); None
+    when the catalog can't say — the caller then simply tries the create. Never
+    raises: a probe is advisory, the create attempt is the truth.
+    """
+    try:
+        from runpod.api.graphql import run_graphql_query
+        q = ('query { gpuTypes(input:{id:"%s"}) { lowestPrice(input:{gpuCount:%d, secureCloud:true}) '
+             '{ stockStatus } } }' % (gpu_type_id.replace('"', ""), int(count)))
+        types = (run_graphql_query(q).get("data") or {}).get("gpuTypes") or []
+        if not types:
+            return None
+        if not (types[0].get("lowestPrice") or {}).get("stockStatus"):
+            return False                                   # nothing anywhere
+        if not volume_id:
+            return True
+        dc = _volume_data_center(volume_id)
+        if not dc:
+            return None                                    # unknown volume: let the create decide
+        q = ('query { dataCenters { id gpuAvailability(input:{gpuCount:%d, secureCloud:true, minMemoryInGb:%d}) '
+             '{ gpuTypeId available } } }' % (int(count), int(min_vram_gb)))
+        for center in (run_graphql_query(q).get("data") or {}).get("dataCenters") or []:
+            if center.get("id") == dc:
+                return any(a.get("gpuTypeId") == gpu_type_id and a.get("available")
+                           for a in center.get("gpuAvailability") or [])
+        return None
+    except Exception:  # noqa: BLE001 — advisory only
+        return None
 
 STATE_PATH = Path(__file__).resolve().parents[1] / "pod_state.json"
 TEMPLATE_STATE_PATH = Path(__file__).resolve().parents[1] / "template_state.json"
@@ -263,9 +370,13 @@ def is_retryable_create_error(e: Exception) -> bool:
     return any(s in str(e) for s in _RETRYABLE_CREATE_ERRORS)
 
 
-def _pod_env(bearer: str, hf: str) -> dict:
+def _pod_env(bearer: str, hf: str, card_memory_gb: int | None = None) -> dict:
     """The pod's runtime env — secrets + model config, read by the image wrappers.
-    Secrets live here (pod env), never in the persistent template."""
+    Secrets live here (pod env), never in the persistent template.
+
+    `card_memory_gb` (the resolved GPU's memory) lets the absolute memory budgets
+    (PODLINK_LLM_KV_GB / _LLM_MEMORY_GB / _RERANK_MEMORY_GB) be turned into the
+    per-card vLLM settings — see stack.apply_memory_budgets."""
     env = {
         # weight-pull token, seen by all three services in the container
         "HF_TOKEN": hf,
@@ -309,7 +420,21 @@ def _pod_env(bearer: str, hf: str) -> dict:
     # env is unchanged (same rule as app/stack.container_env).
     if RERANK_BACKEND != "tei":
         env["RERANK_BACKEND"] = RERANK_BACKEND
+    _apply_memory_budgets(env, card_memory_gb)
     return env
+
+
+def _apply_memory_budgets(env: dict, card_memory_gb: int | None) -> None:
+    """Absolute GB budgets -> per-card vLLM settings (shared rule in app/stack.py).
+
+    Imported lazily: this module is also a standalone CLI, and app/stack.py is the
+    cloud-neutral copy of the image contract that owns the arithmetic."""
+    try:
+        from app import stack as _stack
+    except ImportError:                                    # CLI use outside the app package
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from app import stack as _stack
+    _stack.apply_memory_budgets(env, card_memory_gb)
 
 
 def _gql_escape_env(env: dict) -> dict:
@@ -325,30 +450,35 @@ def _gql_escape_env(env: dict) -> dict:
     return {k: str(v).replace("\\", "\\\\").replace('"', '\\"') for k, v in env.items()}
 
 
-def create_pod_once(gpu_type_id: str, bearer: str, hf: str, template_id: str) -> dict:
+def create_pod_once(gpu_type_id: str, bearer: str, hf: str, template_id: str,
+                    rung: Rung | None = None, card_memory_gb: int | None = None) -> dict:
     """ONE create attempt from the bundled image. Raises QueryError (retryable via
     is_retryable_create_error, or a real error) on failure; returns the pod on
     success. Callers own the retry policy — the CLI create_pod loop below, and the
     web driver's cancel-aware, UI-reporting loop. No docker_args (that would
-    override the image CMD). template_id carries the private-registry credential."""
+    override the image CMD). template_id carries the private-registry credential.
+    `rung` (a ladder entry) supplies the GPU count and the volume; without one the
+    single-card constants apply."""
+    count = rung.count if rung else GPU_COUNT
+    volume_id = rung.volume_id if rung else NETWORK_VOLUME_ID
     # Persistent storage: a Network Volume (survives terminate; region-locked) when
-    # NETWORK_VOLUME_ID is set, else a pod-scoped Data Volume (destroyed on terminate).
+    # set, else a pod-scoped Data Volume (destroyed on terminate).
     create_kwargs = dict(
         name=POD_NAME,
         image_name=IMAGE,
         template_id=template_id,          # carries the ghcr pull credential
         gpu_type_id=gpu_type_id,
         cloud_type="SECURE",
-        gpu_count=GPU_COUNT,
+        gpu_count=count,
         container_disk_in_gb=CONTAINER_DISK_GB,
         volume_mount_path=VOLUME_MOUNT,
         ports=EXPOSED_PORT,               # "8000/http,8080/http,8081/http"
-        env=_gql_escape_env(_pod_env(bearer, hf)),
+        env=_gql_escape_env(_pod_env(bearer, hf, card_memory_gb)),
         support_public_ip=False,          # all traffic via RunPod's HTTPS proxy
         start_ssh=START_SSH,              # SSH for first-boot debug (PODLINK_START_SSH=0 to disable)
     )
-    if NETWORK_VOLUME_ID:
-        create_kwargs["network_volume_id"] = NETWORK_VOLUME_ID  # persists across terminate
+    if volume_id:
+        create_kwargs["network_volume_id"] = volume_id          # persists across terminate
     else:
         create_kwargs["volume_in_gb"] = VOLUME_GB               # pod-scoped, lost on terminate
     # runpod 1.7.13's create_pod does `print(f"raw_response: {raw_response}")`, and

@@ -161,8 +161,9 @@ def test_resolve_gpu_id_honours_match_and_min_vram():
               rp.pod_up.resolve_gpu_id() == "NVIDIA GeForce RTX 3090")
         pod = rp.pod_up.create_pod_once("gpu-id", "bearer", "hf", "tmpl-id")
         check("create_pod asks for GPU_COUNT gpus", pod["gpu_count"] == 2)
+        step = {"gpu_id": "g", "rung": rp.pod_up.ladder()[0], "of": 1}
         check("create phase names the gpu count",
-              rp.PROVIDER().create_phase({"gpu_id": "g"}, 1, 3).startswith("creating pod on 2x g"))
+              rp.PROVIDER().create_phase(step, 1, 3).startswith("2x RTX 3090 — creating pod on g"))
     finally:
         for k in ("PODLINK_GPU_MATCH", "PODLINK_GPU_MIN_VRAM_GB", "PODLINK_GPU_COUNT"):
             _os.environ.pop(k, None)
@@ -204,6 +205,165 @@ def test_gpu_pinning_passthrough_and_fingerprint():
     finally:
         for k in ("PODLINK_LLM_GPUS", "PODLINK_EMBED_GPUS", "PODLINK_RERANK_GPUS"):
             _os.environ.pop(k, None)
+
+
+def test_gpu_ladder_parsing_and_default():
+    # Unset = one rung from the single-card constants; set = ordered rungs with
+    # optional per-rung retries; malformed = ValueError naming the rung.
+    import importlib
+    import os as _os
+    single = rp.pod_up.ladder()
+    check("no ladder -> one rung from GPU_MATCH/COUNT/volume",
+          len(single) == 1 and single[0].match == "RTX PRO 6000" and single[0].count == 1
+          and single[0].volume_id == rp.pod_up.NETWORK_VOLUME_ID and single[0].retries is None)
+    rungs = rp.pod_up.parse_ladder("RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|vol123")
+    check("two rungs parsed in order",
+          [(r.index, r.match, r.min_vram_gb, r.count, r.volume_id, r.retries) for r in rungs]
+          == [(1, "RTX 3090", 24, 2, "", 1), (2, "RTX PRO 4500", 30, 2, "vol123", None)])
+    check("rung labels", [r.label for r in rungs] == ["2x RTX 3090", "2x RTX PRO 4500"])
+    for bad in ("RTX 3090|24|2", "RTX 3090|x|2|none", "|24|2|none", " ; ", "RTX 3090|24|0|none"):
+        check(f"malformed ladder {bad!r} raises", _raises_value(lambda: rp.pod_up.parse_ladder(bad)))
+    _os.environ["PODLINK_GPU_LADDER"] = "RTX 3090|24|2|none|1 ; RTX 5090|30|2|none"
+    try:
+        importlib.reload(rp.pod_up)
+        check("env ladder re-baked", [r.match for r in rp.pod_up.ladder()] == ["RTX 3090", "RTX 5090"])
+        check("stack_config reports the ladder",
+              [r["label"] for r in rp.PROVIDER().stack_config()["ladder"]] == ["2x RTX 3090", "2x RTX 5090"])
+        check("persistence: a volume-less rung means not configured", rp.PROVIDER().persistence_configured() is False)
+    finally:
+        _os.environ.pop("PODLINK_GPU_LADDER", None)
+        importlib.reload(rp.pod_up)
+
+
+def _raises_value(fn) -> bool:
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
+def test_memory_budgets_derive_per_card_settings():
+    # Absolute GB budgets -> exact KV bytes on any card, and per-card fractions
+    # when the card's memory is known; nothing changes when unset.
+    import os as _os
+    from app import stack
+    base = dict(stack.container_env(stack.from_env(), "B", "H"))
+    _os.environ.update({"PODLINK_LLM_KV_GB": "4.5", "PODLINK_RERANK_MEMORY_GB": "2.9",
+                        "PODLINK_LLM_MEMORY_GB": "22.8"})
+    try:
+        env24 = stack.container_env(stack.from_env(), "B", "H", card_memory_gb=24)
+        env32 = stack.container_env(stack.from_env(), "B", "H", card_memory_gb=32)
+        kv = f"--kv-cache-memory-bytes {int(4.5 * 2**30)}"
+        check("kv bytes appended to the vLLM args", env24["VLLM_EXTRA_ARGS"].endswith(kv)
+              and env32["VLLM_EXTRA_ARGS"].endswith(kv))
+        check("llm fraction derived per card",
+              (env24["GPU_MEMORY_UTILIZATION"], env32["GPU_MEMORY_UTILIZATION"]) == ("0.950", "0.713"))
+        check("reranker fraction derived per card",
+              (env24["RERANK_GPU_MEMORY_UTILIZATION"], env32["RERANK_GPU_MEMORY_UTILIZATION"]) == ("0.121", "0.091"))
+        env_none = stack.container_env(stack.from_env(), "B", "H")
+        check("unknown card: kv bytes still applied, fractions left alone",
+              env_none["VLLM_EXTRA_ARGS"].endswith(kv) and env_none["GPU_MEMORY_UTILIZATION"] == base["GPU_MEMORY_UTILIZATION"])
+        check("pod_up applies the same rule",
+              rp.pod_up._pod_env("B", "H", 32)["GPU_MEMORY_UTILIZATION"] == "0.713"
+              and rp.pod_up._pod_env("B", "H", 32)["VLLM_EXTRA_ARGS"].endswith(kv))
+        check("budget keys are already fingerprinted",
+              {"VLLM_EXTRA_ARGS", "GPU_MEMORY_UTILIZATION", "RERANK_GPU_MEMORY_UTILIZATION"}
+              <= set(__import__("app.providers.runpod.provider", fromlist=["x"])._CONFIG_ENV))
+    finally:
+        for k in ("PODLINK_LLM_KV_GB", "PODLINK_RERANK_MEMORY_GB", "PODLINK_LLM_MEMORY_GB"):
+            _os.environ.pop(k, None)
+    check("unset budgets: env unchanged", stack.container_env(stack.from_env(), "B", "H", 32) == base)
+
+
+def test_ladder_walk_probes_then_creates_on_the_first_rung_with_stock():
+    # Rung 1 (1 attempt) probes empty -> skipped without a create; rung 2 probes
+    # stock -> create (capacity error once, then success). Feed names the rung.
+    import importlib
+    import os as _os
+    _os.environ["PODLINK_GPU_LADDER"] = "RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|none"
+    saved = (fake_runpod._gpus, rp.pod_up.ensure_template, rp.pod_up.STATE_PATH, rd.egress_logger.client)
+    fake_runpod._gpus = saved[0] + [{"id": "NVIDIA RTX PRO 4500 Blackwell", "displayName": "RTX PRO 4500", "memoryInGb": 32}]
+    probes, creates = [], []
+    scratch = Path("/tmp/podlink_ladder_state.json")
+    try:
+        importlib.reload(rp.pod_up)
+        rp.pod_up.ensure_template = lambda: "tmpl1"
+        rp.pod_up.STATE_PATH = scratch
+        stock = {"NVIDIA GeForce RTX 3090": False, "NVIDIA RTX PRO 4500 Blackwell": True}
+        rp.pod_up.probe_stock = lambda gpu_id, count, volume_id="", min_vram_gb=1: probes.append((gpu_id, count)) or stock[gpu_id]
+
+        def fake_create(gpu_id, bearer, hf, template_id, rung=None, card_memory_gb=None):
+            creates.append((gpu_id, rung.count, card_memory_gb))
+            if len(creates) == 1:
+                raise QueryError("no longer any instances available", "q")
+            return {"id": "ladderpod", "gpu_count": rung.count}
+        rp.pod_up.create_pod_once = fake_create
+        saved_sleep = rd._sleep_or_cancel
+        rd._sleep_or_cancel = lambda session, seconds: session.cancel.is_set()   # no real waits
+        s = PodSession()
+        s.try_begin_start(None)
+        inst = rd._create_with_retries(s)
+        check("created on rung 2", inst and inst["id"] == "ladderpod")
+        check("rung 1 probed once, never created", probes[0] == ("NVIDIA GeForce RTX 3090", 2)
+              and all(c[0] != "NVIDIA GeForce RTX 3090" for c in creates))
+        check("rung 2 created with its count + card memory", creates[-1] == ("NVIDIA RTX PRO 4500 Blackwell", 2, 32))
+        feed = " | ".join(m for _, _, m in s.events)
+        check("feed: rung 1 empty, moved on", "rung 1/2: 2x RTX 3090: no Secure stock" in feed
+              and "trying the next rung" in feed)
+        check("feed: created on rung 2", "pod created on rung 2/2: 2x RTX PRO 4500" in feed)
+        # Everything empty -> exhausted message names both rungs, no create calls.
+        probes.clear(); creates.clear()
+        stock["NVIDIA RTX PRO 4500 Blackwell"] = False
+        _os.environ["PODLINK_CREATE_RETRIES"] = "2"
+        s2 = PodSession()
+        s2.try_begin_start(None)
+        msg = ""
+        try:
+            rd._create_with_retries(s2)
+        except RuntimeError as e:
+            msg = str(e)
+        check("all rungs empty -> exhausted, no create attempted",
+              creates == [] and "2x RTX 3090 / 2x RTX PRO 4500" in msg)
+        check("last rung used its retries", [p for p in probes if p[0].endswith("4500 Blackwell")].__len__() == 2)
+    finally:
+        _os.environ.pop("PODLINK_GPU_LADDER", None)
+        _os.environ.pop("PODLINK_CREATE_RETRIES", None)
+        fake_runpod._gpus = saved[0]
+        importlib.reload(rp.pod_up)
+        rp.pod_up.ensure_template, rp.pod_up.STATE_PATH = saved[1], saved[2]
+        rd._sleep_or_cancel = saved_sleep
+        scratch.unlink(missing_ok=True)
+
+
+def test_ladder_fingerprint_is_rung_aware():
+    # A stopped pod on rung 2 must be compared with rung 2's derived env (its
+    # card's fractions), not rung 1's; a pod on no rung is a mismatch.
+    import importlib
+    import os as _os
+    _os.environ["PODLINK_GPU_LADDER"] = "RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|none"
+    _os.environ["PODLINK_RERANK_MEMORY_GB"] = "2.9"
+    saved = fake_runpod._gpus
+    fake_runpod._gpus = saved + [{"id": "NVIDIA RTX PRO 4500 Blackwell", "displayName": "RTX PRO 4500", "memoryInGb": 32}]
+    try:
+        importlib.reload(rp.pod_up)
+        p = rp.PROVIDER()
+        # The fake secrets' values, so the digest comparison sees them unchanged.
+        env32 = rp.pod_up._pod_env("bearer_dummy", "hf_dummy", 32)
+        inst = {"imageName": rp.pod_up.IMAGE, "gpuCount": 2,
+                "machine": {"gpuTypeId": "NVIDIA RTX PRO 4500 Blackwell"},
+                "env": [{"key": k, "value": v} for k, v in env32.items() if v]}
+        check("rung-2 pod with rung-2 env matches", p.stack_diff(inst) == [])
+        inst24 = dict(inst, env=[{"key": k, "value": v}
+                                 for k, v in rp.pod_up._pod_env("bearer_dummy", "hf_dummy", 24).items() if v])
+        check("rung-2 pod carrying 24 GB fractions is stale", "RERANK_GPU_MEMORY_UTILIZATION" in p.stack_diff(inst24))
+        stray = dict(inst, machine={"gpuTypeId": "NVIDIA A100"})
+        check("pod on no rung -> 'gpu' in the diff", "gpu" in p.stack_diff(stray))
+    finally:
+        _os.environ.pop("PODLINK_GPU_LADDER", None)
+        _os.environ.pop("PODLINK_RERANK_MEMORY_GB", None)
+        fake_runpod._gpus = saved
+        importlib.reload(rp.pod_up)
 
 
 def test_preflight_gpu_rows():
@@ -609,7 +769,7 @@ def test_start_opens_access_on_the_create_path():
              rp.pod_up.resolve_gpu_id, rp.pod_up.STATE_PATH)
     scratch = Path("/tmp/podlink_access_create.json")
     rp.pod_up.find_existing = lambda: None           # nothing to adopt -> create
-    rp.pod_up.resolve_gpu_id = lambda: "gpuX"
+    rp.pod_up.resolve_gpu_id = lambda *a, **k: "gpuX"
     rp.pod_up.ensure_template = lambda: "tmpl1"
     rp.pod_up.create_pod_once = lambda *a, **k: {"id": "created1"}
     _healthy_pod_fixture(scratch)
@@ -636,7 +796,7 @@ def test_start_and_recovery_hand_off_the_client_env():
              rp.pod_up.resolve_gpu_id, rp.pod_up.STATE_PATH)
     scratch = Path("/tmp/podlink_handoff_state.json")
     rp.pod_up.find_existing = lambda: None
-    rp.pod_up.resolve_gpu_id = lambda: "gpuX"
+    rp.pod_up.resolve_gpu_id = lambda *a, **k: "gpuX"
     rp.pod_up.ensure_template = lambda: "tmpl1"
     rp.pod_up.create_pod_once = lambda *a, **k: {"id": "createdH"}
     _healthy_pod_fixture(scratch)
@@ -935,7 +1095,7 @@ def test_create_retries_then_succeeds_and_logs():
              rp.pod_up.resolve_gpu_id, rd._sleep_or_cancel)
     rp.pod_up.create_pod_once = flaky
     rp.pod_up.ensure_template = lambda: "tmpl1"
-    rp.pod_up.resolve_gpu_id = lambda: "gpuX"
+    rp.pod_up.resolve_gpu_id = lambda *a, **k: "gpuX"
     rd._sleep_or_cancel = lambda session, secs: False   # instant, not cancelled
     try:
         s = PodSession(); s.try_begin_start(None)
@@ -991,7 +1151,7 @@ def test_create_non_retryable_error_surfaces():
     saved = (rp.pod_up.create_pod_once, rp.pod_up.ensure_template, rp.pod_up.resolve_gpu_id)
     rp.pod_up.create_pod_once = lambda *a, **k: (_ for _ in ()).throw(QE("invalid gpu spec"))
     rp.pod_up.ensure_template = lambda: "t"
-    rp.pod_up.resolve_gpu_id = lambda: "g"
+    rp.pod_up.resolve_gpu_id = lambda *a, **k: "g"
     try:
         s = PodSession(); s.try_begin_start(None)
         raised = False
@@ -1151,6 +1311,10 @@ if __name__ == "__main__":
     test_resolve_gpu_id_matches_rtx_pro_6000()
     test_resolve_gpu_id_honours_match_and_min_vram()
     test_gpu_pinning_passthrough_and_fingerprint()
+    test_gpu_ladder_parsing_and_default()
+    test_memory_budgets_derive_per_card_settings()
+    test_ladder_walk_probes_then_creates_on_the_first_rung_with_stock()
+    test_ladder_fingerprint_is_rung_aware()
     test_preflight_gpu_rows()
     test_resolve_gpu_id_raises_when_absent()
     test_all_ready_true_when_all_200()

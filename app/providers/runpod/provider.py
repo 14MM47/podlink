@@ -248,7 +248,17 @@ class RunPodProvider:
         if not instance:
             return ["instance"]
         diff = [] if instance.get("imageName") == pod_up.IMAGE else ["image"]
-        want = {k: str(v) for k, v in pod_up._pod_env("", "").items() if k in _CONFIG_ENV}
+        # Compare against the env THIS pod's rung would get (the ladder derives
+        # per-card memory settings), so a pod on rung 2 isn't judged stale
+        # because rung 1 is listed first. A pod on no rung is a mismatch.
+        memory_gb = None
+        if pod_up.GPU_LADDER:
+            found = self.rung_of(instance)
+            if found is None:
+                diff.append("gpu")
+            else:
+                memory_gb = found[1]
+        want = {k: str(v) for k, v in pod_up._pod_env("", "", memory_gb).items() if k in _CONFIG_ENV}
         have = {k: v for k, v in _env_dict(instance.get("env")).items() if k in _CONFIG_ENV}
         diff += sorted(k for k in set(want) | set(have) if (want.get(k) or "") != (have.get(k) or ""))
         # Only the secret keys reach _secret_diff — the rest of the pod env never
@@ -258,46 +268,117 @@ class RunPodProvider:
         return diff
 
     def prepare_create(self, session) -> dict | None:
-        """Resolve the GPU type id and the registry-cred template.
+        """Resolve every rung's GPU type id and the registry-cred template.
 
-        Both are live lookups that can take a moment, so each is announced as a
-        phase and cancel is checked between them — POD DOWN pressed here should
-        not have to wait for a template round-trip.
+        All live lookups that can take a moment, so each is announced as a phase
+        and cancel is checked between them — POD DOWN pressed here should not
+        have to wait for a template round-trip. Returns {"template_id", "steps"};
+        create_plan() hands the driver the steps in ladder order.
         """
-        if session.cancel.is_set():                      # Down pressed before we resolve
-            return None
-        session.update(phase=f"resolving {pod_up.GPU_MATCH} GPU id")   # live catalog lookup
-        gpu_id = pod_up.resolve_gpu_id()                 # exact RunPod gpu_type_id
+        rungs = pod_up.ladder()
+        steps = []
+        for rung in rungs:
+            if session.cancel.is_set():                  # Down pressed before we resolve
+                return None
+            session.update(phase=f"resolving {rung.label} GPU id"
+                                 + (f" (rung {rung.index}/{len(rungs)})" if len(rungs) > 1 else ""))
+            gpu_id = pod_up.resolve_gpu_id(rung.match, rung.min_vram_gb)   # exact gpu_type_id
+            steps.append({"rung": rung, "gpu_id": gpu_id, "memory_gb": pod_up.gpu_memory_gb(gpu_id),
+                          "of": len(rungs)})
         if session.cancel.is_set():
             return None
         session.update(phase="ensuring pod template")    # registry-cred template (cached)
         template_id = pod_up.ensure_template()
-        return {"gpu_id": gpu_id, "template_id": template_id}
+        for step in steps:
+            step["template_id"] = template_id
+        return {"template_id": template_id, "steps": steps}
 
-    def create_once(self, ctx: dict, secrets: dict, attempt: int) -> dict:
-        """ONE create attempt from the bundled image.
+    def create_plan(self, ctx: dict) -> list[dict]:
+        return ctx["steps"]
+
+    def probe(self, step: dict) -> bool | None:
+        """Catalog stock for this rung (advisory — see pod_up.probe_stock)."""
+        rung = step["rung"]
+        return pod_up.probe_stock(step["gpu_id"], rung.count, rung.volume_id, rung.min_vram_gb)
+
+    def step_retries(self, step: dict) -> int | None:
+        return step["rung"].retries
+
+    def step_label(self, step: dict) -> str:
+        rung = step["rung"]
+        return (f"rung {rung.index}/{step['of']}: {rung.label}" if step["of"] > 1 else rung.label)
+
+    def create_once(self, step: dict, secrets: dict, attempt: int) -> dict:
+        """ONE create attempt from the bundled image, on this step's rung.
 
         The secrets travel as pod env (that is where the image's wrappers read
         them); pod_up keeps them out of the persistent template.
         """
-        return pod_up.create_pod_once(ctx["gpu_id"], secrets["bearer"], secrets["hf"],
-                                      ctx["template_id"])
+        return pod_up.create_pod_once(step["gpu_id"], secrets["bearer"], secrets["hf"],
+                                      step["template_id"], rung=step["rung"],
+                                      card_memory_gb=step.get("memory_gb"))
 
     def is_retryable_create_error(self, exc: Exception) -> bool:
         """True for the transient host-capacity lottery (a failed create bills nothing)."""
         return pod_up.is_retryable_create_error(exc)
 
-    def create_phase(self, ctx: dict, attempt: int, retries: int) -> str:
-        gpus = f"{pod_up.GPU_COUNT}x " if pod_up.GPU_COUNT > 1 else ""
-        return f"creating pod on {gpus}{ctx['gpu_id']} — attempt {attempt}/{retries}"
+    def create_phase(self, step: dict, attempt: int, retries: int) -> str:
+        return f"{self.step_label(step)} — creating pod on {step['gpu_id']}, attempt {attempt}/{retries}"
 
     def capacity_note(self, attempt: int, retries: int, delay: int) -> str:
         return f"no host with capacity yet — attempt {attempt}/{retries}; retrying in {delay}s"
 
     def create_exhausted_message(self, retries: int, delay: int) -> str:
-        return (f"no Secure host in the volume's region accepted the pod after {retries} "
-                f"attempts (~{retries * delay // 60} min). {pod_up.GPU_MATCH} capacity is transient — "
-                f"press POD UP to keep trying, or try again later.")
+        rungs = pod_up.ladder()
+        what = " / ".join(r.label for r in rungs)
+        return (f"no Secure host accepted the pod on {what} (last rung: {retries} attempts, "
+                f"~{retries * delay // 60} min). Capacity is transient — press POD UP to keep "
+                f"trying, or try again later.")
+
+    @staticmethod
+    def _ladder_rows() -> list[dict]:
+        """The ladder as plain dicts for the preflight/UI; [] when malformed (the
+        preflight's own row reports the parse error)."""
+        try:
+            rungs = pod_up.ladder()
+        except ValueError:
+            return []
+        return [{"label": r.label, "match": r.match, "min_vram_gb": r.min_vram_gb, "count": r.count,
+                 "volume": r.volume_id, "retries": r.retries} for r in rungs]
+
+    def stock_report(self) -> list[dict]:
+        """Manual probe (the console's 'Probe GPU stock'): live Secure stock per rung,
+        so the user can decide whether a stopped pod on a lower rung is worth
+        terminating for a fresh walk of the ladder. Each entry:
+        {"rung", "label", "stock": "yes"|"no"|"unknown", "detail"}."""
+        self.authenticate()
+        out = []
+        for rung in pod_up.ladder():
+            try:
+                gpu_id = pod_up.resolve_gpu_id(rung.match, rung.min_vram_gb)
+            except RuntimeError as e:
+                out.append({"rung": rung.index, "label": rung.label, "stock": "unknown", "detail": str(e)[:80]})
+                continue
+            stock = pod_up.probe_stock(gpu_id, rung.count, rung.volume_id, rung.min_vram_gb)
+            out.append({"rung": rung.index, "label": rung.label,
+                        "stock": "yes" if stock else "no" if stock is False else "unknown",
+                        "detail": ("in the volume's data center" if (stock and rung.volume_id)
+                                   else "anywhere on Secure Cloud" if stock else "")})
+        return out
+
+    def rung_of(self, instance: dict) -> tuple[pod_up.Rung, int | None] | None:
+        """Which ladder rung an existing pod sits on (by GPU type + count), with the
+        card's memory — or None when it matches no rung. Catalog lookups are live."""
+        gpu_type = ((instance or {}).get("machine") or {}).get("gpuTypeId") or (instance or {}).get("gpuTypeId")
+        count = self.gpu_count(instance)
+        for rung in pod_up.ladder():
+            try:
+                gpu_id = pod_up.resolve_gpu_id(rung.match, rung.min_vram_gb)
+            except RuntimeError:
+                continue
+            if gpu_id == gpu_type and (count is None or count == rung.count):
+                return rung, pod_up.gpu_memory_gb(gpu_id)
+        return None
 
     def terminate(self, instance_id: str) -> None:
         """Release the GPU and the pod (weights persist on the Network Volume)."""
@@ -340,6 +421,10 @@ class RunPodProvider:
             "gpu_match": pod_up.GPU_MATCH,
             "gpu_min_vram_gb": pod_up.GPU_MIN_VRAM_GB,
             "gpu_count": pod_up.GPU_COUNT,
+            # The ladder (one entry when no ladder is set), for the preflight's
+            # per-rung guard and the GPU line.
+            "ladder": self._ladder_rows(),
+            "memory_budgets": stack_contract.memory_budgets(),
             "vllm_extra_args": os.environ.get("PODLINK_VLLM_EXTRA_ARGS", "").strip(),
             "llm_gpus": os.environ.get("PODLINK_LLM_GPUS", "").strip(),
             "embed_gpus": os.environ.get("PODLINK_EMBED_GPUS", "").strip(),
@@ -374,14 +459,43 @@ class RunPodProvider:
             rows.append(("fail", "PODLINK_IMAGE not set (required — see the README)"))
         rows.append(("info", "registry auth: set (private image)" if pod_up.CONTAINER_REGISTRY_AUTH_ID
                      else "registry auth: none (public image)"))
-        if pod_up.NETWORK_VOLUME_ID:
-            rows.append(("ok", f"persistence: Network Volume {pod_up.NETWORK_VOLUME_ID}"))
-        else:
-            rows.append(("warn", f"persistence: none — Data-Volume ({pod_up.VOLUME_GB} GB) is destroyed "
-                                 "on POD DOWN; weights re-download each launch"))
+        try:
+            rungs = pod_up.ladder()
+        except ValueError as e:
+            return rows + [("fail", str(e))]
+        for rung in rungs:
+            tag = f"rung {rung.index}/{len(rungs)} ({rung.label}): " if len(rungs) > 1 else ""
+            if rung.volume_id:
+                rows.append(("ok", f"{tag}persistence: Network Volume {rung.volume_id}"))
+            else:
+                rows.append(("warn", f"{tag}persistence: none — Data-Volume ({pod_up.VOLUME_GB} GB) is "
+                                     "destroyed on a terminate; weights re-download on a fresh create"))
+        if len(rungs) > 1:
+            # Live stock, so a launch that would sit probing for ten minutes is
+            # visible before it bills anything. Advisory: a probe can be wrong.
+            try:
+                runpod.api_key = read_secret(_secrets.runpod_api_key)
+                seen = []
+                for rung in rungs:
+                    gpu_id = pod_up.resolve_gpu_id(rung.match, rung.min_vram_gb)
+                    stock = pod_up.probe_stock(gpu_id, rung.count, rung.volume_id, rung.min_vram_gb)
+                    seen.append(f"{rung.label}: {'yes' if stock else 'no' if stock is False else 'unknown'}")
+                rows.append(("info", "stock now (Secure) — " + " · ".join(seen)))
+            except Exception as e:  # noqa: BLE001 — the probe is informational
+                rows.append(("info", f"stock probe skipped: {type(e).__name__}"))
         return rows
 
     def persistence_configured(self) -> bool:
+        """True only when every rung keeps its weights on a Network Volume — a
+        volume-less rung would lose them on a terminate, so the UI must warn."""
+        if pod_up.GPU_LADDER:
+            try:
+                return all(r.volume_id for r in pod_up.ladder())
+            except ValueError:
+                return False
+        return self._persistence_configured_single()
+
+    def _persistence_configured_single(self) -> bool:
         """True when a Network Volume is set (weights persist across terminate).
 
         When False, POD DOWN's terminate DESTROYS the ~36 GB of downloaded weights,

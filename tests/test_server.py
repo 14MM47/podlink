@@ -206,6 +206,36 @@ def test_keepalive_clears_deadline():
     _reset()
 
 
+def test_stock_probe_route():
+    # Token-gated; reports the provider's per-rung stock; a provider without a
+    # probe says so; a failing probe is a 502 with the error TYPE only.
+    _reset()
+    from app import providers as _providers
+    p = _providers.active()
+    check("/pod/stock needs the token", client.get("/pod/stock").status_code in (401, 403))
+    saved = getattr(p, "stock_report", None)
+    p.stock_report = lambda: [{"rung": 1, "label": "2x RTX 3090", "stock": "no", "detail": ""},
+                              {"rung": 2, "label": "2x RTX PRO 4500", "stock": "yes", "detail": "anywhere on Secure Cloud"}]
+    try:
+        d = client.get("/pod/stock", headers=H).json()
+        check("stock per rung reported", [r["stock"] for r in d["rungs"]] == ["no", "yes"] and d.get("at"))
+
+        def boom():
+            raise RuntimeError("api key rk_secret leaked?")
+        p.stock_report = boom
+        r = client.get("/pod/stock", headers=H)
+        check("probe failure -> 502 with the type only", r.status_code == 502 and "RuntimeError" in r.text and "rk_secret" not in r.text)
+        p.stock_report = None                       # masks the class method: "no probe here"
+        d = client.get("/pod/stock", headers=H).json()
+        check("no probe on this provider -> empty + note", d["rungs"] == [] and "no stock probe" in d["note"])
+    finally:
+        try:
+            del p.stock_report                      # back to the class method
+        except AttributeError:
+            pass
+    _reset()
+
+
 def test_env_and_test_guards():
     _reset()
     check("/pod/env with no pod -> 409", client.get("/pod/env", headers=H).status_code == 409)
@@ -384,6 +414,7 @@ if __name__ == "__main__":
     test_ui_files_are_never_cached_stale()
     test_auto_deadline_wording_follows_lifecycle()
     test_keepalive_clears_deadline()
+    test_stock_probe_route()
     test_env_and_test_guards()
     test_profile_parsing_and_switching()
     test_cross_cloud_switch_guard()

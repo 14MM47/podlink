@@ -1,28 +1,31 @@
 # Example profile — copy to ~/.config/podlink/profiles/<name>.conf and fill in the TODOs.
-# Agentic-apps stack on a 2x RTX 3090 pod (2 x 24 GB, Ampere / sm_86) — TENSOR-PARALLEL
-# layout for long context + concurrency, at the cost of ragline's index compatibility:
-#   GPU0+1  LLM      RedHatAI/Qwen3.8-27B-INT4, TP=2 (~8.3 GiB weights + ~4-5 GB KV per GPU)
+# Agentic-apps stack on a 2-GPU pod — TENSOR-PARALLEL layout for long context and
+# concurrency, at the cost of ragline's index compatibility:
+#   GPU0+1  LLM      RedHatAI/Qwen3.8-27B-INT4, TP=2 (~8.3 GiB weights per GPU)
 #   GPU0    embedder Qwen/Qwen3-Embedding-4B (~9 GB, 2560-dim — its OWN index, not ragline's)
 #   GPU1    reranker Qwen/Qwen3-Reranker-0.6B via vLLM (~2.9 GB, cohere format)
 # Field-tested shape (dual 3090, vLLM >= 0.19): --disable-custom-all-reduce is required on
 # PCIe (no NVLink); fp8 KV via FlashInfer works on Ampere; 117-124 tok/s at 2-4 concurrent.
 # No client handoff here: each agentic app wires itself to the URLs (Copy .env).
 #
+# GPU LADDER as in ragline-3090.conf: 2x RTX 3090 (one probe) -> 2x RTX PRO 4500. No KV
+# emulation on this profile — the LLM takes its fraction of whatever card it lands on
+# (more context on the 32 GB rung is welcome here).
+#
 # Launch: ./start.sh --check --profile agentic-3090 / ./start.sh --profile agentic-3090
 # NOT LAUNCHABLE until image 2026-09d is pushed, the console runs feature/profile-3090,
-# and the shared 3090 Network Volume exists (see ragline-3090.conf).
+# and rung 2's Network Volume exists (same id as in ragline-3090.conf).
 
-# --- image + hardware ----------------------------------------------------------
+# --- image + ladder -------------------------------------------------------------
 export PODLINK_IMAGE=ghcr.io/14mm47/ragline-pod:2026-09d
-export PODLINK_GPU_MATCH="RTX 3090"
-export PODLINK_GPU_MIN_VRAM_GB=24
-export PODLINK_GPU_COUNT=2
+export PODLINK_GPU_LADDER="RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|none"
+export PODLINK_VOLUME_GB=80
 export PODLINK_POD_NAME=podlink-agentic-3090
 
 # --- LLM across both GPUs ---------------------------------------------------------
-# No LLM_GPUS: both cards, one rank each. 0.55 x 24 = 13.2 GB per GPU must be free when
-# vLLM profiles (TEI starts first: GPU0 keeps ~15 GB free after the 4B embedder, GPU1 ~21).
-# --max-num-seqs 4: a few agent steps in flight; raise only with the KV to back it.
+# No LLM_GPUS: both cards, one rank each. 0.55 of each card must be free when vLLM
+# profiles (TEI starts first: after the 4B embedder GPU0 keeps ~15 GB free on a 3090,
+# ~23 on a PRO 4500). --max-num-seqs 4: a few agent steps in flight.
 # Tool calling on (qwen3_xml is the Qwen3.8 parser); thinking off by default — an agent
 # step can turn it on per request with chat_template_kwargs {"enable_thinking": true}.
 export PODLINK_LLM_SERVED_NAME=agentic-llm
@@ -37,12 +40,10 @@ export PODLINK_EMBED_GPUS=0
 export PODLINK_RERANK_BACKEND=vllm
 export PODLINK_RERANK_MODEL_ID=Qwen/Qwen3-Reranker-0.6B
 export PODLINK_RERANK_GPUS=1
-export PODLINK_RERANK_GPU_MEMORY_UTILIZATION=0.12
+export PODLINK_RERANK_MEMORY_GB=2.9
 export PODLINK_RERANK_VLLM_EXTRA_ARGS="--safetensors-load-strategy=prefetch"
 
-# --- storage + lifecycle (shared volume with ragline-3090; never both running) ----------
-export PODLINK_NETWORK_VOLUME_ID=none                  # TODO: same id as ragline-3090 (Phase F)
-export PODLINK_VOLUME_GB=80
+# --- lifecycle (shared volume with ragline-3090 on rung 2; never both running) ----------
 export PODLINK_LIFECYCLE=stop
 export PODLINK_RESUME_RETRIES=4
 export PODLINK_RESUME_RETRY_DELAY=15

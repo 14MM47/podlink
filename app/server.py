@@ -315,6 +315,23 @@ def client_env(x_podlink_token: str | None = Header(default=None)) -> JSONRespon
     return JSONResponse({"env": _client_env(pod_id)})
 
 
+@app.get("/pod/stock")
+def pod_stock(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
+    """Live GPU stock per ladder rung (a manual probe — decide whether a stopped
+    pod on a lower rung is worth terminating for a fresh walk of the ladder).
+    Providers without a ladder report nothing."""
+    _require_token(x_podlink_token)                  # gated: triggers authed cloud calls
+    provider = providers.active()
+    report = getattr(provider, "stock_report", None)
+    if report is None:
+        return JSONResponse({"rungs": [], "note": f"provider {provider.name!r} has no stock probe"})
+    try:
+        return JSONResponse({"rungs": report(), "at": time.time()})
+    except Exception as e:                            # noqa: BLE001
+        # Type only in detail — str(e) could embed the API key.
+        raise HTTPException(status_code=502, detail=f"stock probe failed: {type(e).__name__}")
+
+
 @app.post("/pod/test")
 def pod_test(x_podlink_token: str | None = Header(default=None)) -> JSONResponse:
     """Run a real completion + embedding + rerank against the pod, in the background."""

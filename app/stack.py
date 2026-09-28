@@ -65,12 +65,13 @@ def from_env() -> dict:
     }
 
 
-def container_env(stack: dict, bearer: str, hf: str) -> dict[str, str]:
+def container_env(stack: dict, bearer: str, hf: str, card_memory_gb: int | float | None = None) -> dict[str, str]:
     """The container's runtime env — secrets + model config, read by the image wrappers.
 
     Same keys pod_up._pod_env() emits, so the image behaves identically on
     every cloud. The optional tuning passthroughs are only sent when set, so the
-    image defaults stay authoritative otherwise.
+    image defaults stay authoritative otherwise. `card_memory_gb` (when the
+    provider knows the card) lets the absolute memory budgets apply.
     """
     env = {
         "HF_TOKEN": hf,                              # weight-pull token, all three services
@@ -106,7 +107,49 @@ def container_env(stack: dict, bearer: str, hf: str) -> dict[str, str]:
     for key, dst in (("llm_gpus", "LLM_GPUS"), ("embed_gpus", "EMBED_GPUS"), ("rerank_gpus", "RERANK_GPUS")):
         if stack.get(key):
             env[dst] = stack[key]
+    apply_memory_budgets(env, card_memory_gb)
     return env
+
+
+def memory_budgets() -> dict:
+    """Absolute memory budgets, read live: {llm_kv_gb, llm_memory_gb, rerank_memory_gb}
+    as floats or None. Blank/invalid values are None (preflight reports them)."""
+    out = {}
+    for key, var in (("llm_kv_gb", "PODLINK_LLM_KV_GB"), ("llm_memory_gb", "PODLINK_LLM_MEMORY_GB"),
+                     ("rerank_memory_gb", "PODLINK_RERANK_MEMORY_GB")):
+        raw = os.environ.get(var, "").strip()
+        try:
+            out[key] = float(raw) if raw else None
+        except ValueError:
+            out[key] = None
+    return out
+
+
+def apply_memory_budgets(env: dict, card_memory_gb: int | float | None) -> None:
+    """Turn absolute GB budgets into what vLLM takes, so one profile behaves the
+    same on every card it can land on (a 24 GB budget is 0.95 of a 3090 and 0.71
+    of a 32 GB card):
+
+      PODLINK_LLM_KV_GB        -> `--kv-cache-memory-bytes N` appended to VLLM_EXTRA_ARGS:
+                                  the LLM's KV cache is exactly this size on any card,
+                                  which is what fixes context capacity and queueing.
+      PODLINK_LLM_MEMORY_GB    -> GPU_MEMORY_UTILIZATION = gb / card memory
+      PODLINK_RERANK_MEMORY_GB -> RERANK_GPU_MEMORY_UTILIZATION = gb / card memory
+
+    The fraction ones need the card's memory; without it they are left as the
+    profile's fractions (the KV bytes need nothing). In place; no-op when unset.
+    """
+    b = memory_budgets()
+    if b["llm_kv_gb"]:
+        flag = f"--kv-cache-memory-bytes {int(b['llm_kv_gb'] * 2**30)}"
+        extra = env.get("VLLM_EXTRA_ARGS", "")
+        if "--kv-cache-memory-bytes" not in extra:
+            env["VLLM_EXTRA_ARGS"] = f"{extra} {flag}".strip()
+    if card_memory_gb:
+        if b["llm_memory_gb"]:
+            env["GPU_MEMORY_UTILIZATION"] = f"{min(0.99, b['llm_memory_gb'] / card_memory_gb):.3f}"
+        if b["rerank_memory_gb"]:
+            env["RERANK_GPU_MEMORY_UTILIZATION"] = f"{min(0.99, b['rerank_memory_gb'] / card_memory_gb):.3f}"
 
 
 def rerank_api_format(backend: str) -> str:

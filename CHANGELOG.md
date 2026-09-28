@@ -21,6 +21,19 @@ All notable changes to podlink are documented here. The format loosely follows
   and POD UP recreates instead of resuming a pod that would 401 every request.
 
 ### Added
+- **GPU ladder + absolute memory budgets** (`PODLINK_GPU_LADDER`, `PODLINK_LLM_KV_GB`,
+  `PODLINK_LLM_MEMORY_GB`, `PODLINK_RERANK_MEMORY_GB`): a profile can list fallback
+  cards for a fresh create (`match|min_vram_gb|count|volume[|retries] ; …`). The driver
+  probes each rung's Secure stock via the catalog (and its volume's data center) before
+  creating — an empty rung with `|1` costs one look, not ten minutes of doomed creates —
+  and the feed names the rung a pod was created on. The stop/resume fingerprint compares a
+  stopped pod with *its own* rung's env, so a pod on rung 2 is resumed rather than
+  recreated because rung 1 is listed first. Absolute budgets make the stack identical
+  across rungs: the LLM's KV cache in bytes (`--kv-cache-memory-bytes` appended to the
+  vLLM args), the vLLM fractions derived from the resolved card's memory. Preflight prints
+  the ladder, applies the pinning/TP guard per rung and shows live stock; the console
+  gains **Probe GPU stock** (`GET /pod/stock`) for deciding between a resume and
+  "Terminate instead". Providers without a ladder are unchanged (single step).
 - **One image for Blackwell and Ampere pods, multi-GPU aware** (image `2026-09d`,
   `pod_image/gpu-env.sh`): the Dockerfile bundles both TEI router builds
   (`text-embeddings-router-sm120` / `-sm86`, both 1.9.4 on the same CUDA 12.9.1 base) and

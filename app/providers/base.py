@@ -158,6 +158,16 @@ class Provider(Protocol):
         lookup is visible in the UI.
         """
 
+    # Optional — a provider with several placements to try in order (a GPU ladder)
+    # implements these; the driver falls back to a single step = ctx otherwise:
+    #   create_plan(ctx) -> list[step]     ordered steps, each an opaque per-step ctx
+    #   probe(step) -> bool | None         is a create likely to succeed right now?
+    #                                      False = skip this attempt without creating,
+    #                                      None = can't say (just try)
+    #   step_retries(step) -> int | None   attempts for this step; None = the default
+    #   step_label(step) -> str            for the event feed ("rung 2/2: 2x RTX PRO 4500")
+    # create_once / create_phase then receive a step, not the whole ctx.
+
     def create_once(self, ctx: Any, secrets: dict, attempt: int) -> Any:
         """ONE create attempt. Raises on failure; the driver owns the retry loop.
 

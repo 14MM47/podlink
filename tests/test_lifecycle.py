@@ -118,7 +118,7 @@ def setup(lifecycle="stop", retries="3"):
         _SAVED.setdefault("pod_up." + name, getattr(rp.pod_up, name))
     rp.pod_up.create_pod_once = store.create_pod_once
     rp.pod_up.ensure_template = lambda: "tmpl1"
-    rp.pod_up.resolve_gpu_id = lambda: "gpuX"
+    rp.pod_up.resolve_gpu_id = lambda *a, **k: "gpuX"
     rp.pod_up.STATE_PATH = SCRATCH
     _SAVED.setdefault("delay", rd._resume_retry_delay)
     rd._resume_retry_delay = lambda: 0              # no real sleeps between attempts
