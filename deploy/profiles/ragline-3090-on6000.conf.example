@@ -1,0 +1,58 @@
+# The ragline-3090 stack (2x RTX 3090 sizing) run on ONE RTX PRO 6000 (96 GB, Secure
+# Cloud — the one card in stock everywhere) as a PROXY, when neither 3090s nor the
+# 2x PRO 4500 rung can be had.
+#
+# What this proves and what it does not:
+#   FAIR    answer + retrieval quality (identical weights: INT4 27B, 8B embedder, 0.6B
+#           reranker, same hybrid search + thinking-off template); the whole operational
+#           chain (image, ladder, stack test, client-env handoff, ragline health,
+#           stop/resume); memory ACCOUNTING — the LLM's KV cache is fixed at the same
+#           bytes and the reranker at the same GB, so vLLM's "model weights / peak
+#           activation / KV" log line is what a 3090 would show (within ~0.5 GB of
+#           arch-dependent workspace). Under ~22.5 GB total = fits a 3090.
+#   UNFAIR  speed: decode is bandwidth-bound and the PRO 6000 has ~1.9x a 3090's
+#           bandwidth; prefill/embedding are compute-bound and ~3x faster. Report
+#           tok/s from here as an UPPER BOUND only — there is no single scale factor.
+#   ABSENT  the Ampere path (sm_86 TEI router, FlashInfer fp8 KV on Ampere, Marlin
+#           INT4 on Ampere) and real 24 GB pressure — a 96 GB card never OOMs.
+#
+# Layout: all three services on GPU 0 (a 1-GPU pod has no GPU 1). ~41 GB of 96 used.
+# ragline's request path is sequential (embed -> search -> rerank -> generate), so
+# sharing one card costs little. PODLINK_LLM_MEMORY_GB=24 makes vLLM's startup budget
+# check behave like a 24 GB card (0.25 of 96) — without it, util 0.95 on a shared
+# card would refuse to start once the embedder is resident.
+#
+# Launch: ./start.sh --check --profile ragline-3090-on6000   (preflight, spends nothing)
+#         ./start.sh --profile ragline-3090-on6000           (or the console dropdown)
+
+# --- image + card ----------------------------------------------------------------
+export PODLINK_IMAGE=ghcr.io/14mm47/ragline-pod:2026-09d
+export PODLINK_GPU_LADDER="RTX PRO 6000|90|1|8q3v00u8os"   # one rung, on the EU-RO-1 ragline-weights volume
+export PODLINK_NETWORK_VOLUME_ID=none                        # volumes are per rung; skips the launcher prompt
+export PODLINK_POD_NAME=podlink-ragline-3090-on6000          # its own pod: never adopts prod or the 3090 pod
+
+# --- GPU0: LLM (ragline-3090 sizing, 24 GB budget on a 96 GB card) ---------------
+export PODLINK_LLM_SERVED_NAME=ragline-llm
+export PODLINK_LLM_MODEL_ID=RedHatAI/Qwen3.8-27B-INT4
+export PODLINK_LLM_GPUS=0
+export PODLINK_LLM_KV_GB=4.5                          # same KV bytes as on a 3090
+export PODLINK_LLM_MEMORY_GB=24                       # -> gpu_memory_utilization 0.25 of 96 GB = a 3090's card
+export PODLINK_MAX_MODEL_LEN=65536
+export PODLINK_VLLM_EXTRA_ARGS='--language-model-only --max-num-seqs 1 --kv-cache-dtype fp8 --attention-backend FLASHINFER --block-size 16 --enable-prefix-caching --safetensors-load-strategy=prefetch --default-chat-template-kwargs {"enable_thinking":false}'
+
+# --- GPU0 too: retrieval (ragline-3090 models) ------------------------------------
+export PODLINK_EMBED_MODEL_ID=Qwen/Qwen3-Embedding-8B
+export PODLINK_EMBED_GPUS=0
+export PODLINK_RERANK_BACKEND=vllm
+export PODLINK_RERANK_MODEL_ID=Qwen/Qwen3-Reranker-0.6B
+export PODLINK_RERANK_GPUS=0
+export PODLINK_RERANK_MEMORY_GB=2.9                   # -> 0.03 of 96 GB: the same 2.9 GB as on a 3090
+export PODLINK_RERANK_VLLM_EXTRA_ARGS="--safetensors-load-strategy=prefetch"
+
+# --- lifecycle (as prod: one card, weights on the volume) ----------------------------
+export PODLINK_LIFECYCLE=stop
+
+# --- client handoff (identical to ragline-3090) -----------------------------------
+export PODLINK_CLIENT_ENV_FILE=~/.config/podlink/ragline.env
+export PODLINK_CLIENT_ENV_HOOK=/home/mattj/Internal_RAG/ragline/scripts/apply_pod_env.py
+export PODLINK_CLIENT_ENV_EXTRA="KG_EXTRACTION_CONCURRENCY=2"
