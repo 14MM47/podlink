@@ -479,7 +479,9 @@ class RunPodProvider:
                 for rung in rungs:
                     gpu_id = pod_up.resolve_gpu_id(rung.match, rung.min_vram_gb)
                     stock = pod_up.probe_stock(gpu_id, rung.count, rung.volume_id, rung.min_vram_gb)
-                    seen.append(f"{rung.label}: {'yes' if stock else 'no' if stock is False else 'unknown'}")
+                    where = f" in {rung.volume_id}'s data center" if rung.volume_id else ""
+                    seen.append(f"rung {rung.index} {rung.label}{where}: "
+                                f"{'yes' if stock else 'no' if stock is False else 'unknown'}")
                 rows.append(("info", "stock now (Secure) — " + " · ".join(seen)))
             except Exception as e:  # noqa: BLE001 — the probe is informational
                 rows.append(("info", f"stock probe skipped: {type(e).__name__}"))

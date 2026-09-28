@@ -23,15 +23,17 @@
 #         ./start.sh --profile ragline-3090           (or pick it in the console dropdown)
 #
 # NOT LAUNCHABLE until: (1) image ghcr.io/14mm47/ragline-pod:2026-09d is built + pushed;
-# (2) the console runs feature/profile-3090; (3) rung 2's Network Volume exists in
-# US-KS-2 (where the PRO 4500 SE lives) — replace `none` in rung 2 with its id (shared
-# with agentic-3090). Rung 1 stays volume-less: 3090s are in other data centers, and a
-# rare 3090 pod re-downloading ~35 GB beats paying for a volume it never uses.
+# (2) the console runs feature/profile-3090; (3) nothing else — rung 2 reuses the
+# EU-RO-1 ragline-weights volume and rung 3 is volume-less by necessity (US-KS-2, the only
+# DC with 2x PRO 4500 SE stock, has no network-volume support). A rung-3 pod still has fast
+# stop/resume on its host; only a terminate costs a ~35 GB re-download.
 
 # --- image + ladder -------------------------------------------------------------
 export PODLINK_IMAGE=ghcr.io/14mm47/ragline-pod:2026-09d
-export PODLINK_GPU_LADDER="RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|none"
-#                          match   |minGB|count|volume|attempts   (rung 2: default 40 x 15 s)
+export PODLINK_GPU_LADDER="RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|8q3v00u8os|1 ; RTX PRO 4500|30|2|none"
+#   rung 1: one look for 3090s · rung 2: one look for PRO 4500s in EU-RO-1, on the existing
+#   ragline-weights volume (US-KS-2, the DC that has them, has NO network-volume support) ·
+#   rung 3: PRO 4500s anywhere, pod-scoped scratch, the 40 x 15 s loop
 export PODLINK_VOLUME_GB=80                            # pod-scoped scratch for volume-less rungs
 export PODLINK_POD_NAME=podlink-ragline-3090          # its own pod: never adopts the prod pod
 

@@ -14,11 +14,11 @@
 #
 # Launch: ./start.sh --check --profile agentic-3090 / ./start.sh --profile agentic-3090
 # NOT LAUNCHABLE until image 2026-09d is pushed, the console runs feature/profile-3090,
-# and rung 2's Network Volume exists (same id as in ragline-3090.conf).
+# — see ragline-3090.conf for the rungs.
 
 # --- image + ladder -------------------------------------------------------------
 export PODLINK_IMAGE=ghcr.io/14mm47/ragline-pod:2026-09d
-export PODLINK_GPU_LADDER="RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|none"
+export PODLINK_GPU_LADDER="RTX 3090|24|2|none|1 ; RTX PRO 4500|30|2|8q3v00u8os|1 ; RTX PRO 4500|30|2|none"
 export PODLINK_VOLUME_GB=80
 export PODLINK_POD_NAME=podlink-agentic-3090
 
