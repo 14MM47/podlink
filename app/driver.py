@@ -327,10 +327,15 @@ def _create_with_retries(session: PodSession) -> dict | None:
             if session.cancel.is_set():                  # Down pressed between attempts
                 return None
             if probe is not None and probe(step) is False:
-                # Say so on the first, every fifth and the last probe — not forty times.
+                # Feed: the first, every fifth and the last probe — not forty lines.
+                # Phase: every probe, so the progress line visibly keeps moving.
+                note = f"{label}: no Secure stock in the catalog (probe {attempt}/{retries})".lstrip(": ")
                 if attempt == 1 or attempt == retries or attempt % 5 == 0:
-                    session.add_event(f"{label}: no Secure stock in the catalog (probe {attempt}/{retries})"
-                                      .lstrip(": "), "lifecycle")
+                    session.add_event(note, "lifecycle")
+                # A changed phase is auto-appended to the feed by session.update, so
+                # set the field directly to keep the feed to the lines above.
+                with session._lock:
+                    session.phase = f"{note} — next probe in {delay}s"
                 if attempt < retries and _sleep_or_cancel(session, delay):
                     return None
                 continue
