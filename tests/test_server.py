@@ -213,7 +213,6 @@ def test_stock_probe_route():
     from app import providers as _providers
     p = _providers.active()
     check("/pod/stock needs the token", client.get("/pod/stock").status_code in (401, 403))
-    saved = getattr(p, "stock_report", None)
     p.stock_report = lambda: [{"rung": 1, "label": "2x RTX 3090", "stock": "no", "detail": ""},
                               {"rung": 2, "label": "2x RTX PRO 4500", "stock": "yes", "detail": "anywhere on Secure Cloud"}]
     try:

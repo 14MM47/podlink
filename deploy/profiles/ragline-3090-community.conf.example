@@ -1,0 +1,62 @@
+# ragline-3090 on REAL 2x RTX 3090s, rented from RunPod COMMUNITY Cloud.
+#
+# Why: 2x RTX 3090 has never been in Secure stock (every sample on 2026-09-28), and
+# the two Blackwell proxies (PRO 4500 / PRO 6000) cannot exercise the Ampere-only
+# paths the 3090 image depends on — the sm_86 TEI router, FlashInfer fp8 KV on
+# Ampere, Marlin INT4 on Ampere, and a true 24 GB fit. Community Cloud is where
+# consumer cards live, so this is the ONE way to test the purchase before buying.
+#
+# What Community Cloud costs you (read before POD UP):
+#   * the host is an unvetted third party: the pod env (the pod bearer, the HF
+#     token) and every prompt/document the pod serves are visible to its operator —
+#     use it with public test data only, and rotate pod_bearer_token afterwards;
+#   * no Network Volumes: weights re-download on every fresh create (~35 GB, a few
+#     minutes on a good host) — stop/resume still works on the same host;
+#   * the catalog publishes no Community stock, so "Probe GPU stock" answers
+#     "unknown" and POD UP goes straight to create attempts (a failed create bills
+#     nothing; the usual 40 x 15 s loop applies);
+#   * hosts run whatever driver they run — PODLINK_ALLOWED_CUDA_VERSIONS keeps the
+#     pod off hosts too old for the cu129 image.
+# Everything below the cloud block is IDENTICAL to ragline-3090: same image, models,
+# pins, memory budgets, served name, client contract and handoff — so numbers measured
+# here are numbers for the box you would buy.
+#
+# Launch: ./start.sh --check --profile ragline-3090-community   (preflight, spends nothing)
+#         ./start.sh --profile ragline-3090-community           (or the console dropdown)
+
+# --- cloud + image + card ---------------------------------------------------------
+export PODLINK_CLOUD_TYPE=COMMUNITY
+export PODLINK_ALLOWED_CUDA_VERSIONS="12.9,13.0,13.1"   # a cu129 image needs a >= 12.9 driver
+export PODLINK_IMAGE=ghcr.io/14mm47/ragline-pod:2026-09d
+export PODLINK_GPU_LADDER="RTX 3090|24|2|none"        # one rung: the exact target, volume-less (Community)
+export PODLINK_NETWORK_VOLUME_ID=none                  # Community pods cannot mount Network Volumes
+export PODLINK_VOLUME_GB=80                            # pod-scoped scratch for the ~35 GB of weights
+export PODLINK_POD_NAME=podlink-ragline-3090-community # its own pod: never adopts the Secure one
+
+# --- GPU0: LLM (identical to ragline-3090) ----------------------------------------
+export PODLINK_LLM_SERVED_NAME=ragline-llm
+export PODLINK_LLM_MODEL_ID=RedHatAI/Qwen3.8-27B-INT4
+export PODLINK_LLM_GPUS=0
+export PODLINK_LLM_KV_GB=4.5
+export PODLINK_GPU_MEMORY_UTILIZATION=0.95
+export PODLINK_MAX_MODEL_LEN=65536
+export PODLINK_VLLM_EXTRA_ARGS='--language-model-only --max-num-seqs 1 --kv-cache-dtype fp8 --attention-backend FLASHINFER --block-size 16 --enable-prefix-caching --safetensors-load-strategy=prefetch --default-chat-template-kwargs {"enable_thinking":false}'
+
+# --- GPU1: retrieval (identical to ragline-3090) ----------------------------------
+export PODLINK_EMBED_MODEL_ID=Qwen/Qwen3-Embedding-8B
+export PODLINK_EMBED_GPUS=1
+export PODLINK_RERANK_BACKEND=vllm
+export PODLINK_RERANK_MODEL_ID=Qwen/Qwen3-Reranker-0.6B
+export PODLINK_RERANK_GPUS=1
+export PODLINK_RERANK_MEMORY_GB=2.9
+export PODLINK_RERANK_VLLM_EXTRA_ARGS="--safetensors-load-strategy=prefetch"
+
+# --- lifecycle ----------------------------------------------------------------------
+export PODLINK_LIFECYCLE=stop
+export PODLINK_RESUME_RETRIES=4
+export PODLINK_RESUME_RETRY_DELAY=15
+
+# --- client handoff (identical to ragline-3090) -----------------------------------
+export PODLINK_CLIENT_ENV_FILE=~/.config/podlink/ragline.env
+export PODLINK_CLIENT_ENV_HOOK=/home/mattj/Internal_RAG/ragline/scripts/apply_pod_env.py
+export PODLINK_CLIENT_ENV_EXTRA="KG_EXTRACTION_CONCURRENCY=2"

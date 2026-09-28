@@ -336,6 +336,66 @@ def test_ladder_walk_probes_then_creates_on_the_first_rung_with_stock():
         scratch.unlink(missing_ok=True)
 
 
+def test_community_cloud_knob():
+    # PODLINK_CLOUD_TYPE=COMMUNITY: the create asks for Community hosts (with the
+    # CUDA driver filter), probes answer "unknown" without touching the API (the
+    # catalog publishes no Community stock), messages say Community, and the
+    # preflight warns about the exposure + fails a rung that names a volume.
+    import importlib
+    import os as _os
+    _os.environ.update({"PODLINK_CLOUD_TYPE": "community", "PODLINK_ALLOWED_CUDA_VERSIONS": "12.9, 13.0",
+                        "PODLINK_GPU_LADDER": "RTX 3090|24|2|none ; RTX 3090|24|2|vol123"})
+    saved_gql = sys.modules.get("runpod.api.graphql")
+    try:
+        importlib.reload(rp.pod_up)
+        check("env re-bakes CLOUD_TYPE (upper-cased) + the CUDA filter",
+              (rp.pod_up.CLOUD_TYPE, rp.pod_up.ALLOWED_CUDA_VERSIONS) == ("COMMUNITY", ["12.9", "13.0"]))
+        pod = rp.pod_up.create_pod_once("gpu-id", "bearer", "hf", "tmpl-id")
+        check("create_pod asks for COMMUNITY + the driver filter",
+              pod["cloud_type"] == "COMMUNITY" and pod["allowed_cuda_versions"] == ["12.9", "13.0"])
+        # No GraphQL module is installed in the fake SDK: a Secure probe would fail
+        # closed to None inside its try, so prove the short-circuit by the absence
+        # of an import attempt.
+        gql = types.ModuleType("runpod.api.graphql")
+        gql.run_graphql_query = lambda q: (_ for _ in ()).throw(AssertionError("Community probe hit the API"))
+        sys.modules["runpod.api.graphql"] = gql
+        check("Community probe is 'unknown' without an API call",
+              rp.pod_up.probe_stock("NVIDIA GeForce RTX 3090", 2) is None)
+        p = rp.PROVIDER()
+        check("stock scope word", p.stock_scope == "Community")
+        check("exhausted message says Community", p.create_exhausted_message(3, 15).startswith("no Community host"))
+        rows = p.preflight()
+        levels = {m: lvl for lvl, m in rows}
+        check("preflight warns about Community exposure",
+              any(lvl == "warn" and m.startswith("cloud: COMMUNITY") for lvl, m in rows))
+        check("preflight lists the CUDA filter", any(m == "host CUDA filter: 12.9, 13.0" and lvl == "ok" for lvl, m in rows))
+        check("a volume rung fails on Community",
+              any(lvl == "fail" and "vol123" in m and "Community" in m for lvl, m in rows))
+        check("no stock line on Community", not any(m.startswith("stock now") for m in levels))
+        check("stack_config carries the cloud", p.stack_config()["cloud_type"] == "COMMUNITY")
+        _os.environ["PODLINK_CLOUD_TYPE"] = "spot"
+        bad = False
+        try:
+            importlib.reload(rp.pod_up)
+        except ValueError:
+            bad = True
+        check("an unknown cloud type is rejected at import", bad)
+    finally:
+        for k in ("PODLINK_CLOUD_TYPE", "PODLINK_ALLOWED_CUDA_VERSIONS", "PODLINK_GPU_LADDER"):
+            _os.environ.pop(k, None)
+        if saved_gql is None:
+            sys.modules.pop("runpod.api.graphql", None)
+        else:
+            sys.modules["runpod.api.graphql"] = saved_gql
+        importlib.reload(rp.pod_up)
+    check("defaults restored: Secure, no CUDA filter",
+          (rp.pod_up.CLOUD_TYPE, rp.pod_up.ALLOWED_CUDA_VERSIONS) == ("SECURE", []))
+    pod = rp.pod_up.create_pod_once("gpu-id", "bearer", "hf", "tmpl-id")
+    check("Secure create carries no CUDA filter", pod["cloud_type"] == "SECURE" and "allowed_cuda_versions" not in pod)
+    p = rp.PROVIDER()
+    check("Secure preflight has the info row", ("info", "cloud: Secure") in p.preflight())
+
+
 def test_ladder_fingerprint_is_rung_aware():
     # A stopped pod on rung 2 must be compared with rung 2's derived env (its
     # card's fractions), not rung 1's; a pod on no rung is a mismatch.
@@ -1314,6 +1374,7 @@ if __name__ == "__main__":
     test_gpu_ladder_parsing_and_default()
     test_memory_budgets_derive_per_card_settings()
     test_ladder_walk_probes_then_creates_on_the_first_rung_with_stock()
+    test_community_cloud_knob()
     test_ladder_fingerprint_is_rung_aware()
     test_preflight_gpu_rows()
     test_resolve_gpu_id_raises_when_absent()

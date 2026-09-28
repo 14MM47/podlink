@@ -1,9 +1,10 @@
 """Provision (or resume) the podlink RunPod pod. Idempotent.
 
 If a pod named POD_NAME already exists, prints its state and exits 0.
-Otherwise creates a new Secure Cloud pod — by default a single RTX Pro 6000 (96 GB,
-Blackwell); PODLINK_GPU_MATCH / _GPU_MIN_VRAM_GB / _GPU_COUNT pick another card or
-a multi-GPU pod — running a bundled RAG inference stack from ONE image:
+Otherwise creates a new pod — Secure Cloud unless PODLINK_CLOUD_TYPE=COMMUNITY; by
+default a single RTX Pro 6000 (96 GB, Blackwell); PODLINK_GPU_MATCH / _GPU_MIN_VRAM_GB
+/ _GPU_COUNT pick another card or a multi-GPU pod — running a bundled RAG inference
+stack from ONE image:
 
     :8000  vLLM        LLM (OpenAI-compatible /v1)
     :8080  TEI         embedder  (/v1/embeddings, /health)
@@ -135,6 +136,31 @@ GPU_MATCH = os.environ.get("PODLINK_GPU_MATCH", "").strip() or "RTX PRO 6000"
 GPU_MIN_VRAM_GB = int(os.environ.get("PODLINK_GPU_MIN_VRAM_GB", "90"))
 GPU_COUNT = int(os.environ.get("PODLINK_GPU_COUNT", "1"))
 
+# --- which RunPod cloud: SECURE (default) or COMMUNITY ------------------------
+# Secure Cloud = RunPod-operated data centers (vetted hosts, Network Volumes,
+# per-DC stock). Community Cloud = third-party hosts renting their cards: cheaper
+# and the only place consumer cards (2x RTX 3090 …) are reliably stocked, but the
+# hosts are unvetted — the pod env (bearer, HF token) and everything the pod
+# serves are visible to whoever runs the machine — and Network Volumes are NOT
+# available, so every rung must be volume-less. The catalog also publishes no
+# Community stock (lowestPrice.stockStatus is null for every card), so probes
+# answer "unknown" and the create attempt itself is the test (it bills nothing
+# when it fails).
+_CLOUD_TYPES = ("SECURE", "COMMUNITY")
+CLOUD_TYPE = os.environ.get("PODLINK_CLOUD_TYPE", "").strip().upper() or "SECURE"
+if CLOUD_TYPE not in _CLOUD_TYPES:
+    raise ValueError(f"PODLINK_CLOUD_TYPE must be one of {', '.join(_CLOUD_TYPES)}, not {CLOUD_TYPE!r}")
+# Host filter by CUDA driver version, comma-separated ("12.9,13.0"); empty = any
+# host. Secure hosts are kept current, but a Community host may run a driver too
+# old for the image's CUDA runtime (a cu129 image needs a >= 12.9 driver), and
+# such a pod boots into "CUDA driver version is insufficient" — billed.
+ALLOWED_CUDA_VERSIONS = [v.strip() for v in os.environ.get("PODLINK_ALLOWED_CUDA_VERSIONS", "").split(",") if v.strip()]
+
+
+def cloud_label() -> str:
+    """'Secure' or 'Community', for messages."""
+    return CLOUD_TYPE.capitalize()
+
 # --- GPU ladder: ordered fallbacks for a FRESH create ---------------------------
 # PODLINK_GPU_LADDER = "match|min_vram_gb|count|volume[|retries] ; match|…" — each
 # rung is a card the profile can run on, tried in order: the catalog is probed for
@@ -210,13 +236,19 @@ def _volume_data_center(volume_id: str) -> str | None:
 
 
 def probe_stock(gpu_type_id: str, count: int, volume_id: str = "", min_vram_gb: int = 1) -> bool | None:
-    """Is a Secure pod of `count` x this card creatable right now, per the catalog?
+    """Is a pod of `count` x this card creatable right now, per the catalog?
 
     True/False from RunPod's stock status (and, when the pod must land in a
     Network Volume's data center, that center's per-type availability); None
     when the catalog can't say — the caller then simply tries the create. Never
     raises: a probe is advisory, the create attempt is the truth.
+
+    Community Cloud: the catalog publishes no stock for it (verified 2026-09-28:
+    stockStatus is null for every card at secureCloud:false, even the ones the
+    console deploys instantly), so the answer is always None there.
     """
+    if CLOUD_TYPE != "SECURE":
+        return None
     try:
         from runpod.api.graphql import run_graphql_query
         q = ('query { gpuTypes(input:{id:"%s"}) { lowestPrice(input:{gpuCount:%d, secureCloud:true}) '
@@ -468,7 +500,7 @@ def create_pod_once(gpu_type_id: str, bearer: str, hf: str, template_id: str,
         image_name=IMAGE,
         template_id=template_id,          # carries the ghcr pull credential
         gpu_type_id=gpu_type_id,
-        cloud_type="SECURE",
+        cloud_type=CLOUD_TYPE,            # SECURE (default) or COMMUNITY
         gpu_count=count,
         container_disk_in_gb=CONTAINER_DISK_GB,
         volume_mount_path=VOLUME_MOUNT,
@@ -481,6 +513,8 @@ def create_pod_once(gpu_type_id: str, bearer: str, hf: str, template_id: str,
         create_kwargs["network_volume_id"] = volume_id          # persists across terminate
     else:
         create_kwargs["volume_in_gb"] = VOLUME_GB               # pod-scoped, lost on terminate
+    if ALLOWED_CUDA_VERSIONS:
+        create_kwargs["allowed_cuda_versions"] = ALLOWED_CUDA_VERSIONS   # host driver filter
     # runpod 1.7.13's create_pod does `print(f"raw_response: {raw_response}")`, and
     # raw_response echoes the pod env — HF_TOKEN and the VLLM/TEI bearer — to stdout.
     # Capture and discard that stdout so the secrets never leak; we use the return value.
@@ -509,7 +543,7 @@ def create_pod(gpu_type_id: str, bearer: str, hf: str, template_id: str | None =
                        f"{RETRY_DELAY}s[/] ({str(e)[:70]})")
                 time.sleep(RETRY_DELAY)
     raise RuntimeError(
-        f"No Secure host accepted the pod after {CREATE_RETRIES} attempts. "
+        f"No {cloud_label()} host accepted the pod after {CREATE_RETRIES} attempts. "
         f"Last error: {last_err}. Try again later, pin a data_center_id, or trim disk."
     )
 

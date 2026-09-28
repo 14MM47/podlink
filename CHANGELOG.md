@@ -21,6 +21,14 @@ All notable changes to podlink are documented here. The format loosely follows
   and POD UP recreates instead of resuming a pod that would 401 every request.
 
 ### Added
+- **Community Cloud** (`PODLINK_CLOUD_TYPE=COMMUNITY`, plus `PODLINK_ALLOWED_CUDA_VERSIONS`
+  as a host driver filter): a profile can rent third-party hosts — the only place consumer
+  cards such as 2× RTX 3090 are stocked. The preflight warns what that exposes (the pod
+  env and served data are visible to the host operator), fails any rung that names a
+  Network Volume (Community pods cannot mount them), and skips the stock line because the
+  catalog publishes no Community stock: probes answer "unknown" and POD UP goes straight
+  to create attempts. Messages say "Secure"/"Community" accordingly. Example profile:
+  `deploy/profiles/ragline-3090-community.conf.example`.
 - **GPU ladder + absolute memory budgets** (`PODLINK_GPU_LADDER`, `PODLINK_LLM_KV_GB`,
   `PODLINK_LLM_MEMORY_GB`, `PODLINK_RERANK_MEMORY_GB`): a profile can list fallback
   cards for a fresh create (`match|min_vram_gb|count|volume[|retries] ; …`). The driver

@@ -391,7 +391,7 @@ teststackBtn.addEventListener("click", () => {      // run a real completion+emb
   teststackBtn.disabled = true;                     // optimistic; SSE reflects test_running
   send("/pod/test");
 });
-// Manual GPU-stock probe: live Secure stock per ladder rung, so you can decide
+// Manual GPU-stock probe: live catalog stock per ladder rung, so you can decide
 // whether a stopped pod on a lower rung is worth terminating for a fresh walk.
 document.getElementById("probestock").addEventListener("click", async () => {
   const el = document.getElementById("stockresult");

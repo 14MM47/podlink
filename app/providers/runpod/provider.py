@@ -108,7 +108,7 @@ def _env_dict(env) -> dict[str, str]:
 
 
 class RunPodProvider:
-    """Drives RunPod Secure Cloud pods for app/driver.py."""
+    """Drives RunPod pods (Secure Cloud, or Community with PODLINK_CLOUD_TYPE) for app/driver.py."""
 
     name = "runpod"
     #: create_pod_once raises QueryError both for the transient host-capacity
@@ -328,10 +328,15 @@ class RunPodProvider:
     def capacity_note(self, attempt: int, retries: int, delay: int) -> str:
         return f"no host with capacity yet — attempt {attempt}/{retries}; retrying in {delay}s"
 
+    @property
+    def stock_scope(self) -> str:
+        """The word the driver's probe notes use: 'Secure' / 'Community'."""
+        return pod_up.cloud_label()
+
     def create_exhausted_message(self, retries: int, delay: int) -> str:
         rungs = pod_up.ladder()
         what = " / ".join(r.label for r in rungs)
-        return (f"no Secure host accepted the pod on {what} (last rung: {retries} attempts, "
+        return (f"no {pod_up.cloud_label()} host accepted the pod on {what} (last rung: {retries} attempts, "
                 f"~{retries * delay // 60} min). Capacity is transient — press POD UP to keep "
                 f"trying, or try again later.")
 
@@ -347,7 +352,7 @@ class RunPodProvider:
                  "volume": r.volume_id, "retries": r.retries} for r in rungs]
 
     def stock_report(self) -> list[dict]:
-        """Manual probe (the console's 'Probe GPU stock'): live Secure stock per rung,
+        """Manual probe (the console's 'Probe GPU stock'): live stock per rung,
         so the user can decide whether a stopped pod on a lower rung is worth
         terminating for a fresh walk of the ladder. Each entry:
         {"rung", "label", "stock": "yes"|"no"|"unknown", "detail"}."""
@@ -363,7 +368,9 @@ class RunPodProvider:
             out.append({"rung": rung.index, "label": rung.label,
                         "stock": "yes" if stock else "no" if stock is False else "unknown",
                         "detail": ("in the volume's data center" if (stock and rung.volume_id)
-                                   else "anywhere on Secure Cloud" if stock else "")})
+                                   else f"anywhere on {pod_up.cloud_label()} Cloud" if stock
+                                   else "the catalog publishes no Community stock — POD UP tries the create"
+                                   if stock is None and pod_up.CLOUD_TYPE == "COMMUNITY" else "")})
         return out
 
     def rung_of(self, instance: dict) -> tuple[pod_up.Rung, int | None] | None:
@@ -407,6 +414,9 @@ class RunPodProvider:
 
     def stack_config(self) -> dict:
         """What this launch will serve — read by the stack test and the preflight."""
+        ladder = self._ladder_rows() if pod_up.GPU_LADDER else []
+        if not ladder:
+            ladder = self._ladder_rows()                 # the single configured card
         return {
             "image": pod_up.IMAGE or None,
             "llm_model_id": pod_up.LLM_MODEL_ID,
@@ -418,12 +428,16 @@ class RunPodProvider:
             "rerank_backend": pod_up.RERANK_BACKEND,     # decides the stack test's rerank call
             # The GPU the create asks for, and what the preflight's pinning guard checks
             # the per-service GPU indices / tensor-parallel size against.
-            "gpu_match": pod_up.GPU_MATCH,
-            "gpu_min_vram_gb": pod_up.GPU_MIN_VRAM_GB,
-            "gpu_count": pod_up.GPU_COUNT,
+            # A ladder's first rung stands in for the single-card knobs, so a
+            # one-rung ladder is displayed and guarded as that rung, not as the
+            # GPU_MATCH / GPU_COUNT defaults it never uses.
+            "gpu_match": ladder[0]["match"] if ladder else pod_up.GPU_MATCH,
+            "gpu_min_vram_gb": ladder[0]["min_vram_gb"] if ladder else pod_up.GPU_MIN_VRAM_GB,
+            "gpu_count": ladder[0]["count"] if ladder else pod_up.GPU_COUNT,
+            "cloud_type": pod_up.CLOUD_TYPE,             # SECURE / COMMUNITY
             # The ladder (one entry when no ladder is set), for the preflight's
             # per-rung guard and the GPU line.
-            "ladder": self._ladder_rows(),
+            "ladder": ladder,
             "memory_budgets": stack_contract.memory_budgets(),
             "vllm_extra_args": os.environ.get("PODLINK_VLLM_EXTRA_ARGS", "").strip(),
             "llm_gpus": os.environ.get("PODLINK_LLM_GPUS", "").strip(),
@@ -459,20 +473,37 @@ class RunPodProvider:
             rows.append(("fail", "PODLINK_IMAGE not set (required — see the README)"))
         rows.append(("info", "registry auth: set (private image)" if pod_up.CONTAINER_REGISTRY_AUTH_ID
                      else "registry auth: none (public image)"))
+        community = pod_up.CLOUD_TYPE == "COMMUNITY"
+        if community:
+            rows.append(("warn", "cloud: COMMUNITY — unvetted third-party hosts: the pod env (bearer, "
+                                 "HF token) and everything the pod serves are visible to the host "
+                                 "operator; no Network Volumes; the catalog publishes no stock, so POD UP "
+                                 "goes straight to create attempts"))
+            rows.append(("ok" if pod_up.ALLOWED_CUDA_VERSIONS else "warn",
+                         f"host CUDA filter: {', '.join(pod_up.ALLOWED_CUDA_VERSIONS)}" if pod_up.ALLOWED_CUDA_VERSIONS
+                         else "host CUDA filter: none — a Community host with an old driver boots into "
+                              "'CUDA driver version is insufficient' (billed); set PODLINK_ALLOWED_CUDA_VERSIONS"))
+        else:
+            rows.append(("info", "cloud: Secure" + (f" (host CUDA filter: {', '.join(pod_up.ALLOWED_CUDA_VERSIONS)})"
+                                                    if pod_up.ALLOWED_CUDA_VERSIONS else "")))
         try:
             rungs = pod_up.ladder()
         except ValueError as e:
             return rows + [("fail", str(e))]
         for rung in rungs:
             tag = f"rung {rung.index}/{len(rungs)} ({rung.label}): " if len(rungs) > 1 else ""
-            if rung.volume_id:
+            if rung.volume_id and community:
+                rows.append(("fail", f"{tag}Network Volume {rung.volume_id} — Community Cloud pods cannot "
+                                     "mount Network Volumes; use `none`"))
+            elif rung.volume_id:
                 rows.append(("ok", f"{tag}persistence: Network Volume {rung.volume_id}"))
             else:
                 rows.append(("warn", f"{tag}persistence: none — Data-Volume ({pod_up.VOLUME_GB} GB) is "
                                      "destroyed on a terminate; weights re-download on a fresh create"))
-        if len(rungs) > 1:
+        if len(rungs) > 1 and not community:
             # Live stock, so a launch that would sit probing for ten minutes is
             # visible before it bills anything. Advisory: a probe can be wrong.
+            # (Community: nothing to show — see pod_up.probe_stock.)
             try:
                 runpod.api_key = read_secret(_secrets.runpod_api_key)
                 seen = []
@@ -482,7 +513,7 @@ class RunPodProvider:
                     where = f" in {rung.volume_id}'s data center" if rung.volume_id else ""
                     seen.append(f"rung {rung.index} {rung.label}{where}: "
                                 f"{'yes' if stock else 'no' if stock is False else 'unknown'}")
-                rows.append(("info", "stock now (Secure) — " + " · ".join(seen)))
+                rows.append(("info", f"stock now ({pod_up.cloud_label()}) — " + " · ".join(seen)))
             except Exception as e:  # noqa: BLE001 — the probe is informational
                 rows.append(("info", f"stock probe skipped: {type(e).__name__}"))
         return rows
