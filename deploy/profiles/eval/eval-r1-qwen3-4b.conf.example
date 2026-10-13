@@ -1,0 +1,42 @@
+# Evaluation campaign eval-2026-10, rung r1: Qwen/Qwen3-4B-FP8
+# One RTX PRO 6000 (96 GB, Secure Cloud) on the EU-RO-1 ragline-weights volume, the
+# prod embedder and reranker beside the LLM (same as ragline-3090-on6000), terminate
+# lifecycle (weights stay on the volume). Floor of the spread (FP8).
+#
+# Memory: LLM budget 16 GB (weights ~4 GB + KV at 64k ctx for 8 streams),
+# embedder ~16 GB, reranker 2.9 GB — under 96 GB with headroom. Thinking ON/OFF is a
+# per-request chat_template_kwargs switch from ragline (LLM_EXTRA_BODY); the reasoning
+# parser below keeps thinking text out of the answer in both conditions.
+#
+# Preflight: ./start.sh --check --profile eval-r1-qwen3-4b   (spends nothing)
+
+# --- image + card ----------------------------------------------------------------
+export PODLINK_IMAGE=ghcr.io/14mm47/ragline-pod:2026-09d
+export PODLINK_GPU_LADDER="RTX PRO 6000|90|1|8q3v00u8os"
+export PODLINK_NETWORK_VOLUME_ID=none                        # volumes are per rung; skips the launcher prompt
+export PODLINK_POD_NAME=podlink-eval-r1-qwen3-4b
+
+# --- GPU0: LLM -------------------------------------------------------------------
+export PODLINK_LLM_SERVED_NAME=ragline-llm
+export PODLINK_LLM_MODEL_ID=Qwen/Qwen3-4B-FP8
+export PODLINK_LLM_GPUS=0
+export PODLINK_LLM_MEMORY_GB=16
+export PODLINK_MAX_MODEL_LEN=65536
+export PODLINK_VLLM_EXTRA_ARGS='--max-num-seqs 8 --kv-cache-dtype fp8 --attention-backend FLASHINFER --block-size 16 --enable-prefix-caching --safetensors-load-strategy=prefetch --reasoning-parser qwen3 --default-chat-template-kwargs {"enable_thinking":false}'
+
+# --- GPU0 too: retrieval (prod models, as every recorded run) --------------------
+export PODLINK_EMBED_MODEL_ID=Qwen/Qwen3-Embedding-8B
+export PODLINK_EMBED_GPUS=0
+export PODLINK_RERANK_BACKEND=vllm
+export PODLINK_RERANK_MODEL_ID=Qwen/Qwen3-Reranker-0.6B
+export PODLINK_RERANK_GPUS=0
+export PODLINK_RERANK_MEMORY_GB=2.9
+export PODLINK_RERANK_VLLM_EXTRA_ARGS="--safetensors-load-strategy=prefetch"
+
+# --- lifecycle: terminate (default) — a stopped pod would bill its disk ------------
+export PODLINK_LIFECYCLE=terminate
+
+# --- client handoff (identical to prod) ------------------------------------------
+export PODLINK_CLIENT_ENV_FILE=~/.config/podlink/ragline.env
+export PODLINK_CLIENT_ENV_HOOK=/home/mattj/Internal_RAG/ragline/scripts/apply_pod_env.py
+export PODLINK_CLIENT_ENV_EXTRA="KG_EXTRACTION_CONCURRENCY=2"
