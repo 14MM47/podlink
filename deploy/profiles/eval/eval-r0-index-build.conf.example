@@ -1,0 +1,43 @@
+# Evaluation campaign eval-2026-10, Phase 0.4 index build (not a ladder rung).
+# The rung-3 stack (stelterlab/Qwen3-30B-A3B-Instruct-2507-AWQ = the fixed KG extractor,
+# prod embedder and reranker) with ingest-sized concurrency: vLLM --max-num-seqs 32 and
+# KG_EXTRACTION_CONCURRENCY=32 handed to ragline. The rung profile's 8 seqs / 2 calls
+# made KG extraction of ~15k chunks take 8-23 h; this runs it in ~2 h.
+# Ladder: the weights volume's data centre first, then any Secure PRO 6000 (weights
+# re-download on that rung). Terminate lifecycle.
+#
+# Memory: LLM budget 32 GB (weights ~18 GB + fp8 KV; 32 short extraction streams fit),
+# embedder ~16 GB, reranker 2.9 GB — under 96 GB.
+#
+# Preflight: ./start.sh --check --profile eval-r0-index-build   (spends nothing)
+
+# --- image + card ----------------------------------------------------------------
+export PODLINK_IMAGE=ghcr.io/14mm47/ragline-pod:2026-09d
+export PODLINK_GPU_LADDER="RTX PRO 6000|90|1|8q3v00u8os ; RTX PRO 6000|90|1|none"
+export PODLINK_NETWORK_VOLUME_ID=none                        # volumes are per rung; skips the launcher prompt
+export PODLINK_POD_NAME=podlink-eval-r0-index-build
+
+# --- GPU0: LLM -------------------------------------------------------------------
+export PODLINK_LLM_SERVED_NAME=ragline-llm
+export PODLINK_LLM_MODEL_ID=stelterlab/Qwen3-30B-A3B-Instruct-2507-AWQ
+export PODLINK_LLM_GPUS=0
+export PODLINK_LLM_MEMORY_GB=32
+export PODLINK_MAX_MODEL_LEN=65536
+export PODLINK_VLLM_EXTRA_ARGS='--max-num-seqs 32 --kv-cache-dtype fp8 --attention-backend FLASHINFER --block-size 16 --enable-prefix-caching --safetensors-load-strategy=prefetch --reasoning-parser qwen3 --default-chat-template-kwargs {"enable_thinking":false}'
+
+# --- GPU0 too: retrieval (prod models, as every recorded run) --------------------
+export PODLINK_EMBED_MODEL_ID=Qwen/Qwen3-Embedding-8B
+export PODLINK_EMBED_GPUS=0
+export PODLINK_RERANK_BACKEND=vllm
+export PODLINK_RERANK_MODEL_ID=Qwen/Qwen3-Reranker-0.6B
+export PODLINK_RERANK_GPUS=0
+export PODLINK_RERANK_MEMORY_GB=2.9
+export PODLINK_RERANK_VLLM_EXTRA_ARGS="--safetensors-load-strategy=prefetch"
+
+# --- lifecycle: terminate (default) — a stopped pod would bill its disk ------------
+export PODLINK_LIFECYCLE=terminate
+
+# --- client handoff (identical to prod) ------------------------------------------
+export PODLINK_CLIENT_ENV_FILE=~/.config/podlink/ragline.env
+export PODLINK_CLIENT_ENV_HOOK=/home/mattj/Internal_RAG/ragline/scripts/apply_pod_env.py
+export PODLINK_CLIENT_ENV_EXTRA="KG_EXTRACTION_CONCURRENCY=32"
