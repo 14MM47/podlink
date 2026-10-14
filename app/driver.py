@@ -97,6 +97,7 @@ def _arm_billing(session: PodSession) -> None:
     so the meter and the idle timer both start there.
     """
     now = time.time()
+    session.mark_boot("created")                         # the instance exists from here
     fields = {"billing_started_at": now}
     minutes = _auto_terminate_minutes()
     if minutes > 0:                                      # arm the idle safety timer
@@ -190,7 +191,8 @@ def start(session: PodSession) -> None:
             _drain_access_events(session, provider)
             # An arbitrary instance may not serve /v1/models, so RUNNING is 'up'
             # here; skip the readiness probe and write_state (both assume the
-            # podlink stack).
+            # podlink stack). Its boot timeline therefore stops at `created`
+            # (no `ready`, boot_s None) — deliberately, not a missing mark_boot.
             session.commit_running()                      # -> RUNNING (unless a stop won)
             return
 
@@ -231,6 +233,7 @@ def start(session: PodSession) -> None:
 
         if not _wait_for_running(session, pod_id):        # poll until RUNNING (or cancel)
             return                                        # cancelled mid-wait
+        session.mark_boot("running")                      # container up on its host
 
         # Open the local access path before anything reads a URL. This runs on
         # the adopt branch above as well as here — an adopted instance is never
@@ -252,6 +255,7 @@ def start(session: PodSession) -> None:
             return                                        # a stop overtook us at the finish line
         # Hand the client its live config (stack test → file → hook); no-op unless configured.
         clientenv.handoff(session, provider, pod_id, test_stack)
+        session.mark_boot("ready")                        # boot complete: serving + handed over
     except Exception as e:  # noqa: BLE001 — surface any failure to the UI
         # A failed launch owns its own teardown: no stop worker is coming, so
         # anything ensure_access opened would leak. (The cancel returns above
@@ -688,10 +692,12 @@ def _wait_for_all_ready(session: PodSession, pod_id: str) -> bool:
                 continue
             if _probe_service(url, headers):             # this service is serving
                 ready.add(name)
+                session.mark_boot(f"healthy_{name}")     # per-service boot time
         # Reflect per-service health onto the tiles (healthy vs still pending).
         _drain_access_events(session, active_provider())
         _apply_health(session, {n: ("healthy" if n in ready else "pending") for n in probes})
         if len(ready) == len(probes):                    # all three healthy
+            session.mark_boot("services_healthy")
             session.update(phase="all services healthy")
             return True                                  # start is complete
         pending = [n for n in probes if n not in ready]  # what's still loading
@@ -785,6 +791,7 @@ def recover_if_healthy(session: PodSession, pod_id: str) -> bool:
     except Exception:  # noqa: BLE001
         pass
     clientenv.handoff(session, provider, pod_id, test_stack)   # same handoff as a normal start
+    session.mark_boot("ready")                           # a recovered start ends its boot here
     return True
 
 

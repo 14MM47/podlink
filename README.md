@@ -29,6 +29,10 @@ all motion respects `prefers-reduced-motion`):
 - **POD UP / POD DOWN** — POD DOWN **terminates** by default, or stops with `PODLINK_LIFECYCLE=stop` (see below), and is live from the
   instant POD UP starts through the whole boot, so you can kill a pod cleanly anytime.
 - **Live cost meter** — uptime × the pod's `$/hr`, ticking every second.
+- **Boot timeline** — `/status` carries `boot` (epoch seconds for each step of the
+  latest start: `up_requested`, `created`, `running`, `healthy_<service>`,
+  `services_healthy`, `stack_test`, `client_env_written`, `ready`) and `boot_s`, POD UP
+  to ready — so a script driving the console can record boot time per session.
 - **Idle auto-terminate** — an optional watchdog that terminates a forgotten pod after
   `PODLINK_AUTO_TERMINATE_MIN`; the UI shows a countdown + a **Keep alive** button.
 - **Per-service health tiles** — LLM / embedder / reranker, re-probed continuously.

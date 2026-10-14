@@ -462,6 +462,8 @@ def test_all_ready_true_when_all_200():
     s.try_begin_start(None)
     check("_wait_for_all_ready True when all 3 healthy",
           rd._wait_for_all_ready(s, "pod1") is True)
+    check("boot records each service and the all-healthy moment",
+          {"healthy_llm", "healthy_embedder", "healthy_reranker", "services_healthy"} <= set(s.boot))
 
 
 def test_all_ready_waits_for_stragglers_then_times_out():
@@ -555,6 +557,7 @@ def test_recover_if_healthy_flips_error_to_running():
         install_fake_client(lambda url: 200)
         check("all healthy: recovers to RUNNING",
               rd.recover_if_healthy(s, "podLost") is True and s.state == State.RUNNING)
+        check("a recovered start closes its boot timeline", s.snapshot()["boot_s"] is not None)
         snap = s.snapshot()
         check("recovery clears the error and sets the proxy url",
               snap["error"] is None and snap["proxy_url"] and "podLost" in snap["proxy_url"])

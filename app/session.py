@@ -63,6 +63,12 @@ class PodSession:
         #   health    — per-service up/down transitions
         #   system    — errors, idle auto-terminate, safety notices
         self.events: list = []
+        # Boot timeline of the current start: step name -> epoch seconds, each
+        # recorded the first time it happens (see mark_boot). Steps: up_requested,
+        # created, running, healthy_<service>, services_healthy, stack_test,
+        # client_env_written, ready. Reset by every POD UP; read by /status so a
+        # client (the eval campaign runner) can store boot time per session.
+        self.boot: dict = {}
         # Set by a Pod Down request; the start worker polls this and bails out.
         self.cancel = threading.Event()          # cross-thread "stop now" signal
         # Stop lifecycle: True when this Pod Down must TERMINATE even though the
@@ -98,6 +104,7 @@ class PodSession:
             self.test_result = None                          # clear any prior stack-test result
             self.test_running = False
             self.client_env = None                           # a new pod means a new handoff
+            self.boot = {"up_requested": time.time()}        # a new boot timeline starts now
             self.cancel.clear()                             # ensure a fresh (un-cancelled) run
             self.force_terminate = False                     # stop flags belong to one Down only
             self.stop_from_idle = False
@@ -154,6 +161,7 @@ class PodSession:
             self.services = _default_services()
             self.test_result = None
             self.test_running = False
+            self.boot = {}                                   # the errored start's timeline is over
             return True
 
     # --- generic field updates -------------------------------------------
@@ -170,6 +178,16 @@ class PodSession:
                 self._record_event(new_phase, "lifecycle")  # provisioning timeline entry
             for key, value in fields.items():      # apply each supplied field
                 setattr(self, key, value)          # e.g. self.phase = "…"
+
+    def mark_boot(self, step: str) -> None:
+        """Record when a boot step first happened (later repeats are ignored).
+
+        Only during a start: a step after `ready` (e.g. a stack test pressed by
+        hand an hour later) belongs to no boot and is not recorded.
+        """
+        with self._lock:
+            if self.boot and "ready" not in self.boot and step not in self.boot:
+                self.boot[step] = time.time()
 
     def add_event(self, message: str, category: str = "lifecycle") -> None:
         """Append a categorised status event (health transition, system notice) to the feed."""
@@ -222,6 +240,11 @@ class PodSession:
                 "test_result": self.test_result,          # last stack-test result, or None
                 "test_running": self.test_running,        # a stack test is in flight
                 "client_env": self.client_env,            # last automatic handoff outcome, or None
+                # Boot timeline of the latest start (epoch seconds per step) and its
+                # total, POD UP to ready; None until the pod is ready.
+                "boot": dict(self.boot),
+                "boot_s": (round(self.boot["ready"] - self.boot["up_requested"], 1)
+                           if "ready" in self.boot and "up_requested" in self.boot else None),
                 "events": [{"t": t, "cat": c, "msg": m}   # recent feed, split by category in the UI
                            for t, c, m in self.events[-40:]],
             }

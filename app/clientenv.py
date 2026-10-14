@@ -185,6 +185,7 @@ def handoff(session, provider, pod_id: str, test_stack) -> None:
     try:
         session.add_event("client env: running the stack test before handoff", "system")
         test_stack(session)                                   # sets session.test_result
+        session.mark_boot("stack_test")                       # stack test finished (pass or fail)
         result = session.test_result or {}
         if not result.get("all_ok"):
             session.add_event("client env: stack test did not pass — client left untouched", "system")
@@ -209,6 +210,7 @@ def handoff(session, provider, pod_id: str, test_stack) -> None:
                 status["hook"] = f"exit {rc}"
                 session.add_event(f"client env hook: exit {rc} — check the client's own logs", "system")
         session.update(client_env=status)
+        session.mark_boot("client_env_written")               # client re-pointed (hook run)
     except Exception as e:  # noqa: BLE001 — a handoff failure must never take the session down
         session.add_event(f"client env: error: {type(e).__name__}", "system")
         session.update(client_env={"status": "error", "at": time.time(), "detail": type(e).__name__})

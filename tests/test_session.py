@@ -109,6 +109,30 @@ def test_settle_idle_if_error_is_guarded():
           and s.state == State.STARTING)
 
 
+def test_boot_timeline():
+    s = PodSession()
+    s.mark_boot("created")
+    check("no boot before a POD UP", s.snapshot()["boot"] == {})
+    s.try_begin_start(None)
+    boot = s.snapshot()["boot"]
+    check("POD UP starts the timeline", set(boot) == {"up_requested"})
+    s.mark_boot("created")
+    first = s.boot["created"]
+    time.sleep(0.01)
+    s.mark_boot("created")
+    check("a step keeps its first time", s.boot["created"] == first)
+    check("boot_s is None until ready", s.snapshot()["boot_s"] is None)
+    s.boot["up_requested"] -= 100.0                  # pretend POD UP was 100 s ago
+    s.mark_boot("ready")
+    snap = s.snapshot()
+    check("boot_s = ready - up_requested", 99.0 < snap["boot_s"] < 102.0)
+    s.mark_boot("stack_test")
+    check("steps after ready are not recorded", "stack_test" not in s.boot)
+    s.update(state=State.IDLE)
+    s.try_begin_start(None)
+    check("a new POD UP resets the timeline", set(s.boot) == {"up_requested"})
+
+
 if __name__ == "__main__":
     print("session tests:")
     test_start_transition()
@@ -119,4 +143,5 @@ if __name__ == "__main__":
     test_phase_events_and_categories()
     test_cost_meter_and_auto_terminate_derived()
     test_settle_idle_if_error_is_guarded()
+    test_boot_timeline()
     print("all session tests passed.")
